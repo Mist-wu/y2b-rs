@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "target_audience": "Bilibili viewers watching programming tutorials, quantitative finance education, and Brawl Stars/game commentary",
+  "style": [
+    "Natural contemporary Simplified Chinese",
+    "Concise enough for two-line hard subtitles",
+    "Avoid documentary narration tone",
+    "Preserve jokes, emphasis, uncertainty and speaker intent"
+  ],
+  "glossary": {
+    "Brawl Stars": "荒野乱斗",
+    "Hypercharge": "超级充能",
+    "Showdown Plus": "荒野决斗+",
+    "prestige": "巅峰等级",
+    "prestige three": "巅峰三",
+    "Sirius": "西里乌斯",
+    "Sirus": "西里乌斯",
+    "brawler": "英雄",
+    "brawlers": "英雄",
+    "nano drop": "纳米惊喜",
+    "nano drops": "纳米惊喜",
+    "nano power": "纳米能力",
+    "nano powers": "纳米能力"
+  }
+}
