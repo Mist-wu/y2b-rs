@@ -1,0 +1,460 @@
+use crate::model::{AiUsage, Channel, Job, JobStatus, StageRun};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::path::Path;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
+
+#[derive(Clone)]
+pub struct Database(Arc<Mutex<Connection>>);
+
+impl Database {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(path)
+            .with_context(|| format!("打开数据库失败: {}", path.display()))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let db = Self(Arc::new(Mutex::new(conn)));
+        db.migrate()?;
+        Ok(db)
+    }
+
+    fn migrate(&self) -> Result<()> {
+        self.conn().execute_batch(r#"
+        CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS channels(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          youtube_channel_id TEXT NOT NULL UNIQUE,
+          name TEXT NOT NULL, url TEXT NOT NULL, feed_url TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1, baseline_at TEXT,
+          last_checked_at TEXT, last_reconcile_at TEXT, last_error TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS jobs(
+          id TEXT PRIMARY KEY, channel_id INTEGER REFERENCES channels(id),
+          video_id TEXT NOT NULL UNIQUE, url TEXT NOT NULL, title TEXT,
+          status TEXT NOT NULL, published_at TEXT, youtube_updated_at TEXT,
+          discovered_at TEXT NOT NULL, is_short INTEGER NOT NULL DEFAULT 0,
+          duration_seconds REAL, width INTEGER, height INTEGER, fps REAL,
+          bvid TEXT, provider TEXT, ai_model TEXT, thinking TEXT,
+          attempt INTEGER NOT NULL DEFAULT 0, error TEXT,
+          raw_video_path TEXT, rendered_path TEXT, subtitle_path TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, discovered_at);
+        CREATE TABLE IF NOT EXISTS stage_runs(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id),
+          stage TEXT NOT NULL, status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1,
+          started_at TEXT NOT NULL, finished_at TEXT, duration_ms INTEGER,
+          peak_rss_kib INTEGER, provider TEXT, model TEXT, thinking TEXT, detail TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_stage_job ON stage_runs(job_id, id);
+        CREATE TABLE IF NOT EXISTS ai_calls(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id),
+          stage_run_id INTEGER REFERENCES stage_runs(id), task TEXT NOT NULL,
+          provider TEXT NOT NULL, model TEXT NOT NULL, thinking TEXT NOT NULL,
+          input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+          reasoning_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+          cache_write_tokens INTEGER DEFAULT 0, total_tokens INTEGER DEFAULT 0,
+          cost REAL, duration_ms INTEGER, input_json TEXT, output_json TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS events(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, level TEXT NOT NULL,
+          message TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS commands(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, payload TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'queued', created_at TEXT NOT NULL, processed_at TEXT, error TEXT
+        );
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+        INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, CURRENT_TIMESTAMP);
+        "#)?;
+        let c = self.conn();
+        let mut columns = c.prepare("PRAGMA table_info(ai_calls)")?;
+        let names = columns
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(columns);
+        if !names.iter().any(|n| n == "input_json") {
+            c.execute("ALTER TABLE ai_calls ADD COLUMN input_json TEXT", [])?;
+        }
+        if !names.iter().any(|n| n == "output_json") {
+            c.execute("ALTER TABLE ai_calls ADD COLUMN output_json TEXT", [])?;
+        }
+        c.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)",[])?;
+        Ok(())
+    }
+
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.0.lock().expect("database mutex poisoned")
+    }
+
+    pub fn integrity_check(&self) -> Result<String> {
+        Ok(self
+            .conn()
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))?)
+    }
+    pub fn schema_version(&self) -> Result<i64> {
+        Ok(self.conn().query_row(
+            "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn add_channel(
+        &self,
+        channel_id: &str,
+        name: &str,
+        url: &str,
+        feed_url: &str,
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        let c = self.conn();
+        c.execute("INSERT INTO channels(youtube_channel_id,name,url,feed_url,baseline_at,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(youtube_channel_id) DO UPDATE SET name=excluded.name,url=excluded.url,feed_url=excluded.feed_url", params![channel_id,name,url,feed_url,now,now])?;
+        Ok(c.query_row(
+            "SELECT id FROM channels WHERE youtube_channel_id=?",
+            [channel_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn list_channels(&self) -> Result<Vec<Channel>> {
+        let c = self.conn();
+        let mut q=c.prepare("SELECT id,youtube_channel_id,name,url,enabled,last_checked_at,last_error FROM channels ORDER BY id")?;
+        Ok(q.query_map([], |r| {
+            Ok(Channel {
+                id: r.get(0)?,
+                youtube_channel_id: r.get(1)?,
+                name: r.get(2)?,
+                url: r.get(3)?,
+                enabled: r.get::<_, i64>(4)? != 0,
+                last_checked_at: parse_opt(r.get(5)?),
+                last_error: r.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn channel_feed(&self, id: i64) -> Result<String> {
+        Ok(self
+            .conn()
+            .query_row("SELECT feed_url FROM channels WHERE id=?", [id], |r| {
+                r.get(0)
+            })?)
+    }
+    pub fn channel_baseline(&self, id: i64) -> Result<Option<DateTime<Utc>>> {
+        Ok(parse_opt(self.conn().query_row(
+            "SELECT baseline_at FROM channels WHERE id=?",
+            [id],
+            |r| r.get(0),
+        )?))
+    }
+    pub fn set_channel_enabled(&self, id: i64, enabled: bool) -> Result<()> {
+        self.conn().execute(
+            "UPDATE channels SET enabled=? WHERE id=?",
+            params![enabled as i64, id],
+        )?;
+        Ok(())
+    }
+    pub fn mark_channel_checked(&self, id: i64, error: Option<&str>) -> Result<()> {
+        self.conn().execute(
+            "UPDATE channels SET last_checked_at=?,last_error=? WHERE id=?",
+            params![Utc::now().to_rfc3339(), error, id],
+        )?;
+        Ok(())
+    }
+    pub fn mark_channel_reconciled(&self, id: i64, error: Option<&str>) -> Result<()> {
+        self.conn().execute(
+            "UPDATE channels SET last_reconcile_at=?,last_error=? WHERE id=?",
+            params![Utc::now().to_rfc3339(), error, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn create_job(
+        &self,
+        channel_id: Option<i64>,
+        video_id: &str,
+        url: &str,
+        title: Option<&str>,
+        published: Option<DateTime<Utc>>,
+        updated: Option<DateTime<Utc>>,
+    ) -> Result<Option<String>> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let changed=self.conn().execute("INSERT OR IGNORE INTO jobs(id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?,?,?,?)",params![id,channel_id,video_id,url,title,published.map(|x|x.to_rfc3339()),updated.map(|x|x.to_rfc3339()),now,now,now])?;
+        Ok((changed == 1).then_some(id))
+    }
+
+    pub fn get_job(&self, id: &str) -> Result<Option<Job>> {
+        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE id=?",[id],job_from_row).optional().map_err(Into::into)
+    }
+    pub fn list_jobs(&self, limit: usize) -> Result<Vec<Job>> {
+        let c = self.conn();
+        let mut q=c.prepare("SELECT id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,provider,ai_model,thinking,attempt,error FROM jobs ORDER BY discovered_at DESC LIMIT ?")?;
+        Ok(q.query_map([limit as i64], job_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    pub fn next_queued_job(&self) -> Result<Option<Job>> {
+        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE status IN ('queued','retry_wait') ORDER BY discovered_at LIMIT 1",[],job_from_row).optional().map_err(Into::into)
+    }
+
+    pub fn recover_incomplete_jobs(&self) -> Result<usize> {
+        let c = self.conn();
+        let now = Utc::now().to_rfc3339();
+        let recovered=c.execute("UPDATE jobs SET status='queued',error='服务重启后自动恢复',updated_at=? WHERE status IN ('inspecting','downloading','segmenting','translating','rendering')",[&now])?;
+        c.execute("UPDATE jobs SET status='paused',error='服务重启时上传或追加结果不确定，请确认 Bilibili 后手动重试',updated_at=? WHERE status IN ('uploading','appending')",[&now])?;
+        Ok(recovered)
+    }
+
+    pub fn update_job_status(
+        &self,
+        id: &str,
+        status: JobStatus,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE jobs SET status=?,error=?,updated_at=? WHERE id=?",
+            params![status.to_string(), error, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+    pub fn update_job_metadata(
+        &self,
+        id: &str,
+        title: &str,
+        is_short: bool,
+        duration: Option<f64>,
+        width: Option<i64>,
+        height: Option<i64>,
+    ) -> Result<()> {
+        self.conn().execute("UPDATE jobs SET title=?,is_short=?,duration_seconds=?,width=?,height=?,updated_at=? WHERE id=?",params![title,is_short as i64,duration,width,height,Utc::now().to_rfc3339(),id])?;
+        Ok(())
+    }
+    pub fn set_job_model(
+        &self,
+        id: &str,
+        provider: &str,
+        model: &str,
+        thinking: &str,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE jobs SET provider=?,ai_model=?,thinking=?,updated_at=? WHERE id=?",
+            params![provider, model, thinking, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+    pub fn set_job_paths(
+        &self,
+        id: &str,
+        raw: Option<&str>,
+        subtitle: Option<&str>,
+        rendered: Option<&str>,
+    ) -> Result<()> {
+        self.conn().execute("UPDATE jobs SET raw_video_path=COALESCE(?,raw_video_path),subtitle_path=COALESCE(?,subtitle_path),rendered_path=COALESCE(?,rendered_path),updated_at=? WHERE id=?",params![raw,subtitle,rendered,Utc::now().to_rfc3339(),id])?;
+        Ok(())
+    }
+    pub fn set_job_bvid(&self, id: &str, bvid: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE jobs SET bvid=?,updated_at=? WHERE id=?",
+            params![bvid, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+    pub fn job_paths(&self, id: &str) -> Result<(Option<String>, Option<String>, Option<String>)> {
+        Ok(self.conn().query_row(
+            "SELECT raw_video_path,subtitle_path,rendered_path FROM jobs WHERE id=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
+    }
+    pub fn increment_attempt(&self, id: &str) -> Result<i64> {
+        self.conn().execute(
+            "UPDATE jobs SET attempt=attempt+1,updated_at=? WHERE id=?",
+            params![Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(self
+            .conn()
+            .query_row("SELECT attempt FROM jobs WHERE id=?", [id], |r| r.get(0))?)
+    }
+
+    pub fn start_stage(
+        &self,
+        job_id: &str,
+        stage: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        thinking: Option<&str>,
+    ) -> Result<i64> {
+        let c = self.conn();
+        c.execute("INSERT INTO stage_runs(job_id,stage,status,started_at,provider,model,thinking) VALUES(?,?,'running',?,?,?,?)",params![job_id,stage,Utc::now().to_rfc3339(),provider,model,thinking])?;
+        Ok(c.last_insert_rowid())
+    }
+    pub fn finish_stage(
+        &self,
+        id: i64,
+        status: &str,
+        duration_ms: i64,
+        peak_rss_kib: u64,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        self.conn().execute("UPDATE stage_runs SET status=?,finished_at=?,duration_ms=?,peak_rss_kib=?,detail=? WHERE id=?",params![status,Utc::now().to_rfc3339(),duration_ms,peak_rss_kib as i64,detail,id])?;
+        Ok(())
+    }
+    pub fn list_stages(&self, job_id: &str) -> Result<Vec<StageRun>> {
+        let c = self.conn();
+        let mut q=c.prepare("SELECT id,job_id,stage,status,started_at,finished_at,duration_ms,peak_rss_kib,provider,model,thinking,detail FROM stage_runs WHERE job_id=? ORDER BY id")?;
+        Ok(q.query_map([job_id], |r| {
+            Ok(StageRun {
+                id: r.get(0)?,
+                job_id: r.get(1)?,
+                stage: r.get(2)?,
+                status: r.get(3)?,
+                started_at: parse(r.get(4)?),
+                finished_at: parse_opt(r.get(5)?),
+                duration_ms: r.get(6)?,
+                peak_rss_kib: r.get(7)?,
+                provider: r.get(8)?,
+                model: r.get(9)?,
+                thinking: r.get(10)?,
+                detail: r.get(11)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_ai_call(
+        &self,
+        job_id: &str,
+        stage_id: i64,
+        task: &str,
+        provider: &str,
+        model: &str,
+        thinking: &str,
+        usage: &AiUsage,
+        duration_ms: i64,
+        input_json: &str,
+        output_json: &str,
+    ) -> Result<()> {
+        self.conn().execute("INSERT INTO ai_calls(job_id,stage_run_id,task,provider,model,thinking,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost,duration_ms,input_json,output_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![job_id,stage_id,task,provider,model,thinking,usage.input,usage.output,usage.reasoning,usage.cache_read,usage.cache_write,usage.total,usage.cost,duration_ms,input_json,output_json,Utc::now().to_rfc3339()])?;
+        Ok(())
+    }
+    pub fn ai_totals(&self) -> Result<AiUsage> {
+        self.conn().query_row("SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(cache_read_tokens),0),COALESCE(SUM(cache_write_tokens),0),COALESCE(SUM(total_tokens),0),SUM(cost) FROM ai_calls",[],|r|Ok(AiUsage{input:r.get(0)?,output:r.get(1)?,reasoning:r.get(2)?,cache_read:r.get(3)?,cache_write:r.get(4)?,total:r.get(5)?,cost:r.get(6)?})).map_err(Into::into)
+    }
+    pub fn ai_totals_for_job(&self, job_id: &str) -> Result<AiUsage> {
+        self.conn().query_row("SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(cache_read_tokens),0),COALESCE(SUM(cache_write_tokens),0),COALESCE(SUM(total_tokens),0),SUM(cost) FROM ai_calls WHERE job_id=?",[job_id],usage_from_row).map_err(Into::into)
+    }
+    pub fn ai_totals_for_channel(&self, channel_id: i64) -> Result<AiUsage> {
+        self.conn().query_row("SELECT COALESCE(SUM(a.input_tokens),0),COALESCE(SUM(a.output_tokens),0),COALESCE(SUM(a.reasoning_tokens),0),COALESCE(SUM(a.cache_read_tokens),0),COALESCE(SUM(a.cache_write_tokens),0),COALESCE(SUM(a.total_tokens),0),SUM(a.cost) FROM ai_calls a JOIN jobs j ON j.id=a.job_id WHERE j.channel_id=?",[channel_id],usage_from_row).map_err(Into::into)
+    }
+    pub fn ai_tokens_today(&self) -> Result<i64> {
+        let day = Utc::now().format("%Y-%m-%d").to_string();
+        Ok(self.conn().query_row(
+            "SELECT COALESCE(SUM(total_tokens),0) FROM ai_calls WHERE substr(created_at,1,10)=?",
+            [day],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn event(&self, job_id: Option<&str>, level: &str, message: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO events(job_id,level,message,created_at) VALUES(?,?,?,?)",
+            params![job_id, level, message, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn().execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![key,value,Utc::now().to_rfc3339()])?;
+        Ok(())
+    }
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        self.conn()
+            .query_row("SELECT value FROM settings WHERE key=?", [key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+    pub fn backup(&self, dest: &Path) -> Result<()> {
+        if let Some(p) = dest.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        self.conn().backup(rusqlite::MAIN_DB, dest, None)?;
+        Ok(())
+    }
+}
+
+fn parse(s: String) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(&s)
+        .map(|x| x.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+fn parse_opt(s: Option<String>) -> Option<DateTime<Utc>> {
+    s.map(parse)
+}
+fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
+    Ok(Job {
+        id: r.get(0)?,
+        channel_id: r.get(1)?,
+        video_id: r.get(2)?,
+        url: r.get(3)?,
+        title: r.get(4)?,
+        status: JobStatus::from_str(&r.get::<_, String>(5)?).unwrap_or(JobStatus::Failed),
+        published_at: parse_opt(r.get(6)?),
+        youtube_updated_at: parse_opt(r.get(7)?),
+        discovered_at: parse(r.get(8)?),
+        is_short: r.get::<_, i64>(9)? != 0,
+        duration_seconds: r.get(10)?,
+        width: r.get(11)?,
+        height: r.get(12)?,
+        bvid: r.get(13)?,
+        provider: r.get(14)?,
+        ai_model: r.get(15)?,
+        thinking: r.get(16)?,
+        attempt: r.get(17)?,
+        error: r.get(18)?,
+    })
+}
+fn usage_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AiUsage> {
+    Ok(AiUsage {
+        input: r.get(0)?,
+        output: r.get(1)?,
+        reasoning: r.get(2)?,
+        cache_read: r.get(3)?,
+        cache_write: r.get(4)?,
+        total: r.get(5)?,
+        cost: r.get(6)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn schema_and_dedup() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        assert_eq!(db.integrity_check().unwrap(), "ok");
+        assert!(
+            db.create_job(None, "abc", "https://youtu.be/abc", None, None, None)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.create_job(None, "abc", "https://youtu.be/abc", None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        db.update_job_status(&db.list_jobs(1).unwrap()[0].id, JobStatus::Rendering, None)
+            .unwrap();
+        assert_eq!(db.recover_incomplete_jobs().unwrap(), 1);
+        assert_eq!(db.list_jobs(1).unwrap()[0].status, JobStatus::Queued);
+    }
+}
