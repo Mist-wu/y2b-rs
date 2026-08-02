@@ -1,0 +1,25 @@
+[Unit]
+Description=y2b-rs YouTube monitor and Bilibili uploader
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/y2b
+Environment=HOME=/root
+Environment=PI_CODING_AGENT_DIR=/root/.pi/agent
+Environment=RUST_LOG=y2b_rs=info
+ExecStart=/usr/local/bin/y2b --config /etc/y2b/config.toml watch
+Restart=on-failure
+RestartSec=15s
+MemoryAccounting=yes
+MemoryHigh=1200M
+MemoryMax=1600M
+MemorySwapMax=1G
+TasksMax=256
+LimitNOFILE=65536
+TimeoutStopSec=45s
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
