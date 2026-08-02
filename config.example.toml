@@ -1,0 +1,74 @@
+[runtime]
+data_dir = "/var/lib/y2b"
+database = "/var/lib/y2b/state.db"
+download_dir = "/var/lib/y2b/downloads"
+output_dir = "/var/lib/y2b/output"
+log_dir = "/var/lib/y2b/logs"
+backup_dir = "/var/lib/y2b/backups"
+timezone = "Asia/Shanghai"
+
+[monitor]
+poll_seconds = 60
+reconcile_hours = 6
+reconcile_limit = 30
+max_attempts = 5
+
+[youtube]
+yt_dlp = "/usr/local/bin/yt-dlp"
+cookies = "/var/lib/y2b/youtube_cookies.txt"
+probe_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+max_pixels = 2073600
+max_fps = 60.0
+
+[bilibili]
+biliup = "/usr/local/bin/biliup"
+cookies = "/var/lib/y2b/bilibili_cookies.json"
+default_tid = 4
+default_tags = ["翻译", "YouTube"]
+max_parts = 199
+
+[ai]
+pi = "/usr/local/bin/pi"
+extension = "/opt/y2b/pi/y2b-extension.ts"
+policy = "/opt/y2b/pi/policy.json"
+provider = "openai-codex"
+model = "gpt-5.6-luna"
+thinking = "high"
+timeout_seconds = 300
+batch_size = 50
+# daily_token_limit = 1000000
+
+[[ai.allowed_models]]
+provider = "openai-codex"
+model = "gpt-5.6-luna"
+label = "GPT-5.6 Luna"
+
+[[ai.allowed_models]]
+provider = "openai-codex"
+model = "gpt-5.6-sol"
+label = "GPT-5.6 Sol"
+
+[[ai.allowed_models]]
+provider = "openai-codex"
+model = "gpt-5.6-terra"
+label = "GPT-5.6 Terra"
+
+[render]
+ffmpeg = "/usr/local/bin/ffmpeg"
+ffprobe = "/usr/local/bin/ffprobe"
+fonts_dir = "/opt/y2b/fonts"
+font_cn = "Source Han Sans CN Medium"
+font_en = "Inter SemiBold"
+crf = 20
+preset = "medium"
+
+[storage]
+warn_free_gib = 10
+stop_free_gib = 5
+delete_large_after_upload = true
+daily_backups = 7
+weekly_backups = 4
+
+[translation]
+source_lang = "en"
+target_lang = "zh-CN"
