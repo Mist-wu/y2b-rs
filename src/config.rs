@@ -68,8 +68,19 @@ pub struct AiConfig {
     pub thinking: String,
     pub allowed_models: Vec<ModelConfig>,
     pub timeout_seconds: u64,
-    pub batch_size: usize,
+    pub batch_mode: BatchMode,
+    pub context_window_tokens: usize,
+    pub safe_context_tokens: usize,
+    pub segment_overlap_cues: usize,
     pub daily_token_limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchMode {
+    WholeVideo,
+    #[default]
+    Adaptive,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,7 +200,10 @@ impl Default for AiConfig {
                 },
             ],
             timeout_seconds: 300,
-            batch_size: 50,
+            batch_mode: BatchMode::Adaptive,
+            context_window_tokens: 256_000,
+            safe_context_tokens: 200_000,
+            segment_overlap_cues: 12,
             daily_token_limit: None,
         }
     }
@@ -255,5 +269,21 @@ impl Config {
             fs::create_dir_all(p)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_batch_modes_and_256k_defaults() {
+        let adaptive: AiConfig = toml::from_str("batch_mode = \"adaptive\"").unwrap();
+        assert_eq!(adaptive.batch_mode, BatchMode::Adaptive);
+        assert_eq!(adaptive.context_window_tokens, 256_000);
+        assert_eq!(adaptive.safe_context_tokens, 200_000);
+
+        let whole: AiConfig = toml::from_str("batch_mode = \"whole_video\"").unwrap();
+        assert_eq!(whole.batch_mode, BatchMode::WholeVideo);
     }
 }

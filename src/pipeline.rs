@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{BatchMode, Config};
 use crate::db::Database;
 use crate::model::{AiUsage, Job, JobStatus};
 use crate::monitor::Monitor;
@@ -300,32 +300,66 @@ impl Pipeline {
             Some(&self.config.ai.model),
             Some(&self.config.ai.thinking),
         )?;
+        let budget = self.ai_token_budget()?;
+        let estimated = estimate_segment_tokens(cues);
         let mut ranges = Vec::new();
         let mut duration = 0;
         let mut peak = 0;
-        for (chunk_idx, chunk) in cues.chunks(self.config.ai.batch_size * 4).enumerate() {
-            let payload = json!({"task":"segment","source_lang":self.config.translation.source_lang,"tokens":chunk.iter().enumerate().map(|(i,c)|json!({"i":i,"text":c.source})).collect::<Vec<_>>()});
-            let input_json = payload.to_string();
-            let r = self.call_pi(payload).await?;
-            let local = parse_ranges(&r.value)?;
-            let offset = chunk_idx * self.config.ai.batch_size * 4;
-            for (a, b) in local {
-                ranges.push((a + offset, b + offset));
+        let mut calls = 0;
+        if self.config.ai.batch_mode == BatchMode::WholeVideo || estimated <= budget {
+            if estimated > budget {
+                bail!(
+                    "whole_video 分句预计需要 {estimated} tokens，超过安全阈值 {budget}；请改用 adaptive"
+                )
             }
-            self.db.record_ai_call(
-                job_id,
-                stage,
-                "segment",
-                &self.config.ai.provider,
-                &self.config.ai.model,
-                &self.config.ai.thinking,
-                &r.usage,
-                r.output.duration_ms,
-                &input_json,
-                &r.value.to_string(),
-            )?;
-            duration += r.output.duration_ms;
-            peak = peak.max(r.output.peak_rss_kib);
+            let (local, elapsed, rss) = self
+                .segment_batch(job_id, stage, cues, 0, cues.len().saturating_sub(1))
+                .await?;
+            ranges = local;
+            duration += elapsed;
+            peak = peak.max(rss);
+            calls = 1;
+        } else {
+            let overlap = self.config.ai.segment_overlap_cues;
+            let mut cursor = 0;
+            while cursor < cues.len() {
+                let window_start = cursor.saturating_sub(overlap);
+                let window_end = max_segment_window_end(cues, window_start, budget)?;
+                if window_end < cursor {
+                    bail!("安全 token 阈值过小，无法容纳分句核心字幕")
+                }
+                let has_more = window_end + 1 < cues.len();
+                let preferred_end = if has_more {
+                    window_end.saturating_sub(overlap).max(cursor)
+                } else {
+                    cues.len() - 1
+                };
+                let (local, elapsed, rss) = self
+                    .segment_batch(
+                        job_id,
+                        stage,
+                        &cues[window_start..=window_end],
+                        cursor - window_start,
+                        preferred_end - window_start,
+                    )
+                    .await?;
+                let chosen_end = if has_more {
+                    choose_adaptive_boundary(
+                        &local,
+                        window_start,
+                        cursor,
+                        preferred_end,
+                        window_end,
+                    )?
+                } else {
+                    cues.len() - 1
+                };
+                append_core_ranges(&mut ranges, &local, window_start, cursor, chosen_end)?;
+                cursor = chosen_end + 1;
+                duration += elapsed;
+                peak = peak.max(rss);
+                calls += 1;
+            }
         }
         let result = subtitle::apply_ranges(cues, &ranges)?;
         self.db.finish_stage(
@@ -333,9 +367,53 @@ impl Pipeline {
             "completed",
             duration,
             peak,
-            Some(&format!("{} -> {} cues", cues.len(), result.len())),
+            Some(&format!(
+                "{} -> {} cues; mode={}; estimated_tokens={estimated}; calls={calls}",
+                cues.len(),
+                result.len(),
+                batch_mode_name(self.config.ai.batch_mode)
+            )),
         )?;
         Ok(result)
+    }
+
+    async fn segment_batch(
+        &self,
+        job_id: &str,
+        stage: i64,
+        cues: &[Cue],
+        core_start: usize,
+        preferred_end: usize,
+    ) -> Result<(Vec<(usize, usize)>, i64, u64)> {
+        let payload = json!({
+            "task":"segment",
+            "source_lang":self.config.translation.source_lang,
+            "core_start":core_start,
+            "preferred_end":preferred_end,
+            "tokens":cues.iter().enumerate().map(|(i,c)|json!({
+                "i":i,
+                "start":c.start,
+                "end":c.end,
+                "text":c.source
+            })).collect::<Vec<_>>()
+        });
+        let input_json = payload.to_string();
+        let r = self.call_pi(payload).await?;
+        let local = parse_ranges(&r.value)?;
+        validate_ranges_cover(cues.len(), &local)?;
+        self.db.record_ai_call(
+            job_id,
+            stage,
+            "segment",
+            &self.config.ai.provider,
+            &self.config.ai.model,
+            &self.config.ai.thinking,
+            &r.usage,
+            r.output.duration_ms,
+            &input_json,
+            &r.value.to_string(),
+        )?;
+        Ok((local, r.output.duration_ms, r.output.peak_rss_kib))
     }
 
     async fn translate(&self, job_id: &str, cues: &mut [Cue]) -> Result<()> {
@@ -348,15 +426,32 @@ impl Pipeline {
             Some(&self.config.ai.model),
             Some(&self.config.ai.thinking),
         )?;
+        let budget = self.ai_token_budget()?;
+        let estimated = estimate_translation_tokens(cues);
+        let batches = if self.config.ai.batch_mode == BatchMode::WholeVideo {
+            if estimated > budget {
+                bail!(
+                    "whole_video 翻译预计需要 {estimated} tokens，超过安全阈值 {budget}；请改用 adaptive"
+                )
+            }
+            vec![(0, cues.len())]
+        } else if estimated <= budget {
+            vec![(0, cues.len())]
+        } else {
+            translation_batches(cues, budget)?
+        };
         let mut all = Vec::new();
         let mut duration = 0;
         let mut peak = 0;
-        for (chunk_idx, chunk) in cues.chunks(self.config.ai.batch_size).enumerate() {
+        for &(start, end) in &batches {
+            let chunk = &cues[start..end];
             let payload = json!({"task":"translate","source_lang":self.config.translation.source_lang,"target_lang":self.config.translation.target_lang,"items":chunk.iter().enumerate().map(|(i,c)|json!({"i":i,"text":c.source})).collect::<Vec<_>>()});
             let input_json = payload.to_string();
             let r = self.call_pi(payload).await?;
-            for (i, t) in parse_translations(&r.value)? {
-                all.push((i + chunk_idx * self.config.ai.batch_size, t));
+            let local = parse_translations(&r.value)?;
+            validate_translation_indexes(chunk.len(), &local)?;
+            for (i, t) in local {
+                all.push((i + start, t));
             }
             self.db.record_ai_call(
                 job_id,
@@ -379,9 +474,23 @@ impl Pipeline {
             "completed",
             duration,
             peak,
-            Some(&format!("{} cues", cues.len())),
+            Some(&format!(
+                "{} cues; mode={}; estimated_tokens={estimated}; calls={}",
+                cues.len(),
+                batch_mode_name(self.config.ai.batch_mode),
+                batches.len()
+            )),
         )?;
         Ok(())
+    }
+
+    fn ai_token_budget(&self) -> Result<usize> {
+        let context = self.config.ai.context_window_tokens;
+        let safe = self.config.ai.safe_context_tokens;
+        if context == 0 || safe == 0 || safe > context {
+            bail!("AI token 配置无效: safe_context_tokens={safe}, context_window_tokens={context}")
+        }
+        Ok(safe)
     }
 
     async fn translate_title(&self, job_id: &str, title: &str) -> Result<String> {
@@ -669,6 +778,179 @@ impl Pipeline {
     }
 }
 
+const PI_PROMPT_OVERHEAD_TOKENS: usize = 2_048;
+
+fn batch_mode_name(mode: BatchMode) -> &'static str {
+    match mode {
+        BatchMode::WholeVideo => "whole_video",
+        BatchMode::Adaptive => "adaptive",
+    }
+}
+
+fn estimate_text_tokens(text: &str) -> usize {
+    let mut tokens: usize = 0;
+    let mut ascii_run: usize = 0;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '\'') {
+            ascii_run += 1;
+            continue;
+        }
+        if ascii_run > 0 {
+            tokens += ascii_run.div_ceil(4);
+            ascii_run = 0;
+        }
+        if !ch.is_whitespace() {
+            tokens += 1;
+        }
+    }
+    if ascii_run > 0 {
+        tokens += ascii_run.div_ceil(4);
+    }
+    tokens.max(1)
+}
+
+fn segment_cue_tokens(cue: &Cue) -> usize {
+    estimate_text_tokens(&cue.source) + 22
+}
+
+fn translation_cue_tokens(cue: &Cue) -> usize {
+    let source = estimate_text_tokens(&cue.source);
+    source.saturating_mul(2) + 20
+}
+
+fn estimate_segment_tokens(cues: &[Cue]) -> usize {
+    PI_PROMPT_OVERHEAD_TOKENS + cues.iter().map(segment_cue_tokens).sum::<usize>()
+}
+
+fn estimate_translation_tokens(cues: &[Cue]) -> usize {
+    PI_PROMPT_OVERHEAD_TOKENS + cues.iter().map(translation_cue_tokens).sum::<usize>()
+}
+
+fn max_segment_window_end(cues: &[Cue], start: usize, budget: usize) -> Result<usize> {
+    if start >= cues.len() {
+        bail!("分句窗口起点越界: {start}/{}", cues.len())
+    }
+    let mut total = PI_PROMPT_OVERHEAD_TOKENS;
+    let mut end = None;
+    for (index, cue) in cues.iter().enumerate().skip(start) {
+        let item = segment_cue_tokens(cue);
+        if total.saturating_add(item) > budget {
+            break;
+        }
+        total += item;
+        end = Some(index);
+    }
+    end.with_context(|| {
+        format!(
+            "单条字幕已超过安全 token 阈值 {budget}: cue={start}, estimated={}",
+            PI_PROMPT_OVERHEAD_TOKENS + segment_cue_tokens(&cues[start])
+        )
+    })
+}
+
+fn translation_batches(cues: &[Cue], budget: usize) -> Result<Vec<(usize, usize)>> {
+    if cues.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut total = PI_PROMPT_OVERHEAD_TOKENS;
+    for (index, cue) in cues.iter().enumerate() {
+        let item = translation_cue_tokens(cue);
+        if PI_PROMPT_OVERHEAD_TOKENS.saturating_add(item) > budget {
+            bail!(
+                "单句翻译已超过安全 token 阈值 {budget}: cue={index}, estimated={}",
+                PI_PROMPT_OVERHEAD_TOKENS + item
+            )
+        }
+        if total.saturating_add(item) > budget {
+            batches.push((start, index));
+            start = index;
+            total = PI_PROMPT_OVERHEAD_TOKENS;
+        }
+        total += item;
+    }
+    batches.push((start, cues.len()));
+    Ok(batches)
+}
+
+fn validate_ranges_cover(len: usize, ranges: &[(usize, usize)]) -> Result<()> {
+    let mut expected = 0;
+    for &(start, end) in ranges {
+        if start != expected || end < start || end >= len {
+            bail!("Pi 分句范围不连续或越界: {start}..{end}, expected={expected}, len={len}")
+        }
+        expected = end + 1;
+    }
+    if expected != len {
+        bail!("Pi 分句没有覆盖完整窗口: {expected}/{len}")
+    }
+    Ok(())
+}
+
+fn validate_translation_indexes(len: usize, translations: &[(usize, String)]) -> Result<()> {
+    if translations.len() != len {
+        bail!("Pi 翻译数量不匹配: {}/{}", translations.len(), len)
+    }
+    for (expected, (index, _)) in translations.iter().enumerate() {
+        if *index != expected {
+            bail!("Pi 翻译索引无序或缺失: index={index}, expected={expected}")
+        }
+    }
+    Ok(())
+}
+
+fn choose_adaptive_boundary(
+    local: &[(usize, usize)],
+    window_start: usize,
+    cursor: usize,
+    preferred_end: usize,
+    window_end: usize,
+) -> Result<usize> {
+    local
+        .iter()
+        .map(|(_, end)| window_start + end)
+        .filter(|&end| end >= cursor && end <= window_end)
+        .min_by_key(|&end| {
+            (
+                end.abs_diff(preferred_end),
+                usize::from(end > preferred_end),
+            )
+        })
+        .context("Pi 分句窗口中没有可用边界")
+}
+
+fn append_core_ranges(
+    output: &mut Vec<(usize, usize)>,
+    local: &[(usize, usize)],
+    window_start: usize,
+    core_start: usize,
+    core_end: usize,
+) -> Result<()> {
+    let mut expected = core_start;
+    for &(start, end) in local {
+        let global_start = window_start + start;
+        let global_end = window_start + end;
+        if global_end < core_start {
+            continue;
+        }
+        if global_start > core_end {
+            break;
+        }
+        let clipped_start = global_start.max(core_start);
+        let clipped_end = global_end.min(core_end);
+        if clipped_start != expected || clipped_end < clipped_start {
+            bail!("重叠分句合并失败: {clipped_start}..{clipped_end}, expected={expected}")
+        }
+        output.push((clipped_start, clipped_end));
+        expected = clipped_end + 1;
+    }
+    if expected != core_end + 1 {
+        bail!("重叠分句未覆盖核心窗口: {expected}/{}", core_end + 1)
+    }
+    Ok(())
+}
+
 fn find_video(work: &Path, video_id: &str) -> Option<PathBuf> {
     fs::read_dir(work)
         .ok()?
@@ -769,11 +1051,66 @@ fn parse_translations(v: &Value) -> Result<Vec<(usize, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cue(index: usize, text: &str) -> Cue {
+        Cue {
+            start: index as f64 * 2.0,
+            end: index as f64 * 2.0 + 1.8,
+            source: text.into(),
+            translation: None,
+        }
+    }
+
     #[test]
     fn pi_json() {
         let s = r#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"{\"ranges\":[{\"start\":0,\"end\":1}]}"}],"usage":{"input":2,"output":3,"totalTokens":5}}]}"#;
         let (v, u) = parse_pi_stream(s).unwrap();
         assert_eq!(parse_ranges(&v).unwrap(), vec![(0, 1)]);
         assert_eq!(u.total, 5);
+    }
+
+    #[test]
+    fn thirty_minute_subtitles_fit_default_safe_budget() {
+        let cues = (0..1_800)
+            .map(|i| {
+                cue(
+                    i,
+                    "this is a representative subtitle sentence with useful context",
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(estimate_segment_tokens(&cues) < 200_000);
+        assert!(estimate_translation_tokens(&cues) < 200_000);
+    }
+
+    #[test]
+    fn adaptive_translation_batches_are_contiguous() {
+        let cues = (0..20)
+            .map(|i| cue(i, "a moderately sized subtitle sentence"))
+            .collect::<Vec<_>>();
+        let batches = translation_batches(&cues, 2_300).unwrap();
+        assert!(batches.len() > 1);
+        assert_eq!(batches.first().map(|x| x.0), Some(0));
+        assert_eq!(batches.last().map(|x| x.1), Some(cues.len()));
+        assert!(batches.windows(2).all(|pair| pair[0].1 == pair[1].0));
+    }
+
+    #[test]
+    fn adaptive_segmentation_uses_overlap_and_model_boundary() {
+        let local = vec![(0, 2), (3, 5), (6, 8)];
+        validate_ranges_cover(9, &local).unwrap();
+        let boundary = choose_adaptive_boundary(&local, 10, 12, 15, 18).unwrap();
+        assert_eq!(boundary, 15);
+        let mut output = Vec::new();
+        append_core_ranges(&mut output, &local, 10, 12, boundary).unwrap();
+        assert_eq!(output, vec![(12, 12), (13, 15)]);
+    }
+
+    #[test]
+    fn translation_batch_requires_every_index_in_order() {
+        let valid = vec![(0, "甲".into()), (1, "乙".into())];
+        validate_translation_indexes(2, &valid).unwrap();
+        let duplicate = vec![(0, "甲".into()), (0, "乙".into())];
+        assert!(validate_translation_indexes(2, &duplicate).is_err());
     }
 }

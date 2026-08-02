@@ -35,7 +35,12 @@ provider = "openai-codex"
 model = "gpt-5.6-luna"
 thinking = "high"
 timeout_seconds = 300
-batch_size = 50
+# adaptive: 安全阈值内整条视频一次处理，超限后按 token 自动拆批。
+# whole_video: 只允许整条视频一次处理，超过安全阈值则停止并提示切换模式。
+batch_mode = "adaptive"
+context_window_tokens = 256000
+safe_context_tokens = 200000
+segment_overlap_cues = 12
 # daily_token_limit = 1000000
 
 [[ai.allowed_models]]
