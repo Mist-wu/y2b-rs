@@ -9,6 +9,7 @@ Rust CLI/TUI 工具：监控 YouTube 频道更新，下载视频与字幕，调�
 - 有英文字幕：Pi 分句 → Pi 翻译 → 双语 ASS → H.264/AAC 压制 → 投稿。
 - 无字幕：先投稿原片，状态设为 `uploaded_original_pending_subtitle`；之后重查字幕并以 `biliup append --vid` 追加双语分P。
 - Pi 默认 `openai-codex/gpt-5.6-luna`，thinking `high`；每次调用使用 `--no-session --no-tools`，只加载 `pi/y2b-extension.ts`。
+- Pi 批处理支持 `adaptive` 和 `whole_video`。默认按 256k 上下文、200k 安全阈值估算输入与输出；阈值内整条视频只调用一次分句和一次翻译，超限时按 token 拆批。自适应分句携带前后 12 条上下文，并在 Pi 返回的自然分句边界衔接批次。
 - SQLite 持久化频道、任务、阶段、峰值 RSS、Pi token/cost 和认证状态。连续失败 5 次进入 `dead_letter` 并删除大型视频。
 
 ## CLI
