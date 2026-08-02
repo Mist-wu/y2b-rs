@@ -42,7 +42,7 @@ impl Database {
           status TEXT NOT NULL, published_at TEXT, youtube_updated_at TEXT,
           discovered_at TEXT NOT NULL, is_short INTEGER NOT NULL DEFAULT 0,
           duration_seconds REAL, width INTEGER, height INTEGER, fps REAL,
-          bvid TEXT, provider TEXT, ai_model TEXT, thinking TEXT,
+          bvid TEXT, append_to_bvid TEXT, provider TEXT, ai_model TEXT, thinking TEXT,
           attempt INTEGER NOT NULL DEFAULT 0, error TEXT,
           raw_video_path TEXT, rendered_path TEXT, subtitle_path TEXT,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -88,6 +88,15 @@ impl Database {
             c.execute("ALTER TABLE ai_calls ADD COLUMN output_json TEXT", [])?;
         }
         c.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)",[])?;
+        let mut columns = c.prepare("PRAGMA table_info(jobs)")?;
+        let names = columns
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(columns);
+        if !names.iter().any(|n| n == "append_to_bvid") {
+            c.execute("ALTER TABLE jobs ADD COLUMN append_to_bvid TEXT", [])?;
+        }
+        c.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,CURRENT_TIMESTAMP)",[])?;
         Ok(())
     }
 
@@ -194,16 +203,16 @@ impl Database {
     }
 
     pub fn get_job(&self, id: &str) -> Result<Option<Job>> {
-        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE id=?",[id],job_from_row).optional().map_err(Into::into)
+        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE id=?",[id],job_from_row).optional().map_err(Into::into)
     }
     pub fn list_jobs(&self, limit: usize) -> Result<Vec<Job>> {
         let c = self.conn();
-        let mut q=c.prepare("SELECT id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,provider,ai_model,thinking,attempt,error FROM jobs ORDER BY discovered_at DESC LIMIT ?")?;
+        let mut q=c.prepare("SELECT id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs ORDER BY discovered_at DESC LIMIT ?")?;
         Ok(q.query_map([limit as i64], job_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn next_queued_job(&self) -> Result<Option<Job>> {
-        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE status IN ('queued','retry_wait') ORDER BY discovered_at LIMIT 1",[],job_from_row).optional().map_err(Into::into)
+        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE status IN ('queued','retry_wait') ORDER BY discovered_at LIMIT 1",[],job_from_row).optional().map_err(Into::into)
     }
 
     pub fn recover_incomplete_jobs(&self) -> Result<usize> {
@@ -265,6 +274,37 @@ impl Database {
         self.conn().execute(
             "UPDATE jobs SET bvid=?,updated_at=? WHERE id=?",
             params![bvid, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+    pub fn queue_subtitle_recheck(&self, id: &str) -> Result<()> {
+        let c = self.conn();
+        let (status, bvid, existing): (String, Option<String>, Option<String>) = c
+            .query_row(
+                "SELECT status,bvid,append_to_bvid FROM jobs WHERE id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .with_context(|| format!("任务不存在: {id}"))?;
+        let target = existing
+            .or_else(|| {
+                (status == JobStatus::UploadedOriginalPendingSubtitle.to_string())
+                    .then_some(bvid)
+                    .flatten()
+            })
+            .filter(|value| !value.trim().is_empty())
+            .with_context(|| format!("任务 {id} 没有可追加的原稿 BV"))?;
+        c.execute(
+            "UPDATE jobs SET status='queued',append_to_bvid=?,attempt=0,error=NULL,updated_at=? WHERE id=?",
+            params![target, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+    pub fn clear_job_append_target(&self, id: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE jobs SET append_to_bvid=NULL,updated_at=? WHERE id=?",
+            params![Utc::now().to_rfc3339(), id],
         )?;
         Ok(())
     }
@@ -415,11 +455,12 @@ fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         width: r.get(11)?,
         height: r.get(12)?,
         bvid: r.get(13)?,
-        provider: r.get(14)?,
-        ai_model: r.get(15)?,
-        thinking: r.get(16)?,
-        attempt: r.get(17)?,
-        error: r.get(18)?,
+        append_to_bvid: r.get(14)?,
+        provider: r.get(15)?,
+        ai_model: r.get(16)?,
+        thinking: r.get(17)?,
+        attempt: r.get(18)?,
+        error: r.get(19)?,
     })
 }
 fn usage_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AiUsage> {
@@ -442,6 +483,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
+        assert_eq!(db.schema_version().unwrap(), 3);
         assert!(
             db.create_job(None, "abc", "https://youtu.be/abc", None, None, None)
                 .unwrap()
@@ -456,5 +498,32 @@ mod tests {
             .unwrap();
         assert_eq!(db.recover_incomplete_jobs().unwrap(), 1);
         assert_eq!(db.list_jobs(1).unwrap()[0].status, JobStatus::Queued);
+    }
+
+    #[test]
+    fn subtitle_recheck_persists_append_target_across_recovery() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        let id = db
+            .create_job(None, "abc", "https://youtu.be/abc", None, None, None)
+            .unwrap()
+            .unwrap();
+
+        assert!(db.queue_subtitle_recheck(&id).is_err());
+        db.set_job_bvid(&id, "BV1test").unwrap();
+        db.update_job_status(&id, JobStatus::UploadedOriginalPendingSubtitle, None)
+            .unwrap();
+        db.queue_subtitle_recheck(&id).unwrap();
+
+        let queued = db.get_job(&id).unwrap().unwrap();
+        assert_eq!(queued.status, JobStatus::Queued);
+        assert_eq!(queued.append_to_bvid.as_deref(), Some("BV1test"));
+
+        db.update_job_status(&id, JobStatus::Rendering, None)
+            .unwrap();
+        assert_eq!(db.recover_incomplete_jobs().unwrap(), 1);
+        let recovered = db.get_job(&id).unwrap().unwrap();
+        assert_eq!(recovered.status, JobStatus::Queued);
+        assert_eq!(recovered.append_to_bvid.as_deref(), Some("BV1test"));
     }
 }

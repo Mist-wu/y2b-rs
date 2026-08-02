@@ -252,12 +252,31 @@ fn app(
                         ))
                     }
                 }
-                KeyCode::Char('r') | KeyCode::Char('p') => {
+                KeyCode::Char('r') => {
                     if let Some(i) = state.selected()
                         && let Some(j) = jobs.get(i)
                     {
-                        db.update_job_status(&j.id, JobStatus::Queued, None)?;
-                        notice = format!("已重新排队 {}", j.video_id);
+                        if j.status == JobStatus::UploadedOriginalPendingSubtitle
+                            || j.append_to_bvid.is_some()
+                        {
+                            match db.queue_subtitle_recheck(&j.id) {
+                                Ok(()) => notice = format!("已排队补字幕并追加原稿 {}", j.video_id),
+                                Err(e) => notice = format!("补字幕排队失败: {e}"),
+                            }
+                        } else {
+                            db.update_job_status(&j.id, JobStatus::Queued, None)?;
+                            notice = format!("已重新排队 {}", j.video_id);
+                        }
+                    }
+                }
+                KeyCode::Char('p') => {
+                    if let Some(i) = state.selected()
+                        && let Some(j) = jobs.get(i)
+                    {
+                        match db.queue_subtitle_recheck(&j.id) {
+                            Ok(()) => notice = format!("已排队补字幕并追加原稿 {}", j.video_id),
+                            Err(e) => notice = format!("补字幕排队失败: {e}"),
+                        }
                     }
                 }
                 KeyCode::Char(' ') => {

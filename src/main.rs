@@ -195,9 +195,23 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&db.get_job(&id)?)?);
                 println!("{}", serde_json::to_string_pretty(&db.list_stages(&id)?)?)
             }
-            JobCmd::Retry { id } | JobCmd::RecheckSubtitle { id } => {
-                db.update_job_status(&id, JobStatus::Queued, None)?;
-                println!("已重新排队 {id}");
+            JobCmd::Retry { id } => {
+                let job = db
+                    .get_job(&id)?
+                    .with_context(|| format!("任务不存在: {id}"))?;
+                if job.status == JobStatus::UploadedOriginalPendingSubtitle
+                    || job.append_to_bvid.is_some()
+                {
+                    db.queue_subtitle_recheck(&id)?;
+                    println!("已排队补字幕并将追加到原稿 {id}");
+                } else {
+                    db.update_job_status(&id, JobStatus::Queued, None)?;
+                    println!("已重新排队 {id}");
+                }
+            }
+            JobCmd::RecheckSubtitle { id } => {
+                db.queue_subtitle_recheck(&id)?;
+                println!("已排队补字幕并将追加到原稿 {id}");
             }
         },
         Cmd::Model(c) => match c {

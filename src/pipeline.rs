@@ -60,11 +60,7 @@ impl Pipeline {
         {
             bail!("Bilibili 认证失效，暂停处理并保留现有文件")
         }
-        let append_to = if job.status == JobStatus::UploadedOriginalPendingSubtitle {
-            job.bvid.clone()
-        } else {
-            None
-        };
+        let append_to = job.append_to_bvid.clone();
         self.db.set_job_model(
             &job.id,
             &self.config.ai.provider,
@@ -151,14 +147,17 @@ impl Pipeline {
             .unwrap_or_else(|_| meta.title.clone());
         self.probe_media(&job.id, &rendered, "rendered_probe")
             .await?;
-        let bvid = if let Some(existing) = append_to {
-            self.append(&job.id, &rendered, &existing).await?;
-            existing
+        let bvid = if let Some(existing) = append_to.as_deref() {
+            self.append(&job.id, &rendered, existing).await?;
+            existing.to_owned()
         } else {
             self.upload(&job.id, &rendered, &title, &job.url, None)
                 .await?
         };
         self.db.set_job_bvid(&job.id, &bvid)?;
+        if append_to.is_some() {
+            self.db.clear_job_append_target(&job.id)?;
+        }
         self.db
             .update_job_status(&job.id, JobStatus::Completed, None)?;
         self.after_upload(&job.id, &[&video, &rendered])?;
