@@ -52,16 +52,25 @@ TUI：`Tab` 切换任务/频道列表，`↑/↓` 选择，`n` 输入单个 YouT
 
 ## 荒野乱斗词库审计
 
-`scripts/audit_brawl_glossary.py` 从国际服客户端镜像的 `localization/texts`、`localization/cn`、`localization/texts_patch` 以及游戏逻辑 TID 引用生成英文/简中术语集。完整说明句、占位模板、纯数字和一词多译项目不会进入强制词库。
+`scripts/audit_brawl_glossary.py` 从国际服客户端镜像的 `localization/texts`、`localization/cn`、`localization/texts_patch` 以及游戏逻辑 TID 引用生成英文/简中术语集。完整说明句、占位模板、纯数字、一词多译项目、商店/通知/教程 UI 不会进入强制词库。提取器按引用行的 `Disabled` 字段把术语分为当前 `active` 和历史 `legacy`，不依靠名称或发布时间猜测状态。
 
 ```bash
 python3 scripts/audit_brawl_glossary.py \
   --server root@157.230.241.109 \
   --models gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra \
   --output /tmp/y2b-brawl-glossary-audit.json
+
+# 使用已有模型错误并集重建分层生产词库
+python3 scripts/audit_brawl_glossary.py \
+  --models '' \
+  --output /tmp/y2b-brawl-glossary-extract.json \
+  --production-from pi/brawl-stars-glossary.json \
+  --production-output pi/brawl-stars-glossary.json
 ```
 
-脚本固定使用 `thinking=high`，默认使用不含任何答案的 `pi/audit-policy.json`，避免生产词库污染模型能力测试；支持 `--terms-file` 重用提取结果、`--resume` 断点续跑和 `--shard-index/--shard-count` 分片。单词调用超时或失败会按错误计入并继续。当前生产词库及数据版本、筛选数量、模型审计统计保存在 `pi/brawl-stars-glossary.json`。
+脚本固定使用 `thinking=high`，默认使用不含任何答案的 `pi/audit-policy.json`，extension 在此模式下不会加载生产词库，避免污染模型能力测试；支持 `--terms-file` 重用提取结果、`--resume` 断点续跑和 `--shard-index/--shard-count` 分片。单词调用超时或失败会按错误计入并继续。
+
+生产运行时的四层优先级为：`policy.json` 人工 `curated` > 动态数值 `patterns` > 当前 `active` > 历史 `legacy`。Pi 每次只接收输入中精确命中的词；`legacy` 不会常驻上下文，但视频明确提到旧地图时仍使用当年的游戏内官译。被规则折叠或来源排除的模型错误保存在 `omitted` 供下次重建，不参与运行时注入。
 
 ## 新服务器部署
 

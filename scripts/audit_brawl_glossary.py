@@ -20,7 +20,45 @@ from typing import Any
 
 
 API_ROOT = "https://api.brawlapi.com"
-USER_AGENT = "y2b-rs-glossary-audit/1.0"
+USER_AGENT = "y2b-rs-glossary-audit/2.0"
+PATTERN_RULES = [
+    {
+        "id": "numeric-gems",
+        "pattern": r"(?<![A-Za-z0-9])([0-9][0-9,.]*)\s+Gems?(?![A-Za-z0-9])",
+        "flags": "gi",
+        "translation": "{1}宝石",
+    },
+    {
+        "id": "numeric-coins",
+        "pattern": r"(?<![A-Za-z0-9])([0-9][0-9,.]*)\s+Coins?(?![A-Za-z0-9])",
+        "flags": "gi",
+        "translation": "{1}金币",
+    },
+    {
+        "id": "numeric-power-points",
+        "pattern": r"(?<![A-Za-z0-9])([0-9][0-9,.]*)\s+Power Points?(?![A-Za-z0-9])",
+        "flags": "gi",
+        "translation": "{1}战力能量",
+    },
+    {
+        "id": "numeric-bling",
+        "pattern": r"(?<![A-Za-z0-9])([0-9][0-9,.]*)\s+Bling(?![A-Za-z0-9])",
+        "flags": "gi",
+        "translation": "{1}闪闪币",
+    },
+]
+IGNORED_REFERENCE_PATHS = {
+    "csv_client/billing_packages",
+    "csv_client/hints",
+    "csv_client/local_notifications",
+    "csv_client/login_calendar_items",
+    "csv_client/oddity_shop_reactions",
+    "csv_client/shop_items",
+    "csv_client/tutorial",
+    "csv_logic/buddy_shop",
+    "csv_logic/messages",
+    "csv_logic/visual_offer_groupings",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -29,6 +67,9 @@ class Term:
     target: str
     tid: str
     categories: tuple[str, ...]
+    status: str = "active"
+    active_references: int = 0
+    disabled_references: int = 0
 
 
 def fetch_json(url: str, attempts: int = 3) -> dict[str, Any]:
@@ -78,26 +119,22 @@ def iter_rows(data: Any) -> list[dict[str, Any]]:
     return [row for row in rows if isinstance(row, dict)]
 
 
-def scan_tid_references(path: str) -> tuple[str, dict[str, set[str]]]:
-    columns: dict[str, set[str]] = collections.defaultdict(set)
+def scan_tid_references(
+    path: str,
+) -> tuple[str, dict[str, set[tuple[str, bool]]]]:
+    references: dict[str, set[tuple[str, bool]]] = collections.defaultdict(set)
     for row in iter_rows(raw_csv(path)["data"]):
+        disabled = row.get("Disabled") is True
         for column, value in row.items():
             values = value if isinstance(value, list) else [value]
             for item in values:
                 if isinstance(item, str) and item.startswith("TID_"):
-                    columns[column].add(item)
-    return path, columns
+                    references[item].add((column, disabled))
+    return path, references
 
 
 def is_terminology_reference(path: str, column: str) -> bool:
-    sentence_files = {
-        "csv_client/hints",
-        "csv_client/local_notifications",
-        "csv_client/oddity_shop_reactions",
-        "csv_client/tutorial",
-        "csv_logic/messages",
-    }
-    if path in sentence_files:
+    if path in IGNORED_REFERENCE_PATHS or path.startswith("csv_logic/shop_"):
         return False
     lowered = column.casefold()
     if any(
@@ -144,14 +181,14 @@ def extract_terms(workers: int) -> tuple[list[Term], dict[str, Any]]:
         if path.startswith(("csv_logic/", "csv_client/")) and not path.endswith(" 2")
     )
 
-    references: dict[str, set[tuple[str, str]]] = collections.defaultdict(set)
+    references: dict[str, set[tuple[str, str, bool]]] = collections.defaultdict(set)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        for path, columns in executor.map(scan_tid_references, paths):
-            for column, tids in columns.items():
-                if not is_terminology_reference(path, column):
-                    continue
-                for tid in tids:
-                    references[tid].add((path, column))
+        for path, tids in executor.map(scan_tid_references, paths):
+            for tid, rows in tids.items():
+                for column, disabled in rows:
+                    if not is_terminology_reference(path, column):
+                        continue
+                    references[tid].add((path, column, disabled))
 
     english_doc = raw_csv("localization/texts")
     chinese_doc = raw_csv("localization/cn")
@@ -179,8 +216,21 @@ def extract_terms(workers: int) -> tuple[list[Term], dict[str, Any]]:
         if not is_term_like(source, target):
             continue
         raw_term_rows += 1
-        categories = tuple(sorted({path for path, _ in sources}))
-        grouped[normalize(source)].append(Term(source, target, tid, categories))
+        categories = tuple(sorted({path for path, _, _ in sources}))
+        active_references = sum(not disabled for _, _, disabled in sources)
+        disabled_references = sum(disabled for _, _, disabled in sources)
+        status = "active" if active_references else "legacy"
+        grouped[normalize(source)].append(
+            Term(
+                source,
+                target,
+                tid,
+                categories,
+                status,
+                active_references,
+                disabled_references,
+            )
+        )
 
     terms: list[Term] = []
     ambiguous: list[dict[str, Any]] = []
@@ -197,12 +247,17 @@ def extract_terms(workers: int) -> tuple[list[Term], dict[str, Any]]:
             continue
         representative = sorted(rows, key=lambda row: (row.source.casefold(), row.tid))[0]
         categories = tuple(sorted({category for row in rows for category in row.categories}))
+        active_references = sum(row.active_references for row in rows)
+        disabled_references = sum(row.disabled_references for row in rows)
         terms.append(
             Term(
                 representative.source,
                 representative.target,
                 representative.tid,
                 categories,
+                "active" if active_references else "legacy",
+                active_references,
+                disabled_references,
             )
         )
 
@@ -217,8 +272,12 @@ def extract_terms(workers: int) -> tuple[list[Term], dict[str, Any]]:
         "raw_term_rows": raw_term_rows,
         "unique_english": len(grouped),
         "unambiguous_terms": len(terms),
+        "active_terms": sum(term.status == "active" for term in terms),
+        "legacy_terms": sum(term.status == "legacy" for term in terms),
         "ambiguous_terms": len(ambiguous),
         "ambiguous": ambiguous,
+        "ignored_reference_paths": sorted(IGNORED_REFERENCE_PATHS)
+        + ["csv_logic/shop_*"],
     }
     return terms, metadata
 
@@ -396,6 +455,92 @@ def write_report(path: pathlib.Path, report: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def pattern_matches(source: str) -> bool:
+    return any(re.fullmatch(rule["pattern"], source, re.IGNORECASE) for rule in PATTERN_RULES)
+
+
+def previous_glossary(document: dict[str, Any]) -> dict[str, str]:
+    if isinstance(document.get("glossary"), dict):
+        return document["glossary"]
+    flattened: dict[str, str] = {}
+    for layer in ("active", "legacy", "omitted"):
+        for source, entry in (document.get(layer) or {}).items():
+            if isinstance(entry, str):
+                flattened[source] = entry
+            elif isinstance(entry, dict) and isinstance(entry.get("translation"), str):
+                flattened[source] = entry["translation"]
+    return flattened
+
+
+def build_production_glossary(
+    terms: list[Term],
+    source_metadata: dict[str, Any],
+    previous: dict[str, Any],
+) -> dict[str, Any]:
+    failures = previous_glossary(previous)
+    failed_normalized = {normalize(source) for source in failures}
+    active: dict[str, Any] = {}
+    legacy: dict[str, Any] = {}
+    for term in terms:
+        if normalize(term.source) not in failed_normalized or pattern_matches(term.source):
+            continue
+        entry = {
+            "translation": term.target,
+            "representative_tid": term.tid,
+            "sources": list(term.categories),
+            "active_references": term.active_references,
+            "disabled_references": term.disabled_references,
+        }
+        (active if term.status == "active" else legacy)[term.source] = entry
+
+    active = dict(sorted(active.items(), key=lambda item: item[0].casefold()))
+    legacy = dict(sorted(legacy.items(), key=lambda item: item[0].casefold()))
+    selected = {normalize(source) for source in active} | {
+        normalize(source) for source in legacy
+    }
+    omitted = {
+        source: {
+            "translation": target,
+            "reason": "pattern" if pattern_matches(source) else "ignored_or_unreferenced",
+        }
+        for source, target in sorted(failures.items(), key=lambda item: item[0].casefold())
+        if normalize(source) not in selected
+    }
+    collapsed = sum(entry["reason"] == "pattern" for entry in omitted.values())
+    excluded = sum(
+        entry["reason"] == "ignored_or_unreferenced" for entry in omitted.values()
+    )
+    return {
+        "version": 2,
+        "game_version": previous.get("game_version"),
+        "language_pair": previous.get("language_pair", "en->zh-CN"),
+        "source": previous.get("source", {}),
+        "selection": {
+            "localization_rows": source_metadata["localization_rows"],
+            "referenced_tids": source_metadata["referenced_tids"],
+            "unambiguous_terms": source_metadata["unambiguous_terms"],
+            "ambiguous_terms_excluded": source_metadata["ambiguous_terms"],
+            "active_candidates": source_metadata["active_terms"],
+            "legacy_candidates": source_metadata["legacy_terms"],
+            "model_failure_inputs": len(failures),
+            "active_entries": len(active),
+            "legacy_entries": len(legacy),
+            "pattern_collapsed_entries": collapsed,
+            "excluded_or_unreferenced_failures": excluded,
+            "ignored_reference_paths": source_metadata["ignored_reference_paths"],
+        },
+        "audit": previous.get("audit", {}),
+        "curated": {
+            "source": "policy.json",
+            "precedence": "highest",
+        },
+        "patterns": PATTERN_RULES,
+        "active": active,
+        "legacy": legacy,
+        "omitted": omitted,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", default="root@157.230.241.109")
@@ -419,6 +564,16 @@ def main() -> int:
         help="Reuse terms and source metadata from a previous extraction report",
     )
     parser.add_argument(
+        "--production-from",
+        type=pathlib.Path,
+        help="Existing audited glossary whose failures should be reclassified",
+    )
+    parser.add_argument(
+        "--production-output",
+        type=pathlib.Path,
+        help="Write a layered production glossary",
+    )
+    parser.add_argument(
         "--output",
         type=pathlib.Path,
         default=pathlib.Path("/tmp/y2b-brawl-glossary-audit.json"),
@@ -435,6 +590,9 @@ def main() -> int:
                 target=row["target"],
                 tid=row["tid"],
                 categories=tuple(row["categories"]),
+                status=row.get("status", "active"),
+                active_references=row.get("active_references", 0),
+                disabled_references=row.get("disabled_references", 0),
             )
             for row in extracted["terms"]
         ]
@@ -458,6 +616,21 @@ def main() -> int:
         print(
             f"using audit shard {args.shard_index + 1}/{args.shard_count}: "
             f"{len(terms)} terms",
+            flush=True,
+        )
+    if bool(args.production_from) != bool(args.production_output):
+        parser.error("--production-from and --production-output must be used together")
+    if args.production_from and args.shard_count != 1:
+        parser.error("production glossary generation requires --shard-count 1")
+    if args.production_from and args.production_output:
+        previous = json.loads(args.production_from.read_text(encoding="utf-8"))
+        production = build_production_glossary(terms, source_metadata, previous)
+        write_report(args.production_output, production)
+        print(
+            f"production glossary: active={len(production['active'])} "
+            f"legacy={len(production['legacy'])} "
+            f"patterns={len(production['patterns'])} "
+            f"path={args.production_output}",
             flush=True,
         )
     if args.resume and args.output.exists():
