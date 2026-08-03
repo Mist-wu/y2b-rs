@@ -677,9 +677,7 @@ impl Pipeline {
                 "--tid",
                 &self.config.bilibili.default_tid.to_string(),
                 "--copyright",
-                "2",
-                "--source",
-                source,
+                "1",
                 "--limit",
                 "1",
             ]);
