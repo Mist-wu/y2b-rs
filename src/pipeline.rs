@@ -1198,14 +1198,26 @@ fn build_description(meta: &VideoMetadata, mode: TransferMode) -> String {
         TransferMode::Direct => "仅翻译标题",
         TransferMode::Translated => "中英双语字幕翻译压制",
     };
-    format!(
-        "原标题：{}\n来源：{}\n原作者：{}\n原发布日期：{}\n处理方式：{}\n处理工具：https://github.com/Mist-wu/y2b-rs",
-        meta.title,
-        source_url,
-        uploader,
-        publication_date(meta),
-        treatment
-    )
+    let mut lines = Vec::with_capacity(5);
+    if let Some(title) = original_title_without_hashtags(&meta.title) {
+        lines.push(format!("原标题：{title}"));
+    }
+    lines.extend([
+        format!("来源：{source_url}"),
+        format!("原作者：{uploader}"),
+        format!("处理方式：{treatment}"),
+        "处理工具：https://github.com/Mist-wu/y2b-rs".to_string(),
+    ]);
+    lines.join("\n")
+}
+
+fn original_title_without_hashtags(title: &str) -> Option<String> {
+    let clean = title
+        .split_whitespace()
+        .filter(|part| !part.starts_with('#') && !part.starts_with('＃'))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!clean.is_empty()).then_some(clean)
 }
 
 fn build_upload_args(
@@ -1718,8 +1730,33 @@ mod tests {
         assert_eq!(value_after("--dynamic"), "最后一局上演极限翻盘。");
         let description = value_after("--desc");
         assert!(description.contains("原标题：Best Ranked Match 2026"));
+        assert!(description.contains("来源：https://www.youtube.com/watch?v=video"));
         assert!(description.contains("原作者：Player One"));
-        assert!(description.contains("原发布日期：2026-08-03"));
+        assert!(!description.contains("原发布日期："));
+        assert!(description.contains("处理方式：中英双语字幕翻译压制"));
+    }
+
+    #[test]
+    fn description_removes_hashtags_and_publication_date() {
+        let mut meta = metadata();
+        meta.title = "Poor   Alli #bs #brawlstars ＃keepbrawlalive".into();
+        meta.url = "https://www.youtube.com/watch?v=F8yN5-ctCZw".into();
+        meta.webpage_url = Some(meta.url.clone());
+        meta.uploader = Some("Bazilious".into());
+        let description = build_description(&meta, TransferMode::Direct);
+        assert_eq!(
+            description,
+            "原标题：Poor Alli\n来源：https://www.youtube.com/watch?v=F8yN5-ctCZw\n原作者：Bazilious\n处理方式：仅翻译标题\n处理工具：https://github.com/Mist-wu/y2b-rs"
+        );
+    }
+
+    #[test]
+    fn description_omits_title_when_it_contains_only_hashtags() {
+        let mut meta = metadata();
+        meta.title = "#bs ＃brawlstars".into();
+        let description = build_description(&meta, TransferMode::Translated);
+        assert!(!description.contains("原标题："));
+        assert!(description.starts_with("来源：https://www.youtube.com/watch?v=video\n"));
         assert!(description.contains("处理方式：中英双语字幕翻译压制"));
     }
 
