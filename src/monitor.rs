@@ -76,6 +76,17 @@ fn extract_thumbnail_url(v: &Value) -> Option<String> {
     })
 }
 
+fn reconcile_after_baseline(
+    baseline: Option<DateTime<Utc>>,
+    timestamp: Option<i64>,
+) -> Option<bool> {
+    let Some(baseline) = baseline else {
+        return Some(true);
+    };
+    let published = timestamp.and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))?;
+    Some(published > baseline)
+}
+
 impl Monitor {
     pub fn new(config: Config, db: Database) -> Result<Self> {
         Ok(Self {
@@ -198,6 +209,7 @@ impl Monitor {
 
     async fn reconcile_channel(&self, id: i64, url: &str) -> Result<usize> {
         let transfer_mode = self.db.channel_transfer_mode(id)?;
+        let baseline = self.db.channel_baseline(id)?;
         let mut cmd = Command::new(&self.config.youtube.yt_dlp);
         cmd.args([
             "--js-runtimes",
@@ -231,6 +243,27 @@ impl Monitor {
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={video_id}"));
             let title = e.get("title").and_then(Value::as_str);
+            if self.db.get_job_by_video_id(video_id)?.is_some() {
+                continue;
+            }
+            let metadata = match self.fetch_metadata(&link).await {
+                Ok((metadata, _, _)) => metadata,
+                Err(error) => {
+                    tracing::warn!(video_id, error = %error, "校对候选元数据获取失败，跳过");
+                    continue;
+                }
+            };
+            match reconcile_after_baseline(baseline, metadata.timestamp) {
+                Some(true) => {}
+                Some(false) => break,
+                None => {
+                    tracing::warn!(video_id, "校对候选缺少发布时间，跳过以避免补录历史视频");
+                    continue;
+                }
+            }
+            let published = metadata
+                .timestamp
+                .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0));
             if self
                 .db
                 .create_job(NewJob {
@@ -238,7 +271,7 @@ impl Monitor {
                     video_id,
                     url: &link,
                     title,
-                    published: None,
+                    published,
                     updated: None,
                     transfer_mode,
                 })?
@@ -432,5 +465,20 @@ mod tests {
             .as_deref(),
             Some("https://i.ytimg.com/best.jpg")
         );
+    }
+
+    #[test]
+    fn reconcile_only_accepts_videos_published_after_channel_baseline() {
+        let baseline = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        assert_eq!(
+            reconcile_after_baseline(Some(baseline), Some(1_800_000_001)),
+            Some(true)
+        );
+        assert_eq!(
+            reconcile_after_baseline(Some(baseline), Some(1_800_000_000)),
+            Some(false)
+        );
+        assert_eq!(reconcile_after_baseline(Some(baseline), None), None);
+        assert_eq!(reconcile_after_baseline(None, None), Some(true));
     }
 }

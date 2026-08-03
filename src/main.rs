@@ -309,8 +309,11 @@ async fn watch(config_path: PathBuf, config: Config, db: Database) -> Result<()>
     }
     let monitor = Monitor::new(config.clone(), db.clone())?;
     let mut poll = tokio::time::interval(Duration::from_secs(config.monitor.poll_seconds));
-    let mut reconcile =
-        tokio::time::interval(Duration::from_secs(config.monitor.reconcile_hours * 3600));
+    let reconcile_period = Duration::from_secs(config.monitor.reconcile_hours * 3600);
+    let mut reconcile = tokio::time::interval_at(
+        tokio::time::Instant::now() + reconcile_period,
+        reconcile_period,
+    );
     let mut backup_tick = tokio::time::interval(Duration::from_secs(6 * 3600));
     let mut auth_tick = tokio::time::interval(Duration::from_secs(24 * 3600));
     let mut worker: Option<tokio::task::JoinHandle<()>> = None;
