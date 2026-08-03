@@ -295,6 +295,19 @@ impl Monitor {
                 id: v["id"].as_str().unwrap_or_default().into(),
                 url: url.into(),
                 title: v["title"].as_str().unwrap_or("Untitled").into(),
+                description: v
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                uploader: v
+                    .get("uploader")
+                    .or_else(|| v.get("channel"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                upload_date: v
+                    .get("upload_date")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 channel: v.get("channel").and_then(Value::as_str).map(str::to_string),
                 channel_id: v
                     .get("channel_id")

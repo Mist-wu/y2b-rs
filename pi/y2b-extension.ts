@@ -37,10 +37,15 @@ Task translate:
 - Preserve code, API names, numbers, usernames, game terminology, and proper nouns accurately.
 - Do not add notes or punctuation that is absent unless natural Chinese readability requires it.
 
-Task title:
-- Input: {"task":"title","text":"..."}
-- Output: {"title":"..."}
-- Produce a natural Bilibili title, concise and not sensationalized, maximum 70 Chinese-width characters.
+Task publish_metadata:
+- Input: {"task":"publish_metadata","transfer_mode":"direct|translated","youtube":{"title":"...","description":"...","url":"...","uploader":"...","published_date":"YYYY-MM-DD"},"subtitle_sampling":{"sampled":false,"total":0,"included":0},"subtitles":[{"i":0,"start":0.0,"end":2.0,"source":"...","translation":"..."}]}
+- Output exactly: {"title":"...","dynamic":"...","tags":["荒野乱斗","..."]}
+- Generate all three fields together from this one input. Do not output tid or any additional fields.
+- title must be a faithful, natural Chinese translation of the YouTube title. Do not add a prefix, source, uploader, hashtags, emoji, or marketing language. Preserve names, game terminology, and numbers. Maximum 70 Chinese-width characters.
+- dynamic must be one paragraph of 1-2 concise Chinese sentences describing the video's concrete highlights. Maximum 120 Chinese-width characters. Do not include a source URL, source attribution, hashtags, emoji, calls to follow/like/coin/subscribe/share, or generic promotional filler.
+- tags must contain 1-4 concrete Chinese tags. “荒野乱斗” must be the first item. Add at most 3 specific topic tags supported by the title, description, or subtitles. Do not prefix tags with # and do not use commas inside a tag. Each tag must be at most 20 characters.
+- For transfer_mode=direct, rely only on the YouTube metadata; subtitles will be empty.
+- For transfer_mode=translated, use the bilingual subtitles to identify the actual content. subtitle_sampling.sampled=true means the caller retained the beginning/end and uniformly sampled the rest; do not infer unsupported details from omitted sections.
 
 Project policy and glossary:
 ${JSON.stringify(policy, null, 2)}`,

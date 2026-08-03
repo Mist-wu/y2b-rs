@@ -1,10 +1,11 @@
 use crate::config::{BatchMode, Config};
 use crate::db::Database;
-use crate::model::{AiUsage, Job, JobStatus, TransferMode, VideoMetadata};
+use crate::model::{AiUsage, Job, JobStatus, PublicationMetadata, TransferMode, VideoMetadata};
 use crate::monitor::Monitor;
 use crate::process::{ProcessOutput, run_monitored};
 use crate::subtitle::{self, Cue};
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::fs;
@@ -23,6 +24,12 @@ struct PiResult {
     value: Value,
     usage: AiUsage,
     output: ProcessOutput,
+}
+
+#[derive(Debug)]
+struct PreparedSubtitle {
+    ass: PathBuf,
+    cues: Vec<Cue>,
 }
 
 impl Pipeline {
@@ -93,10 +100,10 @@ impl Pipeline {
 
         let video_fut = self.download_video(&job.id, &job.url, &meta.id, &work);
         let subtitle_fut = self.prepare_translated_subtitle(job, &meta, &work);
-        let (video, ass) = try_join_branches(video_fut, subtitle_fut).await?;
+        let (video, subtitle) = try_join_branches(video_fut, subtitle_fut).await?;
         self.db
             .set_job_paths(&job.id, Some(&video.to_string_lossy()), None, None)?;
-        let Some(ass) = ass else {
+        let Some(subtitle) = subtitle else {
             if append_to.is_some() {
                 self.cleanup_large(&job.id)?;
                 self.db.update_job_status(
@@ -106,21 +113,46 @@ impl Pipeline {
                 )?;
                 return Ok(());
             }
-            let title = self.translate_title(&job.id, &meta.title).await?;
-            return self.finish_direct_upload(job, &video, &title, true).await;
+            let publication = self
+                .publish_metadata(&job.id, TransferMode::Direct, &meta, None)
+                .await?;
+            return self
+                .finish_direct_upload(job, &meta, &video, &publication, true)
+                .await;
         };
-        let rendered = self.render(&job.id, &video, &ass, &meta.id).await?;
+        let publication = if append_to.is_none() {
+            Some(
+                self.publish_metadata(
+                    &job.id,
+                    TransferMode::Translated,
+                    &meta,
+                    Some(&subtitle.cues),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let rendered = self
+            .render(&job.id, &video, &subtitle.ass, &meta.id)
+            .await?;
         self.db
             .set_job_paths(&job.id, None, None, Some(&rendered.to_string_lossy()))?;
-        let title = self.translate_title(&job.id, &meta.title).await?;
         self.probe_media(&job.id, &rendered, "rendered_probe")
             .await?;
         let bvid = if let Some(existing) = append_to.as_deref() {
             self.append(&job.id, &rendered, existing).await?;
             existing.to_owned()
         } else {
-            self.upload(&job.id, &rendered, &title, &job.url, None)
-                .await?
+            self.upload(
+                &job.id,
+                &rendered,
+                publication.as_ref().context("投稿元数据未生成")?,
+                &meta,
+                TransferMode::Translated,
+                None,
+            )
+            .await?
         };
         self.db.set_job_bvid(&job.id, &bvid)?;
         if append_to.is_some() {
@@ -134,22 +166,33 @@ impl Pipeline {
 
     async fn run_direct(&self, job: &Job, meta: &VideoMetadata, work: &Path) -> Result<()> {
         let video_fut = self.download_video(&job.id, &job.url, &meta.id, work);
-        let title_fut = self.translate_title(&job.id, &meta.title);
-        let (video, title) = try_join_branches(video_fut, title_fut).await?;
+        let metadata_fut = self.publish_metadata(&job.id, TransferMode::Direct, meta, None);
+        let (video, publication) = try_join_branches(video_fut, metadata_fut).await?;
         self.db
             .set_job_paths(&job.id, Some(&video.to_string_lossy()), None, None)?;
-        self.finish_direct_upload(job, &video, &title, false).await
+        self.finish_direct_upload(job, meta, &video, &publication, false)
+            .await
     }
 
     async fn finish_direct_upload(
         &self,
         job: &Job,
+        meta: &VideoMetadata,
         video: &Path,
-        title: &str,
+        publication: &PublicationMetadata,
         pending_subtitle: bool,
     ) -> Result<()> {
         self.probe_media(&job.id, video, "original_probe").await?;
-        let bvid = self.upload(&job.id, video, title, &job.url, None).await?;
+        let bvid = self
+            .upload(
+                &job.id,
+                video,
+                publication,
+                meta,
+                TransferMode::Direct,
+                None,
+            )
+            .await?;
         self.db.set_job_bvid(&job.id, &bvid)?;
         self.db.update_job_status(
             &job.id,
@@ -169,7 +212,7 @@ impl Pipeline {
         job: &Job,
         meta: &VideoMetadata,
         work: &Path,
-    ) -> Result<Option<PathBuf>> {
+    ) -> Result<Option<PreparedSubtitle>> {
         let Some(raw_sub) = self
             .download_subtitle(&job.id, &job.url, &meta.id, work)
             .await?
@@ -194,7 +237,7 @@ impl Pipeline {
         )?;
         self.db
             .set_job_paths(&job.id, None, Some(&ass.to_string_lossy()), None)?;
-        Ok(Some(ass))
+        Ok(Some(PreparedSubtitle { ass, cues }))
     }
 
     fn ensure_disk(&self) -> Result<()> {
@@ -519,28 +562,38 @@ impl Pipeline {
         Ok(safe)
     }
 
-    async fn translate_title(&self, job_id: &str, title: &str) -> Result<String> {
+    async fn publish_metadata(
+        &self,
+        job_id: &str,
+        mode: TransferMode,
+        meta: &VideoMetadata,
+        cues: Option<&[Cue]>,
+    ) -> Result<PublicationMetadata> {
+        if let Some(saved) = self.db.publication_metadata(job_id)? {
+            validate_publication_metadata(&saved)?;
+            return Ok(saved);
+        }
+        let payload = build_publication_payload(mode, meta, cues, self.ai_token_budget()?)?;
+        let input_json = payload.to_string();
         let stage = self.db.start_stage(
             job_id,
-            "title_translation",
+            "publish_metadata",
             Some(&self.config.ai.provider),
             Some(&self.config.ai.model),
             Some(&self.config.ai.thinking),
         )?;
-        let payload = json!({"task":"title","text":title});
-        let input_json = payload.to_string();
-        let r = self.call_pi(payload).await?;
-        let translated = r
-            .value
-            .get("title")
-            .and_then(Value::as_str)
-            .context("Pi 标题结果缺少 title")?
-            .trim()
-            .to_string();
+        let r = match self.call_pi(payload).await {
+            Ok(result) => result,
+            Err(error) => {
+                self.db
+                    .finish_stage(stage, "failed", 0, 0, Some(&error.to_string()))?;
+                return Err(error);
+            }
+        };
         self.db.record_ai_call(
             job_id,
             stage,
-            "title",
+            "publish_metadata",
             &self.config.ai.provider,
             &self.config.ai.model,
             &self.config.ai.thinking,
@@ -549,6 +602,29 @@ impl Pipeline {
             &input_json,
             &r.value.to_string(),
         )?;
+        let metadata = match parse_publication_metadata(&r.value) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.db.finish_stage(
+                    stage,
+                    "failed",
+                    r.output.duration_ms,
+                    r.output.peak_rss_kib,
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.db.save_publication_metadata(job_id, &metadata) {
+            self.db.finish_stage(
+                stage,
+                "failed",
+                r.output.duration_ms,
+                r.output.peak_rss_kib,
+                Some(&error.to_string()),
+            )?;
+            return Err(error);
+        }
         self.db.finish_stage(
             stage,
             "completed",
@@ -556,7 +632,7 @@ impl Pipeline {
             r.output.peak_rss_kib,
             None,
         )?;
-        Ok(translated)
+        Ok(metadata)
     }
 
     async fn call_pi(&self, payload: Value) -> Result<PiResult> {
@@ -655,8 +731,9 @@ impl Pipeline {
         &self,
         job_id: &str,
         video: &Path,
-        title: &str,
-        source: &str,
+        publication: &PublicationMetadata,
+        meta: &VideoMetadata,
+        mode: TransferMode,
         cover: Option<&Path>,
     ) -> Result<String> {
         self.db
@@ -667,22 +744,7 @@ impl Pipeline {
             .arg(&self.config.bilibili.cookies)
             .arg("upload")
             .arg(video)
-            .args([
-                "--title",
-                title,
-                "--desc",
-                &format!("URL：{source}\n由 y2b-rs 自动处理"),
-                "--tag",
-                &self.config.bilibili.default_tags.join(","),
-                "--tid",
-                &self.config.bilibili.default_tid.to_string(),
-                "--copyright",
-                "1",
-                "--no-reprint",
-                "0",
-                "--limit",
-                "1",
-            ]);
+            .args(build_upload_args(publication, meta, mode));
         if let Some(c) = cover {
             cmd.arg("--cover").arg(c);
         }
@@ -717,8 +779,7 @@ impl Pipeline {
         let mut cmd = Command::new(&self.config.bilibili.biliup);
         cmd.arg("-u")
             .arg(&self.config.bilibili.cookies)
-            .arg("append")
-            .args(["--vid", bvid, "--limit", "1"])
+            .args(build_append_args(bvid))
             .arg(video);
         let out = run_monitored(cmd, Duration::from_secs(14400)).await?;
         self.db.finish_stage(
@@ -805,6 +866,316 @@ impl Pipeline {
 }
 
 const PI_PROMPT_OVERHEAD_TOKENS: usize = 2_048;
+const PI_METADATA_OUTPUT_RESERVE_TOKENS: usize = 1_024;
+const BILIBILI_TID: i64 = 172;
+const CORE_TAG: &str = "荒野乱斗";
+const MAX_TITLE_WIDTH: usize = 70;
+const MAX_DYNAMIC_WIDTH: usize = 120;
+const MAX_TAG_CHARS: usize = 20;
+const MAX_TAGS: usize = 4;
+
+fn build_publication_payload(
+    mode: TransferMode,
+    meta: &VideoMetadata,
+    cues: Option<&[Cue]>,
+    budget: usize,
+) -> Result<Value> {
+    if mode == TransferMode::Translated && cues.is_none_or(<[Cue]>::is_empty) {
+        bail!("翻译字幕模式缺少双语字幕，不能生成投稿元数据")
+    }
+    let all_cues = cues.unwrap_or_default();
+    let full_indices = (0..all_cues.len()).collect::<Vec<_>>();
+    let full = publication_payload_value(mode, meta, all_cues, &full_indices, false);
+    if estimate_publication_tokens(&full) <= budget {
+        return Ok(full);
+    }
+    if mode == TransferMode::Direct {
+        bail!("YouTube 元数据超过 Pi 安全 token 阈值 {budget}")
+    }
+
+    let mut count = all_cues.len().saturating_sub(1).max(2);
+    loop {
+        let indices = uniform_sample_indices(all_cues.len(), count);
+        let sampled = publication_payload_value(mode, meta, all_cues, &indices, true);
+        let estimated = estimate_publication_tokens(&sampled);
+        if estimated <= budget {
+            return Ok(sampled);
+        }
+        if count == 2 {
+            bail!("保留首尾字幕后投稿元数据仍超过 Pi 安全 token 阈值 {budget}")
+        }
+        let shrunk = count
+            .saturating_mul(budget)
+            .checked_div(estimated)
+            .unwrap_or(0);
+        count = shrunk.clamp(2, count - 1);
+    }
+}
+
+fn publication_payload_value(
+    mode: TransferMode,
+    meta: &VideoMetadata,
+    cues: &[Cue],
+    indices: &[usize],
+    sampled: bool,
+) -> Value {
+    let source_url = meta.webpage_url.as_deref().unwrap_or(&meta.url);
+    json!({
+        "task": "publish_metadata",
+        "transfer_mode": mode.to_string(),
+        "youtube": {
+            "title": meta.title,
+            "description": meta.description.as_deref().unwrap_or(""),
+            "url": source_url,
+            "uploader": meta.uploader.as_deref().or(meta.channel.as_deref()).unwrap_or(""),
+            "published_date": publication_date(meta),
+        },
+        "subtitle_sampling": {
+            "sampled": sampled,
+            "total": cues.len(),
+            "included": indices.len(),
+        },
+        "subtitles": indices.iter().map(|&i| {
+            let cue = &cues[i];
+            json!({
+                "i": i,
+                "start": cue.start,
+                "end": cue.end,
+                "source": cue.source,
+                "translation": cue.translation.as_deref().unwrap_or(""),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn estimate_publication_tokens(payload: &Value) -> usize {
+    PI_PROMPT_OVERHEAD_TOKENS
+        .saturating_add(PI_METADATA_OUTPUT_RESERVE_TOKENS)
+        .saturating_add(estimate_text_tokens(&payload.to_string()))
+}
+
+fn uniform_sample_indices(len: usize, count: usize) -> Vec<usize> {
+    if count >= len {
+        return (0..len).collect();
+    }
+    if len == 0 || count == 0 {
+        return Vec::new();
+    }
+    if count == 1 {
+        return vec![0];
+    }
+    (0..count)
+        .map(|slot| slot * (len - 1) / (count - 1))
+        .collect()
+}
+
+fn parse_publication_metadata(value: &Value) -> Result<PublicationMetadata> {
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .context("Pi 投稿元数据缺少字符串 title")?
+        .trim()
+        .to_string();
+    let dynamic = value
+        .get("dynamic")
+        .and_then(Value::as_str)
+        .context("Pi 投稿元数据缺少字符串 dynamic")?
+        .trim()
+        .to_string();
+    let raw_tags = value
+        .get("tags")
+        .and_then(Value::as_array)
+        .context("Pi 投稿元数据缺少数组 tags")?;
+    if raw_tags.is_empty() {
+        bail!("Pi 投稿元数据 tags 为空")
+    }
+    let raw_tags = raw_tags
+        .iter()
+        .map(|tag| {
+            tag.as_str()
+                .map(str::to_string)
+                .context("Pi 投稿元数据 tags 含非字符串项")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let metadata = PublicationMetadata {
+        title,
+        dynamic,
+        tags: sanitize_tags(&raw_tags),
+        tid: BILIBILI_TID,
+        raw_json: value.to_string(),
+    };
+    validate_publication_metadata(&metadata)?;
+    Ok(metadata)
+}
+
+fn validate_publication_metadata(metadata: &PublicationMetadata) -> Result<()> {
+    validate_text_field("标题", &metadata.title, MAX_TITLE_WIDTH)?;
+    validate_text_field("动态", &metadata.dynamic, MAX_DYNAMIC_WIDTH)?;
+    if metadata.title.contains('#')
+        || metadata.title.contains('＃')
+        || ["http://", "https://", "www."]
+            .iter()
+            .any(|needle| metadata.title.to_ascii_lowercase().contains(needle))
+    {
+        bail!("标题含链接或话题")
+    }
+    if metadata.tid != BILIBILI_TID {
+        bail!("投稿分区必须为 {BILIBILI_TID}，实际为 {}", metadata.tid)
+    }
+    if metadata.tags.is_empty()
+        || metadata.tags.len() > MAX_TAGS
+        || metadata.tags.first().map(String::as_str) != Some(CORE_TAG)
+    {
+        bail!("投稿标签必须以“{CORE_TAG}”开头且总数为 1～{MAX_TAGS}")
+    }
+    if metadata
+        .tags
+        .iter()
+        .any(|tag| tag.is_empty() || tag.chars().count() > MAX_TAG_CHARS)
+    {
+        bail!("投稿标签为空或超过 {MAX_TAG_CHARS} 字")
+    }
+    if metadata.dynamic.contains('#')
+        || metadata.dynamic.contains('＃')
+        || ["http://", "https://", "www."]
+            .iter()
+            .any(|needle| metadata.dynamic.to_ascii_lowercase().contains(needle))
+        || ["关注我", "点赞", "投币", "三连", "订阅频道", "转发"]
+            .iter()
+            .any(|needle| metadata.dynamic.contains(needle))
+    {
+        bail!("动态含链接、话题或引导互动内容")
+    }
+    if metadata.title.chars().any(is_emoji) || metadata.dynamic.chars().any(is_emoji) {
+        bail!("标题或动态含 emoji")
+    }
+    let sentence_ends = metadata
+        .dynamic
+        .chars()
+        .filter(|ch| matches!(ch, '。' | '！' | '？' | '!' | '?'))
+        .count();
+    if sentence_ends > 2 {
+        bail!("动态超过 2 句")
+    }
+    Ok(())
+}
+
+fn validate_text_field(label: &str, text: &str, max_width: usize) -> Result<()> {
+    if text.trim().is_empty() || text.chars().any(char::is_control) {
+        bail!("{label}为空或含控制字符")
+    }
+    let width = chinese_width(text);
+    if width > max_width {
+        bail!("{label}宽度 {width} 超过上限 {max_width}")
+    }
+    Ok(())
+}
+
+fn chinese_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| if ch.is_ascii() { 1 } else { 2 })
+        .sum()
+}
+
+fn is_emoji(ch: char) -> bool {
+    matches!(ch as u32,
+        0x1F000..=0x1FAFF | 0x2600..=0x26FF | 0x2700..=0x27BF | 0xFE00..=0xFE0F)
+}
+
+fn sanitize_tags(raw: &[String]) -> Vec<String> {
+    let mut tags = vec![CORE_TAG.to_string()];
+    for tag in raw {
+        let clean = tag
+            .chars()
+            .filter(|ch| !ch.is_control() && !matches!(ch, '#' | '＃' | ',' | '，'))
+            .collect::<String>();
+        let clean = clean
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(MAX_TAG_CHARS)
+            .collect::<String>();
+        if clean.is_empty() || tags.iter().any(|existing| existing == &clean) {
+            continue;
+        }
+        tags.push(clean);
+        if tags.len() == MAX_TAGS {
+            break;
+        }
+    }
+    tags
+}
+
+fn publication_date(meta: &VideoMetadata) -> String {
+    if let Some(date) = meta.upload_date.as_deref()
+        && date.len() == 8
+        && date.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..]);
+    }
+    meta.timestamp
+        .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "未知".to_string())
+}
+
+fn build_description(meta: &VideoMetadata, mode: TransferMode) -> String {
+    let source_url = meta.webpage_url.as_deref().unwrap_or(&meta.url);
+    let uploader = meta
+        .uploader
+        .as_deref()
+        .or(meta.channel.as_deref())
+        .unwrap_or("未知");
+    let treatment = match mode {
+        TransferMode::Direct => "仅翻译标题",
+        TransferMode::Translated => "中英双语字幕翻译压制",
+    };
+    format!(
+        "原标题：{}\n来源：{}\n原作者：{}\n原发布日期：{}\n处理方式：{}\n处理工具：https://github.com/Mist-wu/y2b-rs",
+        meta.title,
+        source_url,
+        uploader,
+        publication_date(meta),
+        treatment
+    )
+}
+
+fn build_upload_args(
+    metadata: &PublicationMetadata,
+    meta: &VideoMetadata,
+    mode: TransferMode,
+) -> Vec<String> {
+    let source_url = meta.webpage_url.as_deref().unwrap_or(&meta.url);
+    vec![
+        "--title".into(),
+        metadata.title.clone(),
+        "--desc".into(),
+        build_description(meta, mode),
+        "--tag".into(),
+        metadata.tags.join(","),
+        "--tid".into(),
+        BILIBILI_TID.to_string(),
+        "--dynamic".into(),
+        metadata.dynamic.clone(),
+        "--copyright".into(),
+        "2".into(),
+        "--source".into(),
+        source_url.into(),
+        "--limit".into(),
+        "1".into(),
+    ]
+}
+
+fn build_append_args(bvid: &str) -> Vec<String> {
+    vec![
+        "append".into(),
+        "--vid".into(),
+        bvid.into(),
+        "--limit".into(),
+        "1".into(),
+    ]
+}
 
 fn requires_translated_pipeline(mode: TransferMode, has_append_target: bool) -> bool {
     mode == TransferMode::Translated || has_append_target
@@ -1101,6 +1472,26 @@ mod tests {
         }
     }
 
+    fn metadata() -> VideoMetadata {
+        VideoMetadata {
+            id: "video".into(),
+            url: "https://youtube.com/watch?v=video".into(),
+            title: "Best Ranked Match 2026".into(),
+            description: Some("A close Brawl Stars ranked match.".into()),
+            uploader: Some("Player One".into()),
+            upload_date: Some("20260803".into()),
+            channel: Some("Player One".into()),
+            channel_id: Some("UC-test".into()),
+            timestamp: Some(1_775_347_200),
+            duration: Some(120.0),
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(60.0),
+            webpage_url: Some("https://www.youtube.com/watch?v=video".into()),
+            live_status: Some("not_live".into()),
+        }
+    }
+
     #[test]
     fn pi_json() {
         let s = r#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"{\"ranges\":[{\"start\":0,\"end\":1}]}"}],"usage":{"input":2,"output":3,"totalTokens":5}}]}"#;
@@ -1152,6 +1543,127 @@ mod tests {
         validate_translation_indexes(2, &valid).unwrap();
         let duplicate = vec![(0, "甲".into()), (0, "乙".into())];
         assert!(validate_translation_indexes(2, &duplicate).is_err());
+    }
+
+    #[test]
+    fn publication_metadata_cleans_tags_and_forces_core_tag() {
+        let value = json!({
+            "title": "2026年最佳排位赛",
+            "dynamic": "最后一局上演极限翻盘。",
+            "tags": ["#排位赛", "荒野乱斗", "排位赛", "英雄，技巧", "超长标签超长标签超长标签超长标签超长标签"]
+        });
+        let parsed = parse_publication_metadata(&value).unwrap();
+        assert_eq!(parsed.tid, 172);
+        assert_eq!(parsed.tags[0], "荒野乱斗");
+        assert_eq!(parsed.tags.len(), 4);
+        assert!(
+            parsed
+                .tags
+                .iter()
+                .all(|tag| !tag.contains(['#', ',', '，']))
+        );
+        assert!(parsed.tags.iter().all(|tag| tag.chars().count() <= 20));
+    }
+
+    #[test]
+    fn publication_metadata_rejects_invalid_title_or_dynamic() {
+        assert!(
+            parse_publication_metadata(&json!({
+                "title": "",
+                "dynamic": "精彩对局。",
+                "tags": ["荒野乱斗"]
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_publication_metadata(&json!({
+                "title": "精彩对局",
+                "dynamic": "欢迎点赞投币关注我！",
+                "tags": ["荒野乱斗"]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_payload_uses_full_or_uniformly_sampled_bilingual_subtitles() {
+        let mut cues = (0..100)
+            .map(|i| cue(i, "a representative subtitle sentence with context"))
+            .collect::<Vec<_>>();
+        for (index, cue) in cues.iter_mut().enumerate() {
+            cue.translation = Some(format!("第{index}句译文"));
+        }
+        let full =
+            build_publication_payload(TransferMode::Translated, &metadata(), Some(&cues), 200_000)
+                .unwrap();
+        assert_eq!(full["subtitle_sampling"]["sampled"], false);
+        assert_eq!(full["subtitles"].as_array().unwrap().len(), cues.len());
+
+        let minimum = publication_payload_value(
+            TransferMode::Translated,
+            &metadata(),
+            &cues,
+            &[0, cues.len() - 1],
+            true,
+        );
+        let sampled = build_publication_payload(
+            TransferMode::Translated,
+            &metadata(),
+            Some(&cues),
+            estimate_publication_tokens(&minimum) + 250,
+        )
+        .unwrap();
+        let included = sampled["subtitles"].as_array().unwrap();
+        assert_eq!(sampled["subtitle_sampling"]["sampled"], true);
+        assert!(included.len() < cues.len());
+        assert_eq!(included.first().unwrap()["i"], 0);
+        assert_eq!(included.last().unwrap()["i"], cues.len() - 1);
+    }
+
+    #[test]
+    fn direct_metadata_accepts_empty_description_but_translated_needs_subtitles() {
+        let mut meta = metadata();
+        meta.description = None;
+        let payload =
+            build_publication_payload(TransferMode::Direct, &meta, None, 200_000).unwrap();
+        assert_eq!(payload["youtube"]["description"], "");
+        assert!(build_publication_payload(TransferMode::Translated, &meta, None, 200_000).is_err());
+    }
+
+    #[test]
+    fn upload_args_are_fixed_repost_metadata_and_detailed_description() {
+        let publication = parse_publication_metadata(&json!({
+            "title": "2026年最佳排位赛",
+            "dynamic": "最后一局上演极限翻盘。",
+            "tags": ["荒野乱斗", "排位赛"]
+        }))
+        .unwrap();
+        let args = build_upload_args(&publication, &metadata(), TransferMode::Translated);
+        let value_after = |flag: &str| {
+            let index = args.iter().position(|value| value == flag).unwrap();
+            args[index + 1].as_str()
+        };
+        assert_eq!(value_after("--tid"), "172");
+        assert_eq!(value_after("--copyright"), "2");
+        assert_eq!(
+            value_after("--source"),
+            "https://www.youtube.com/watch?v=video"
+        );
+        assert_eq!(value_after("--tag"), "荒野乱斗,排位赛");
+        assert_eq!(value_after("--dynamic"), "最后一局上演极限翻盘。");
+        let description = value_after("--desc");
+        assert!(description.contains("原标题：Best Ranked Match 2026"));
+        assert!(description.contains("原作者：Player One"));
+        assert!(description.contains("原发布日期：2026-08-03"));
+        assert!(description.contains("处理方式：中英双语字幕翻译压制"));
+    }
+
+    #[test]
+    fn append_args_only_target_existing_bvid() {
+        assert_eq!(
+            build_append_args("BV1test"),
+            ["append", "--vid", "BV1test", "--limit", "1"]
+        );
     }
 
     #[test]
