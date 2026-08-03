@@ -64,9 +64,15 @@ enum ChannelCmd {
         #[arg(value_enum)]
         mode: TransferMode,
     },
-    Enable { id: i64 },
-    Disable { id: i64 },
-    Sync { id: Option<i64> },
+    Enable {
+        id: i64,
+    },
+    Disable {
+        id: i64,
+    },
+    Sync {
+        id: Option<i64>,
+    },
 }
 #[derive(Subcommand)]
 enum JobCmd {
