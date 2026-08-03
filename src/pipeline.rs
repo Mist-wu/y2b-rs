@@ -572,10 +572,8 @@ impl Pipeline {
                 )
             }
             vec![(0, cues.len())]
-        } else if estimated <= budget {
-            vec![(0, cues.len())]
         } else {
-            translation_batches(cues, budget)?
+            translation_batches(cues, budget, self.config.ai.translation_batch_cues)?
         };
         let mut all = Vec::new();
         let mut duration = 0;
@@ -1354,9 +1352,16 @@ fn max_segment_window_end(cues: &[Cue], start: usize, budget: usize) -> Result<u
     })
 }
 
-fn translation_batches(cues: &[Cue], budget: usize) -> Result<Vec<(usize, usize)>> {
+fn translation_batches(
+    cues: &[Cue],
+    budget: usize,
+    max_cues: usize,
+) -> Result<Vec<(usize, usize)>> {
     if cues.is_empty() {
         return Ok(Vec::new());
+    }
+    if max_cues == 0 {
+        bail!("translation_batch_cues 必须大于 0")
     }
     let mut batches = Vec::new();
     let mut start = 0;
@@ -1369,7 +1374,7 @@ fn translation_batches(cues: &[Cue], budget: usize) -> Result<Vec<(usize, usize)
                 PI_PROMPT_OVERHEAD_TOKENS + item
             )
         }
-        if total.saturating_add(item) > budget {
+        if index > start && (index - start >= max_cues || total.saturating_add(item) > budget) {
             batches.push((start, index));
             start = index;
             total = PI_PROMPT_OVERHEAD_TOKENS;
@@ -1617,11 +1622,22 @@ mod tests {
         let cues = (0..20)
             .map(|i| cue(i, "a moderately sized subtitle sentence"))
             .collect::<Vec<_>>();
-        let batches = translation_batches(&cues, 2_300).unwrap();
+        let batches = translation_batches(&cues, 2_300, 50).unwrap();
         assert!(batches.len() > 1);
         assert_eq!(batches.first().map(|x| x.0), Some(0));
         assert_eq!(batches.last().map(|x| x.1), Some(cues.len()));
         assert!(batches.windows(2).all(|pair| pair[0].1 == pair[1].0));
+    }
+
+    #[test]
+    fn adaptive_translation_batches_respect_cue_limit() {
+        let cues = (0..107)
+            .map(|i| cue(i, "short subtitle"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            translation_batches(&cues, 200_000, 50).unwrap(),
+            vec![(0, 50), (50, 100), (100, 107)]
+        );
     }
 
     #[test]
