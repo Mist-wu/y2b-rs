@@ -41,7 +41,17 @@ impl Pipeline {
         let result = self.run_job_inner(&job).await;
         if let Err(e) = &result {
             let attempt = self.db.increment_attempt(&job.id)?;
-            let status = if attempt >= self.config.monitor.max_attempts as i64 {
+            let failed_status = self.db.get_job(&job.id)?.map(|job| job.status);
+            let upload_failure = matches!(
+                failed_status,
+                Some(JobStatus::Uploading | JobStatus::Appending)
+            );
+            let rate_limited = e.to_string().contains("21566");
+            let status = if rate_limited
+                || (upload_failure && attempt >= self.config.monitor.max_attempts as i64)
+            {
+                JobStatus::Paused
+            } else if attempt >= self.config.monitor.max_attempts as i64 {
                 self.cleanup_large(&job.id).ok();
                 JobStatus::DeadLetter
             } else {
@@ -1401,6 +1411,8 @@ fn build_upload_args(
     mode: TransferMode,
 ) -> Vec<String> {
     vec![
+        "--submit".into(),
+        "web".into(),
         "--title".into(),
         metadata.title.clone(),
         "--desc".into(),
@@ -1954,6 +1966,7 @@ mod tests {
             args[index + 1].as_str()
         };
         assert_eq!(value_after("--tid"), "172");
+        assert_eq!(value_after("--submit"), "web");
         assert_eq!(value_after("--copyright"), "1");
         assert_eq!(value_after("--no-reprint"), "0");
         assert!(!args.iter().any(|value| value == "--source"));
