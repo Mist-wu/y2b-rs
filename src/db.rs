@@ -1,4 +1,4 @@
-use crate::model::{AiUsage, Channel, Job, JobStatus, StageRun};
+use crate::model::{AiUsage, Channel, Job, JobStatus, StageRun, TransferMode};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -9,6 +9,16 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct Database(Arc<Mutex<Connection>>);
+
+pub struct NewJob<'a> {
+    pub channel_id: Option<i64>,
+    pub video_id: &'a str,
+    pub url: &'a str,
+    pub title: Option<&'a str>,
+    pub published: Option<DateTime<Utc>>,
+    pub updated: Option<DateTime<Utc>>,
+    pub transfer_mode: TransferMode,
+}
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -32,14 +42,16 @@ impl Database {
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           youtube_channel_id TEXT NOT NULL UNIQUE,
           name TEXT NOT NULL, url TEXT NOT NULL, feed_url TEXT NOT NULL,
-          enabled INTEGER NOT NULL DEFAULT 1, baseline_at TEXT,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          transfer_mode TEXT NOT NULL DEFAULT 'translated', baseline_at TEXT,
           last_checked_at TEXT, last_reconcile_at TEXT, last_error TEXT,
           created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS jobs(
           id TEXT PRIMARY KEY, channel_id INTEGER REFERENCES channels(id),
           video_id TEXT NOT NULL UNIQUE, url TEXT NOT NULL, title TEXT,
-          status TEXT NOT NULL, published_at TEXT, youtube_updated_at TEXT,
+          status TEXT NOT NULL, transfer_mode TEXT NOT NULL DEFAULT 'translated',
+          published_at TEXT, youtube_updated_at TEXT,
           discovered_at TEXT NOT NULL, is_short INTEGER NOT NULL DEFAULT 0,
           duration_seconds REAL, width INTEGER, height INTEGER, fps REAL,
           bvid TEXT, append_to_bvid TEXT, provider TEXT, ai_model TEXT, thinking TEXT,
@@ -97,6 +109,29 @@ impl Database {
             c.execute("ALTER TABLE jobs ADD COLUMN append_to_bvid TEXT", [])?;
         }
         c.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,CURRENT_TIMESTAMP)",[])?;
+        let mut columns = c.prepare("PRAGMA table_info(channels)")?;
+        let channel_names = columns
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(columns);
+        if !channel_names.iter().any(|n| n == "transfer_mode") {
+            c.execute(
+                "ALTER TABLE channels ADD COLUMN transfer_mode TEXT NOT NULL DEFAULT 'translated'",
+                [],
+            )?;
+        }
+        let mut columns = c.prepare("PRAGMA table_info(jobs)")?;
+        let job_names = columns
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(columns);
+        if !job_names.iter().any(|n| n == "transfer_mode") {
+            c.execute(
+                "ALTER TABLE jobs ADD COLUMN transfer_mode TEXT NOT NULL DEFAULT 'translated'",
+                [],
+            )?;
+        }
+        c.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,CURRENT_TIMESTAMP)",[])?;
         Ok(())
     }
 
@@ -123,10 +158,11 @@ impl Database {
         name: &str,
         url: &str,
         feed_url: &str,
+        transfer_mode: TransferMode,
     ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let c = self.conn();
-        c.execute("INSERT INTO channels(youtube_channel_id,name,url,feed_url,baseline_at,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(youtube_channel_id) DO UPDATE SET name=excluded.name,url=excluded.url,feed_url=excluded.feed_url", params![channel_id,name,url,feed_url,now,now])?;
+        c.execute("INSERT INTO channels(youtube_channel_id,name,url,feed_url,transfer_mode,baseline_at,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(youtube_channel_id) DO UPDATE SET name=excluded.name,url=excluded.url,feed_url=excluded.feed_url,transfer_mode=excluded.transfer_mode", params![channel_id,name,url,feed_url,transfer_mode.to_string(),now,now])?;
         Ok(c.query_row(
             "SELECT id FROM channels WHERE youtube_channel_id=?",
             [channel_id],
@@ -136,7 +172,7 @@ impl Database {
 
     pub fn list_channels(&self) -> Result<Vec<Channel>> {
         let c = self.conn();
-        let mut q=c.prepare("SELECT id,youtube_channel_id,name,url,enabled,last_checked_at,last_error FROM channels ORDER BY id")?;
+        let mut q=c.prepare("SELECT id,youtube_channel_id,name,url,enabled,transfer_mode,last_checked_at,last_error FROM channels ORDER BY id")?;
         Ok(q.query_map([], |r| {
             Ok(Channel {
                 id: r.get(0)?,
@@ -144,8 +180,9 @@ impl Database {
                 name: r.get(2)?,
                 url: r.get(3)?,
                 enabled: r.get::<_, i64>(4)? != 0,
-                last_checked_at: parse_opt(r.get(5)?),
-                last_error: r.get(6)?,
+                transfer_mode: TransferMode::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
+                last_checked_at: parse_opt(r.get(6)?),
+                last_error: r.get(7)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -157,6 +194,14 @@ impl Database {
             .query_row("SELECT feed_url FROM channels WHERE id=?", [id], |r| {
                 r.get(0)
             })?)
+    }
+    pub fn channel_transfer_mode(&self, id: i64) -> Result<TransferMode> {
+        let value: String =
+            self.conn()
+                .query_row("SELECT transfer_mode FROM channels WHERE id=?", [id], |r| {
+                    r.get(0)
+                })?;
+        TransferMode::from_str(&value)
     }
     pub fn channel_baseline(&self, id: i64) -> Result<Option<DateTime<Utc>>> {
         Ok(parse_opt(self.conn().query_row(
@@ -170,6 +215,16 @@ impl Database {
             "UPDATE channels SET enabled=? WHERE id=?",
             params![enabled as i64, id],
         )?;
+        Ok(())
+    }
+    pub fn set_channel_transfer_mode(&self, id: i64, transfer_mode: TransferMode) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE channels SET transfer_mode=? WHERE id=?",
+            params![transfer_mode.to_string(), id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("频道不存在: {id}")
+        }
         Ok(())
     }
     pub fn mark_channel_checked(&self, id: i64, error: Option<&str>) -> Result<()> {
@@ -187,38 +242,34 @@ impl Database {
         Ok(())
     }
 
-    pub fn create_job(
-        &self,
-        channel_id: Option<i64>,
-        video_id: &str,
-        url: &str,
-        title: Option<&str>,
-        published: Option<DateTime<Utc>>,
-        updated: Option<DateTime<Utc>>,
-    ) -> Result<Option<String>> {
+    pub fn create_job(&self, job: NewJob<'_>) -> Result<Option<String>> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        let changed=self.conn().execute("INSERT OR IGNORE INTO jobs(id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?,?,?,?)",params![id,channel_id,video_id,url,title,published.map(|x|x.to_rfc3339()),updated.map(|x|x.to_rfc3339()),now,now,now])?;
+        let changed=self.conn().execute("INSERT OR IGNORE INTO jobs(id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)",params![id,job.channel_id,job.video_id,job.url,job.title,job.transfer_mode.to_string(),job.published.map(|x|x.to_rfc3339()),job.updated.map(|x|x.to_rfc3339()),now,now,now])?;
         Ok((changed == 1).then_some(id))
     }
 
+    pub fn get_job_by_video_id(&self, video_id: &str) -> Result<Option<Job>> {
+        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE video_id=?",[video_id],job_from_row).optional().map_err(Into::into)
+    }
+
     pub fn get_job(&self, id: &str) -> Result<Option<Job>> {
-        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE id=?",[id],job_from_row).optional().map_err(Into::into)
+        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE id=?",[id],job_from_row).optional().map_err(Into::into)
     }
     pub fn list_jobs(&self, limit: usize) -> Result<Vec<Job>> {
         let c = self.conn();
-        let mut q=c.prepare("SELECT id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs ORDER BY discovered_at DESC LIMIT ?")?;
+        let mut q=c.prepare("SELECT id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs ORDER BY discovered_at DESC LIMIT ?")?;
         Ok(q.query_map([limit as i64], job_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn next_queued_job(&self) -> Result<Option<Job>> {
-        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE status IN ('queued','retry_wait') ORDER BY discovered_at LIMIT 1",[],job_from_row).optional().map_err(Into::into)
+        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE status IN ('queued','retry_wait') ORDER BY discovered_at LIMIT 1",[],job_from_row).optional().map_err(Into::into)
     }
 
     pub fn recover_incomplete_jobs(&self) -> Result<usize> {
         let c = self.conn();
         let now = Utc::now().to_rfc3339();
-        let recovered=c.execute("UPDATE jobs SET status='queued',error='服务重启后自动恢复',updated_at=? WHERE status IN ('inspecting','downloading','segmenting','translating','rendering')",[&now])?;
+        let recovered=c.execute("UPDATE jobs SET status='queued',error='服务重启后自动恢复',updated_at=? WHERE status IN ('inspecting','processing','downloading','segmenting','translating','rendering')",[&now])?;
         c.execute("UPDATE jobs SET status='paused',error='服务重启时上传或追加结果不确定，请确认 Bilibili 后手动重试',updated_at=? WHERE status IN ('uploading','appending')",[&now])?;
         Ok(recovered)
     }
@@ -296,7 +347,7 @@ impl Database {
             .filter(|value| !value.trim().is_empty())
             .with_context(|| format!("任务 {id} 没有可追加的原稿 BV"))?;
         c.execute(
-            "UPDATE jobs SET status='queued',append_to_bvid=?,attempt=0,error=NULL,updated_at=? WHERE id=?",
+            "UPDATE jobs SET status='queued',transfer_mode='translated',append_to_bvid=?,attempt=0,error=NULL,updated_at=? WHERE id=?",
             params![target, Utc::now().to_rfc3339(), id],
         )?;
         Ok(())
@@ -447,20 +498,21 @@ fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         url: r.get(3)?,
         title: r.get(4)?,
         status: JobStatus::from_str(&r.get::<_, String>(5)?).unwrap_or(JobStatus::Failed),
-        published_at: parse_opt(r.get(6)?),
-        youtube_updated_at: parse_opt(r.get(7)?),
-        discovered_at: parse(r.get(8)?),
-        is_short: r.get::<_, i64>(9)? != 0,
-        duration_seconds: r.get(10)?,
-        width: r.get(11)?,
-        height: r.get(12)?,
-        bvid: r.get(13)?,
-        append_to_bvid: r.get(14)?,
-        provider: r.get(15)?,
-        ai_model: r.get(16)?,
-        thinking: r.get(17)?,
-        attempt: r.get(18)?,
-        error: r.get(19)?,
+        transfer_mode: TransferMode::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
+        published_at: parse_opt(r.get(7)?),
+        youtube_updated_at: parse_opt(r.get(8)?),
+        discovered_at: parse(r.get(9)?),
+        is_short: r.get::<_, i64>(10)? != 0,
+        duration_seconds: r.get(11)?,
+        width: r.get(12)?,
+        height: r.get(13)?,
+        bvid: r.get(14)?,
+        append_to_bvid: r.get(15)?,
+        provider: r.get(16)?,
+        ai_model: r.get(17)?,
+        thinking: r.get(18)?,
+        attempt: r.get(19)?,
+        error: r.get(20)?,
     })
 }
 fn usage_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AiUsage> {
@@ -483,16 +535,32 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
         assert!(
-            db.create_job(None, "abc", "https://youtu.be/abc", None, None, None)
-                .unwrap()
-                .is_some()
+            db.create_job(NewJob {
+                channel_id: None,
+                video_id: "abc",
+                url: "https://youtu.be/abc",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .is_some()
         );
         assert!(
-            db.create_job(None, "abc", "https://youtu.be/abc", None, None, None)
-                .unwrap()
-                .is_none()
+            db.create_job(NewJob {
+                channel_id: None,
+                video_id: "abc",
+                url: "https://youtu.be/abc",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .is_none()
         );
         db.update_job_status(&db.list_jobs(1).unwrap()[0].id, JobStatus::Rendering, None)
             .unwrap();
@@ -505,7 +573,15 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         let id = db
-            .create_job(None, "abc", "https://youtu.be/abc", None, None, None)
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "abc",
+                url: "https://youtu.be/abc",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
             .unwrap()
             .unwrap();
 
@@ -525,5 +601,55 @@ mod tests {
         let recovered = db.get_job(&id).unwrap().unwrap();
         assert_eq!(recovered.status, JobStatus::Queued);
         assert_eq!(recovered.append_to_bvid.as_deref(), Some("BV1test"));
+    }
+
+    #[test]
+    fn channel_mode_is_snapshotted_on_new_jobs() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        let channel_id = db
+            .add_channel(
+                "UC-test",
+                "test",
+                "https://youtube.com/@test/videos",
+                "https://youtube.com/feeds/videos.xml?channel_id=UC-test",
+                TransferMode::Direct,
+            )
+            .unwrap();
+        let first = db
+            .create_job(NewJob {
+                channel_id: Some(channel_id),
+                video_id: "first",
+                url: "https://youtu.be/first",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: db.channel_transfer_mode(channel_id).unwrap(),
+            })
+            .unwrap()
+            .unwrap();
+        db.set_channel_transfer_mode(channel_id, TransferMode::Translated)
+            .unwrap();
+        let second = db
+            .create_job(NewJob {
+                channel_id: Some(channel_id),
+                video_id: "second",
+                url: "https://youtu.be/second",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: db.channel_transfer_mode(channel_id).unwrap(),
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            db.get_job(&first).unwrap().unwrap().transfer_mode,
+            TransferMode::Direct
+        );
+        assert_eq!(
+            db.get_job(&second).unwrap().unwrap().transfer_mode,
+            TransferMode::Translated
+        );
     }
 }

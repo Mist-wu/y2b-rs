@@ -9,4 +9,4 @@ pub mod subtitle;
 pub mod tui;
 
 pub use config::Config;
-pub use db::Database;
+pub use db::{Database, NewJob};

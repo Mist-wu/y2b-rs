@@ -1,4 +1,9 @@
-use crate::{config::Config, db::Database, model::VideoMetadata, process::run_monitored};
+use crate::{
+    config::Config,
+    db::{Database, NewJob},
+    model::{Job, TransferMode, VideoMetadata},
+    process::run_monitored,
+};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use feed_rs::parser;
@@ -18,6 +23,12 @@ pub struct ResolvedChannel {
     pub name: String,
     pub url: String,
     pub feed_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnqueueOutcome {
+    pub job: Job,
+    pub created: bool,
 }
 
 impl Monitor {
@@ -68,13 +79,44 @@ impl Monitor {
         })
     }
 
-    pub async fn add_channel(&self, url: &str) -> Result<i64> {
+    pub async fn add_channel(&self, url: &str, transfer_mode: TransferMode) -> Result<i64> {
         let r = self.resolve_channel(url).await?;
         let id = self
             .db
-            .add_channel(&r.channel_id, &r.name, &r.url, &r.feed_url)?;
+            .add_channel(&r.channel_id, &r.name, &r.url, &r.feed_url, transfer_mode)?;
         self.poll_channel(id, false).await?;
         Ok(id)
+    }
+
+    pub async fn enqueue_video(
+        &self,
+        url: &str,
+        transfer_mode: TransferMode,
+    ) -> Result<EnqueueOutcome> {
+        let (meta, _, _) = self.fetch_metadata(url).await?;
+        if meta.id.trim().is_empty() {
+            bail!("无法解析 YouTube video ID")
+        }
+        if let Some(job) = self.db.get_job_by_video_id(&meta.id)? {
+            return Ok(EnqueueOutcome {
+                job,
+                created: false,
+            });
+        }
+        let id = self
+            .db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: &meta.id,
+                url,
+                title: Some(&meta.title),
+                published: None,
+                updated: None,
+                transfer_mode,
+            })?
+            .context("视频已在并发请求中入队")?;
+        let job = self.db.get_job(&id)?.context("已创建任务但无法重新读取")?;
+        Ok(EnqueueOutcome { job, created: true })
     }
 
     pub async fn poll_all(&self) -> Result<usize> {
@@ -110,6 +152,7 @@ impl Monitor {
     }
 
     async fn reconcile_channel(&self, id: i64, url: &str) -> Result<usize> {
+        let transfer_mode = self.db.channel_transfer_mode(id)?;
         let mut cmd = Command::new(&self.config.youtube.yt_dlp);
         cmd.args([
             "--js-runtimes",
@@ -145,7 +188,15 @@ impl Monitor {
             let title = e.get("title").and_then(Value::as_str);
             if self
                 .db
-                .create_job(Some(id), video_id, &link, title, None, None)?
+                .create_job(NewJob {
+                    channel_id: Some(id),
+                    video_id,
+                    url: &link,
+                    title,
+                    published: None,
+                    updated: None,
+                    transfer_mode,
+                })?
                 .is_some()
             {
                 added += 1;
@@ -157,6 +208,7 @@ impl Monitor {
     pub async fn poll_channel(&self, id: i64, enqueue: bool) -> Result<usize> {
         let url = self.db.channel_feed(id)?;
         let baseline = self.db.channel_baseline(id)?;
+        let transfer_mode = self.db.channel_transfer_mode(id)?;
         let bytes = self
             .client
             .get(&url)
@@ -187,7 +239,15 @@ impl Monitor {
             if enqueue
                 && self
                     .db
-                    .create_job(Some(id), &video_id, &link, title, published, e.updated)?
+                    .create_job(NewJob {
+                        channel_id: Some(id),
+                        video_id: &video_id,
+                        url: &link,
+                        title,
+                        published,
+                        updated: e.updated,
+                        transfer_mode,
+                    })?
                     .is_some()
             {
                 added += 1;

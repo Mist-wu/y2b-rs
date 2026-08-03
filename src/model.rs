@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -8,6 +9,7 @@ use std::str::FromStr;
 pub enum JobStatus {
     Queued,
     Inspecting,
+    Processing,
     Downloading,
     Segmenting,
     Translating,
@@ -20,6 +22,34 @@ pub enum JobStatus {
     Paused,
     DeadLetter,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum TransferMode {
+    Direct,
+    #[default]
+    Translated,
+}
+
+impl Display for TransferMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::to_value(self).unwrap().as_str().unwrap()
+        )
+    }
+}
+
+impl FromStr for TransferMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(serde_json::from_value(serde_json::Value::String(
+            s.to_owned(),
+        ))?)
+    }
 }
 
 impl JobStatus {
@@ -54,6 +84,7 @@ pub struct Channel {
     pub name: String,
     pub url: String,
     pub enabled: bool,
+    pub transfer_mode: TransferMode,
     pub last_checked_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
 }
@@ -66,6 +97,7 @@ pub struct Job {
     pub url: String,
     pub title: Option<String>,
     pub status: JobStatus,
+    pub transfer_mode: TransferMode,
     pub published_at: Option<DateTime<Utc>>,
     pub youtube_updated_at: Option<DateTime<Utc>>,
     pub discovered_at: DateTime<Utc>,

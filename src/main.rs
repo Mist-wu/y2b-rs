@@ -5,8 +5,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::process::Command;
 use y2b_rs::{
-    Database, check, config::Config, model::JobStatus, monitor::Monitor, pipeline::Pipeline,
-    process::run_monitored, tui,
+    Database, check,
+    config::Config,
+    model::{JobStatus, TransferMode},
+    monitor::Monitor,
+    pipeline::Pipeline,
+    process::run_monitored,
+    tui,
 };
 
 #[derive(Parser)]
@@ -31,6 +36,8 @@ enum Cmd {
     Watch,
     Run {
         url: String,
+        #[arg(long, value_enum, default_value_t = TransferMode::Translated)]
+        mode: TransferMode,
     },
     Tui,
     Backup,
@@ -46,14 +53,28 @@ enum Cmd {
 }
 #[derive(Subcommand)]
 enum ChannelCmd {
-    Add { url: String },
+    Add {
+        url: String,
+        #[arg(long, value_enum)]
+        mode: TransferMode,
+    },
     List,
+    SetMode {
+        id: i64,
+        #[arg(value_enum)]
+        mode: TransferMode,
+    },
     Enable { id: i64 },
     Disable { id: i64 },
     Sync { id: Option<i64> },
 }
 #[derive(Subcommand)]
 enum JobCmd {
+    Add {
+        url: String,
+        #[arg(long, value_enum)]
+        mode: TransferMode,
+    },
     List {
         #[arg(default_value_t = 20)]
         limit: usize,
@@ -118,21 +139,18 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Watch => watch(cli.config.clone(), config, db).await?,
-        Cmd::Run { url } => {
+        Cmd::Run { url, mode } => {
             let monitor = Monitor::new(config.clone(), db.clone())?;
-            let (meta, _, _) = monitor.fetch_metadata(&url).await?;
-            let id = db
-                .create_job(None, &meta.id, &url, Some(&meta.title), None, None)?
-                .or_else(|| {
-                    db.list_jobs(100)
-                        .ok()?
-                        .into_iter()
-                        .find(|j| j.video_id == meta.id)
-                        .map(|j| j.id)
-                })
-                .context("无法创建或找到任务")?;
-            let job = db.get_job(&id)?.unwrap();
-            Pipeline::new(config, db).run_job(job).await?;
+            let outcome = monitor.enqueue_video(&url, mode).await?;
+            if !outcome.created {
+                anyhow::bail!(
+                    "视频已存在: job={} status={} mode={}",
+                    outcome.job.id,
+                    outcome.job.status,
+                    outcome.job.transfer_mode
+                )
+            }
+            Pipeline::new(config, db).run_job(outcome.job).await?;
         }
         Cmd::Tui => tui::run(&cli.config, config, db)?,
         Cmd::Backup => {
@@ -152,20 +170,25 @@ async fn main() -> Result<()> {
             );
         }
         Cmd::Channels(c) => match c {
-            ChannelCmd::Add { url } => {
-                let id = Monitor::new(config, db)?.add_channel(&url).await?;
-                println!("已添加频道 id={id}，当前视频已作为基线");
+            ChannelCmd::Add { url, mode } => {
+                let id = Monitor::new(config, db)?.add_channel(&url, mode).await?;
+                println!("已添加频道 id={id} mode={mode}，当前视频已作为基线");
             }
             ChannelCmd::List => {
                 for c in db.list_channels()? {
                     println!(
-                        "{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}",
                         c.id,
                         if c.enabled { "on" } else { "off" },
+                        c.transfer_mode,
                         c.name,
                         c.youtube_channel_id
                     )
                 }
+            }
+            ChannelCmd::SetMode { id, mode } => {
+                db.set_channel_transfer_mode(id, mode)?;
+                println!("频道 {id} 的新任务模式已更新为 {mode}");
             }
             ChannelCmd::Enable { id } => db.set_channel_enabled(id, true)?,
             ChannelCmd::Disable { id } => db.set_channel_enabled(id, false)?,
@@ -179,12 +202,30 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Jobs(c) => match c {
+            JobCmd::Add { url, mode } => {
+                let outcome = Monitor::new(config, db)?.enqueue_video(&url, mode).await?;
+                if outcome.created {
+                    println!(
+                        "已加入队列 {}\t{}\t{}",
+                        outcome.job.id, outcome.job.video_id, outcome.job.transfer_mode
+                    );
+                } else {
+                    println!(
+                        "视频已存在 {}\t{}\t{}\t{}",
+                        outcome.job.id,
+                        outcome.job.video_id,
+                        outcome.job.status,
+                        outcome.job.transfer_mode
+                    );
+                }
+            }
             JobCmd::List { limit } => {
                 for j in db.list_jobs(limit)? {
                     println!(
-                        "{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}",
                         j.id,
                         j.status,
+                        j.transfer_mode,
                         j.video_id,
                         j.bvid.unwrap_or_default(),
                         j.title.unwrap_or_default()
