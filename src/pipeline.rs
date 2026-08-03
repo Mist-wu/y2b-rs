@@ -98,7 +98,7 @@ impl Pipeline {
             return self.run_direct(job, &meta, &work).await;
         }
 
-        let video_fut = self.download_video(&job.id, &job.url, &meta.id, &work);
+        let video_fut = self.download_video(&job.id, &job.url, &meta, &work);
         let subtitle_fut = self.prepare_translated_subtitle(job, &meta, &work);
         let (video, subtitle) = try_join_branches(video_fut, subtitle_fut).await?;
         self.db
@@ -166,7 +166,7 @@ impl Pipeline {
     }
 
     async fn run_direct(&self, job: &Job, meta: &VideoMetadata, work: &Path) -> Result<()> {
-        let video_fut = self.download_video(&job.id, &job.url, &meta.id, work);
+        let video_fut = self.download_video(&job.id, &job.url, meta, work);
         let metadata_fut = self.publish_metadata(&job.id, TransferMode::Direct, meta, None);
         let (video, publication) = try_join_branches(video_fut, metadata_fut).await?;
         self.db
@@ -386,9 +386,10 @@ impl Pipeline {
         &self,
         job_id: &str,
         url: &str,
-        video_id: &str,
+        meta: &VideoMetadata,
         work: &Path,
     ) -> Result<PathBuf> {
+        let video_id = &meta.id;
         if let Some(p) = find_video(work, video_id) {
             return Ok(p);
         }
@@ -396,10 +397,10 @@ impl Pipeline {
             .db
             .start_stage(job_id, "video_download", None, None, None)?;
         let mut cmd = Command::new(&self.config.youtube.yt_dlp);
-        let square = (self.config.youtube.max_pixels as f64).sqrt().floor() as u64;
-        let fps = self.config.youtube.max_fps;
-        let format = format!(
-            "bv*[vcodec^=avc1][fps<={fps}][width<=1920][height<=1080]+ba[acodec^=mp4a]/bv*[vcodec^=avc1][fps<={fps}][width<=1080][height<=1920]+ba[acodec^=mp4a]/bv*[vcodec^=avc1][fps<={fps}][width<={square}][height<={square}]+ba[acodec^=mp4a]/b[vcodec^=avc1][acodec^=mp4a][fps<={fps}][width<=1920][height<=1080]/b[vcodec^=avc1][acodec^=mp4a][fps<={fps}][width<=1080][height<=1920]/bv*[fps<={fps}][width<=1920][height<=1080]+ba/bv*[fps<={fps}][width<=1080][height<=1920]+ba/b[fps<={fps}][width<=1920][height<=1080]/b[fps<={fps}][width<=1080][height<=1920]"
+        let format = download_format_selector(
+            meta,
+            self.config.youtube.max_pixels,
+            self.config.youtube.max_fps,
         );
         cmd.args([
             "--js-runtimes",
@@ -940,6 +941,24 @@ const MAX_TITLE_WIDTH: usize = 70;
 const MAX_DYNAMIC_WIDTH: usize = 120;
 const MAX_TAG_CHARS: usize = 20;
 const MAX_TAGS: usize = 4;
+
+fn download_format_selector(meta: &VideoMetadata, max_pixels: u64, max_fps: f64) -> String {
+    let vertical = matches!((meta.width, meta.height), (Some(width), Some(height)) if height >= width)
+        || meta.url.contains("/shorts/")
+        || meta
+            .webpage_url
+            .as_deref()
+            .is_some_and(|url| url.contains("/shorts/"));
+    let ((primary_width, primary_height), (secondary_width, secondary_height)) = if vertical {
+        ((1080, 1920), (1920, 1080))
+    } else {
+        ((1920, 1080), (1080, 1920))
+    };
+    let square = (max_pixels as f64).sqrt().floor() as u64;
+    format!(
+        "bv*[vcodec^=avc1][fps<={max_fps}][width<={primary_width}][height<={primary_height}]+ba[acodec^=mp4a]/bv*[vcodec^=avc1][fps<={max_fps}][width<={secondary_width}][height<={secondary_height}]+ba[acodec^=mp4a]/bv*[vcodec^=avc1][fps<={max_fps}][width<={square}][height<={square}]+ba[acodec^=mp4a]/b[vcodec^=avc1][acodec^=mp4a][fps<={max_fps}][width<={primary_width}][height<={primary_height}]/b[vcodec^=avc1][acodec^=mp4a][fps<={max_fps}][width<={secondary_width}][height<={secondary_height}]/bv*[fps<={max_fps}][width<={primary_width}][height<={primary_height}]+ba/bv*[fps<={max_fps}][width<={secondary_width}][height<={secondary_height}]+ba/b[fps<={max_fps}][width<={primary_width}][height<={primary_height}]/b[fps<={max_fps}][width<={secondary_width}][height<={secondary_height}]"
+    )
+}
 
 fn build_publication_payload(
     mode: TransferMode,
@@ -1707,6 +1726,32 @@ mod tests {
             build_publication_payload(TransferMode::Direct, &meta, None, 200_000).unwrap();
         assert_eq!(payload["youtube"]["description"], "");
         assert!(build_publication_payload(TransferMode::Translated, &meta, None, 200_000).is_err());
+    }
+
+    #[test]
+    fn download_selector_prioritizes_the_video_orientation() {
+        let landscape = metadata();
+        let landscape_selector = download_format_selector(&landscape, 2_073_600, 60.0);
+        assert!(
+            landscape_selector
+                .split('/')
+                .next()
+                .unwrap()
+                .contains("[width<=1920][height<=1080]")
+        );
+
+        let mut vertical = metadata();
+        vertical.url = "https://www.youtube.com/shorts/video".into();
+        vertical.width = Some(1080);
+        vertical.height = Some(1920);
+        let vertical_selector = download_format_selector(&vertical, 2_073_600, 60.0);
+        assert!(
+            vertical_selector
+                .split('/')
+                .next()
+                .unwrap()
+                .contains("[width<=1080][height<=1920]")
+        );
     }
 
     #[test]
