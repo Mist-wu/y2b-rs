@@ -167,8 +167,8 @@ impl Default for BilibiliConfig {
         Self {
             biliup: "/usr/local/bin/biliup".into(),
             cookies: b.join("bilibili_cookies.json"),
-            default_tid: 4,
-            default_tags: vec!["翻译".into(), "YouTube".into()],
+            default_tid: 172,
+            default_tags: vec!["荒野乱斗".into()],
             max_parts: 199,
         }
     }

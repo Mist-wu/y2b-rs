@@ -23,8 +23,8 @@ max_fps = 60.0
 [bilibili]
 biliup = "/usr/local/bin/biliup"
 cookies = "/var/lib/y2b/bilibili_cookies.json"
-default_tid = 4
-default_tags = ["翻译", "YouTube"]
+default_tid = 172
+default_tags = ["荒野乱斗"]
 max_parts = 199
 
 [ai]
