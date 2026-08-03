@@ -933,6 +933,7 @@ impl Pipeline {
 
 const PI_PROMPT_OVERHEAD_TOKENS: usize = 2_048;
 const PI_METADATA_OUTPUT_RESERVE_TOKENS: usize = 1_024;
+const PI_MAX_PROMPT_ARGUMENT_BYTES: usize = 96 * 1024;
 const BILIBILI_TID: i64 = 172;
 const CORE_TAG: &str = "荒野乱斗";
 const MAX_TITLE_WIDTH: usize = 70;
@@ -970,11 +971,15 @@ fn build_publication_payload(
     let all_cues = cues.unwrap_or_default();
     let full_indices = (0..all_cues.len()).collect::<Vec<_>>();
     let full = publication_payload_value(mode, meta, all_cues, &full_indices, false);
-    if estimate_publication_tokens(&full) <= budget {
+    if publication_payload_fits(&full, budget) {
         return Ok(full);
     }
     if mode == TransferMode::Direct {
-        bail!("YouTube 元数据超过 Pi 安全 token 阈值 {budget}")
+        bail!(
+            "YouTube 元数据超过 Pi 输入限制: estimated_tokens={}, bytes={}",
+            estimate_publication_tokens(&full),
+            full.to_string().len()
+        )
     }
 
     let mut count = all_cues.len().saturating_sub(1).max(2);
@@ -982,16 +987,24 @@ fn build_publication_payload(
         let indices = uniform_sample_indices(all_cues.len(), count);
         let sampled = publication_payload_value(mode, meta, all_cues, &indices, true);
         let estimated = estimate_publication_tokens(&sampled);
-        if estimated <= budget {
+        let bytes = sampled.to_string().len();
+        if estimated <= budget && bytes <= PI_MAX_PROMPT_ARGUMENT_BYTES {
             return Ok(sampled);
         }
         if count == 2 {
-            bail!("保留首尾字幕后投稿元数据仍超过 Pi 安全 token 阈值 {budget}")
+            bail!(
+                "保留首尾字幕后投稿元数据仍超过 Pi 输入限制: estimated_tokens={estimated}, bytes={bytes}"
+            )
         }
-        let shrunk = count
+        let token_count = count
             .saturating_mul(budget)
             .checked_div(estimated)
             .unwrap_or(0);
+        let byte_count = count
+            .saturating_mul(PI_MAX_PROMPT_ARGUMENT_BYTES)
+            .checked_div(bytes)
+            .unwrap_or(0);
+        let shrunk = token_count.min(byte_count);
         count = shrunk.clamp(2, count - 1);
     }
 }
@@ -1036,6 +1049,11 @@ fn estimate_publication_tokens(payload: &Value) -> usize {
     PI_PROMPT_OVERHEAD_TOKENS
         .saturating_add(PI_METADATA_OUTPUT_RESERVE_TOKENS)
         .saturating_add(estimate_text_tokens(&payload.to_string()))
+}
+
+fn publication_payload_fits(payload: &Value, token_budget: usize) -> bool {
+    estimate_publication_tokens(payload) <= token_budget
+        && payload.to_string().len() <= PI_MAX_PROMPT_ARGUMENT_BYTES
 }
 
 fn uniform_sample_indices(len: usize, count: usize) -> Vec<usize> {
@@ -1732,6 +1750,18 @@ mod tests {
         assert!(included.len() < cues.len());
         assert_eq!(included.first().unwrap()["i"], 0);
         assert_eq!(included.last().unwrap()["i"], cues.len() - 1);
+
+        let mut large = (0..1_075)
+            .map(|i| cue(i, "a representative subtitle sentence with context"))
+            .collect::<Vec<_>>();
+        for (index, cue) in large.iter_mut().enumerate() {
+            cue.translation = Some(format!("第{index}句包含足够长度的中文字幕内容"));
+        }
+        let bounded =
+            build_publication_payload(TransferMode::Translated, &metadata(), Some(&large), 200_000)
+                .unwrap();
+        assert!(bounded.to_string().len() <= PI_MAX_PROMPT_ARGUMENT_BYTES);
+        assert_eq!(bounded["subtitle_sampling"]["sampled"], true);
     }
 
     #[test]
