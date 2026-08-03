@@ -1213,7 +1213,6 @@ fn build_upload_args(
     meta: &VideoMetadata,
     mode: TransferMode,
 ) -> Vec<String> {
-    let source_url = meta.webpage_url.as_deref().unwrap_or(&meta.url);
     vec![
         "--title".into(),
         metadata.title.clone(),
@@ -1226,9 +1225,9 @@ fn build_upload_args(
         "--dynamic".into(),
         metadata.dynamic.clone(),
         "--copyright".into(),
-        "2".into(),
-        "--source".into(),
-        source_url.into(),
+        "1".into(),
+        "--no-reprint".into(),
+        "0".into(),
         "--limit".into(),
         "1".into(),
     ]
@@ -1699,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_args_are_fixed_repost_metadata_and_detailed_description() {
+    fn upload_args_are_fixed_original_metadata_and_detailed_description() {
         let publication = parse_publication_metadata(&json!({
             "title": "2026年最佳排位赛",
             "dynamic": "最后一局上演极限翻盘。",
@@ -1712,11 +1711,9 @@ mod tests {
             args[index + 1].as_str()
         };
         assert_eq!(value_after("--tid"), "172");
-        assert_eq!(value_after("--copyright"), "2");
-        assert_eq!(
-            value_after("--source"),
-            "https://www.youtube.com/watch?v=video"
-        );
+        assert_eq!(value_after("--copyright"), "1");
+        assert_eq!(value_after("--no-reprint"), "0");
+        assert!(!args.iter().any(|value| value == "--source"));
         assert_eq!(value_after("--tag"), "荒野乱斗,排位赛");
         assert_eq!(value_after("--dynamic"), "最后一局上演极限翻盘。");
         let description = value_after("--desc");
