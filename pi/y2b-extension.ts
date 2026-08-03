@@ -1,14 +1,67 @@
 import fs from "node:fs";
+import path from "node:path";
 
 type PiApi = {
-  on(event: "before_agent_start", handler: (event: { systemPrompt: string }) => Promise<{ systemPrompt: string }> | { systemPrompt: string }): void;
+  on(event: "before_agent_start", handler: (event: { prompt: string; systemPrompt: string }) => Promise<{ systemPrompt: string }> | { systemPrompt: string }): void;
 };
 
+type Policy = {
+  glossary?: Record<string, string>;
+  [key: string]: unknown;
+};
+
+function normalizeTerm(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function promptContainsTerm(prompt: string, term: string): boolean {
+  const trimmed = term.trim();
+  if (!trimmed) return false;
+  const pattern = trimmed.split(/\s+/).map(escapeRegExp).join("\\s+");
+  const left = /^[A-Za-z0-9]/.test(trimmed) ? "(?<![A-Za-z0-9])" : "";
+  const right = /[A-Za-z0-9]$/.test(trimmed) ? "(?![A-Za-z0-9])" : "";
+  return new RegExp(`${left}${pattern}${right}`, "iu").test(prompt);
+}
+
+function loadOfficialGlossary(policyPath: string): Record<string, string> {
+  const glossaryPath = path.join(path.dirname(policyPath), "brawl-stars-glossary.json");
+  if (!fs.existsSync(glossaryPath)) return {};
+  const document = JSON.parse(fs.readFileSync(glossaryPath, "utf8"));
+  return document.glossary ?? {};
+}
+
+function relevantGlossary(
+  prompt: string,
+  official: Record<string, string>,
+  curated: Record<string, string>,
+): Record<string, string> {
+  const merged = new Map<string, [string, string]>();
+  for (const [term, translation] of Object.entries(official)) {
+    merged.set(normalizeTerm(term), [term, translation]);
+  }
+  for (const [term, translation] of Object.entries(curated)) {
+    merged.set(normalizeTerm(term), [term, translation]);
+  }
+  return Object.fromEntries(
+    [...merged.values()].filter(([term]) => promptContainsTerm(prompt, term)),
+  );
+}
+
 export default function y2bExtension(pi: PiApi) {
-  pi.on("before_agent_start", async () => {
+  pi.on("before_agent_start", async (event) => {
     const policyPath = process.env.Y2B_PI_POLICY_PATH;
     if (!policyPath) throw new Error("Y2B_PI_POLICY_PATH is required");
-    const policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
+    const policy: Policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
+    const glossary = relevantGlossary(
+      event.prompt,
+      loadOfficialGlossary(policyPath),
+      policy.glossary ?? {},
+    );
+    const runtimePolicy = { ...policy, glossary };
     return {
       systemPrompt: `You are the deterministic subtitle language engine for y2b-rs.
 You receive exactly one JSON object from the caller. Never call tools. Never explain your work.
@@ -37,6 +90,13 @@ Task translate:
 - Preserve code, API names, numbers, usernames, game terminology, and proper nouns accurately.
 - Do not add notes or punctuation that is absent unless natural Chinese readability requires it.
 
+Task glossary_audit:
+- Input: {"task":"glossary_audit","source_lang":"en","target_lang":"zh-CN","items":["term 1","term 2"]}
+- Output: {"translations":["译文1","译文2"]}
+- Return exactly one translation for every input item, preserving input order and array length.
+- Translate each item independently as an isolated Brawl Stars term. Apply the project glossary and all Task translate terminology rules.
+- Never add indices, explanations, Markdown, or fields other than translations.
+
 Task publish_metadata:
 - Input: {"task":"publish_metadata","transfer_mode":"direct|translated","youtube":{"title":"...","description":"...","url":"...","uploader":"...","published_date":"YYYY-MM-DD"},"subtitle_sampling":{"sampled":false,"total":0,"included":0},"subtitles":[{"i":0,"start":0.0,"end":2.0,"source":"...","translation":"..."}]}
 - Output exactly: {"title":"...","dynamic":"...","tags":["荒野乱斗","..."]}
@@ -48,7 +108,7 @@ Task publish_metadata:
 - For transfer_mode=translated, use the bilingual subtitles to identify the actual content. subtitle_sampling.sampled=true means the caller retained the beginning/end and uniformly sampled the rest; do not infer unsupported details from omitted sections.
 
 Project policy and glossary:
-${JSON.stringify(policy, null, 2)}`,
+${JSON.stringify(runtimePolicy, null, 2)}`,
     };
   });
 }

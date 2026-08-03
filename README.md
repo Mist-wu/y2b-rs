@@ -13,6 +13,7 @@ Rust CLI/TUI 工具：监控 YouTube 频道更新，按频道选择原片直传�
 - 投稿固定为手机游戏分区 `tid=172`、自制 `copyright=1` 并允许转载；不使用 Bilibili 转载来源字段。标签始终以“荒野乱斗”开头，简介按清理 hashtag 后的原标题、YouTube 来源、原作者、处理方式和工具地址确定性生成。
 - 所有新投稿都下载 yt-dlp 选定的 YouTube 原封面，转为 JPEG 后通过 biliup `--cover` 上传；封面失败时任务重试而不会无封面投稿。
 - Pi 默认 `openai-codex/gpt-5.6-luna`，thinking `high`；每次调用使用 `--no-session --no-tools`，只加载 `pi/y2b-extension.ts`。
+- `pi/brawl-stars-glossary.json` 来自国际服客户端英文/简中本地化资源。审计脚本从游戏逻辑 TID 中提取无歧义术语并依次测试 Terra、Luna、Sol，只把至少一个模型译错的官译加入词库；extension 每次仅注入当前输入实际出现的词条，避免全量词库占用上下文。
 - Pi 批处理支持 `adaptive` 和 `whole_video`。默认按 256k 上下文、200k 安全阈值估算输入与输出；阈值内整条视频只调用一次分句和一次翻译，超限时按 token 拆批。自适应分句携带前后 12 条上下文，并在 Pi 返回的自然分句边界衔接批次。
 - SQLite 持久化频道、任务、阶段、峰值 RSS、Pi token/cost 和认证状态。连续失败 5 次进入 `dead_letter` 并删除大型视频。
 
@@ -48,6 +49,19 @@ y2b auth-check
 TUI：`Tab` 切换任务/频道列表，`↑/↓` 选择，`n` 输入单个 YouTube URL 并选择 `direct` 或 `translated`，`r` 重试或恢复 dead-letter，`p` 重查字幕，`Space` 暂停，`m` 在 Luna/Sol/Terra 间切换，`a` 重做认证检查，`y`/`b` 导入 YouTube/Bilibili cookies，`q` 退出。手动 URL 在后台解析并入队，重复 URL 会定位已有任务；频道增删、模式切换和启停仅由 CLI 管理。
 
 频道模式只是新任务的默认值。任务入队后会固化当时的模式，后续 `channels set-mode` 不会改写旧任务。`video_id` 全局唯一，同一视频不会二次入队或二次投稿。`y2b run` 的 `--mode` 默认为 `translated`；`channels add` 和 `jobs add` 要求显式指定 `--mode`。
+
+## 荒野乱斗词库审计
+
+`scripts/audit_brawl_glossary.py` 从国际服客户端镜像的 `localization/texts`、`localization/cn`、`localization/texts_patch` 以及游戏逻辑 TID 引用生成英文/简中术语集。完整说明句、占位模板、纯数字和一词多译项目不会进入强制词库。
+
+```bash
+python3 scripts/audit_brawl_glossary.py \
+  --server root@157.230.241.109 \
+  --models gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra \
+  --output /tmp/y2b-brawl-glossary-audit.json
+```
+
+脚本固定使用 `thinking=high`，支持 `--terms-file` 重用提取结果和 `--resume` 断点续跑。当前生产词库及数据版本、筛选数量、模型审计统计保存在 `pi/brawl-stars-glossary.json`。
 
 ## 新服务器部署
 
@@ -89,7 +103,7 @@ systemctl show y2b-watch -p MemoryCurrent -p MemoryPeak -p MemorySwapCurrent
 ## 恢复
 
 1. 在空服务器运行 `bootstrap-server.sh`。
-2. 恢复 `/etc/y2b/config.toml`、三份认证文件、`/opt/y2b/fonts` 和 Pi extension/policy。
+2. 恢复 `/etc/y2b/config.toml`、三份认证文件、`/opt/y2b/fonts`、Pi extension/policy 和 `brawl-stars-glossary.json`。
 3. 从 `/var/lib/y2b/backups/daily` 或 `weekly` 选择数据库，执行 `deploy/restore.sh BACKUP.db`。
 4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时会自动升级到 v5，旧频道和任务的模式均为 `translated`；v5 会持久化已验证的投稿元数据。
 5. SQLite 保存完整任务队列；`queued`/`retry_wait`/`processing` 会在重启后恢复，任务模式和追加目标 BV 不丢失，`dead_letter` 从 TUI 或 CLI 恢复后会重新下载。

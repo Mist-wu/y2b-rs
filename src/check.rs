@@ -115,11 +115,13 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
         ok: schema >= 2,
         detail: format!("v{schema}"),
     });
+    let glossary_path = config.ai.policy.with_file_name("brawl-stars-glossary.json");
     for (name, p) in [
         ("YouTube cookies", &config.youtube.cookies),
         ("Bilibili cookies", &config.bilibili.cookies),
         ("Pi extension", &config.ai.extension),
         ("Pi policy", &config.ai.policy),
+        ("Brawl Stars glossary", &glossary_path),
         ("fonts", &config.render.fonts_dir),
     ] {
         out.push(CheckItem {
@@ -225,6 +227,21 @@ pub async fn write_baseline(config: &Config, dest: &Path) -> Result<Baseline> {
             version: env!("CARGO_PKG_VERSION").into(),
             sha256: Some(hash_file(&path)?),
         });
+    }
+    let glossary_path = config.ai.policy.with_file_name("brawl-stars-glossary.json");
+    for (name, path) in [
+        ("pi-extension", config.ai.extension.as_path()),
+        ("pi-policy", config.ai.policy.as_path()),
+        ("brawl-stars-glossary", glossary_path.as_path()),
+    ] {
+        if path.exists() {
+            items.push(BaselineItem {
+                name: name.into(),
+                path: path.display().to_string(),
+                version: String::new(),
+                sha256: Some(hash_file(path)?),
+            });
+        }
     }
     for entry in fs::read_dir(&config.render.fonts_dir)
         .into_iter()
