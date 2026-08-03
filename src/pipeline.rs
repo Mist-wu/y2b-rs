@@ -1,6 +1,6 @@
 use crate::config::{BatchMode, Config};
 use crate::db::Database;
-use crate::model::{AiUsage, Job, JobStatus};
+use crate::model::{AiUsage, Job, JobStatus, TransferMode, VideoMetadata};
 use crate::monitor::Monitor;
 use crate::process::{ProcessOutput, run_monitored};
 use crate::subtitle::{self, Cue};
@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
@@ -84,67 +85,34 @@ impl Pipeline {
         )?;
         let work = self.config.runtime.download_dir.join(&meta.id);
         fs::create_dir_all(&work)?;
-        let subtitle = self
-            .download_subtitle(&job.id, &job.url, &meta.id, &work)
-            .await?;
-        if append_to.is_some() && subtitle.is_none() {
-            self.db.update_job_status(
-                &job.id,
-                JobStatus::UploadedOriginalPendingSubtitle,
-                Some("仍无可用字幕"),
-            )?;
-            return Ok(());
-        }
-        let video = self
-            .download_video(&job.id, &job.url, &meta.id, &work)
-            .await?;
-        self.db.set_job_paths(
-            &job.id,
-            Some(&video.to_string_lossy()),
-            subtitle.as_ref().map(|p| p.to_string_lossy()).as_deref(),
-            None,
-        )?;
-        if subtitle.is_none() {
-            let title = self
-                .translate_title(&job.id, &meta.title)
-                .await
-                .unwrap_or_else(|_| meta.title.clone());
-            self.probe_media(&job.id, &video, "original_probe").await?;
-            let bvid = self.upload(&job.id, &video, &title, &job.url, None).await?;
-            self.db.set_job_bvid(&job.id, &bvid)?;
-            self.db
-                .update_job_status(&job.id, JobStatus::UploadedOriginalPendingSubtitle, None)?;
-            self.after_upload(&job.id, &[&video])?;
-            return Ok(());
-        }
-        let raw_sub = subtitle.unwrap();
-        let mut cues = subtitle::parse_vtt(&raw_sub)?;
-        cues = self.segment(&job.id, &cues).await?;
-        let segmented = work.join(format!("{}.en.segmented.json", meta.id));
-        subtitle::save_json(&cues, &segmented)?;
-        self.translate(&job.id, &mut cues).await?;
-        let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
-        subtitle::save_json(&cues, &translated)?;
-        let width = meta.width.unwrap_or(1920);
-        let height = meta.height.unwrap_or(1080);
-        let ass = work.join(format!("{}.bilingual.ass", meta.id));
-        subtitle::write_ass(
-            &cues,
-            &ass,
-            width,
-            height,
-            &self.config.render.font_cn,
-            &self.config.render.font_en,
-        )?;
         self.db
-            .set_job_paths(&job.id, None, Some(&ass.to_string_lossy()), None)?;
+            .update_job_status(&job.id, JobStatus::Processing, None)?;
+        if !requires_translated_pipeline(job.transfer_mode, append_to.is_some()) {
+            return self.run_direct(job, &meta, &work).await;
+        }
+
+        let video_fut = self.download_video(&job.id, &job.url, &meta.id, &work);
+        let subtitle_fut = self.prepare_translated_subtitle(job, &meta, &work);
+        let (video, ass) = try_join_branches(video_fut, subtitle_fut).await?;
+        self.db
+            .set_job_paths(&job.id, Some(&video.to_string_lossy()), None, None)?;
+        let Some(ass) = ass else {
+            if append_to.is_some() {
+                self.cleanup_large(&job.id)?;
+                self.db.update_job_status(
+                    &job.id,
+                    JobStatus::UploadedOriginalPendingSubtitle,
+                    Some("仍无可用字幕"),
+                )?;
+                return Ok(());
+            }
+            let title = self.translate_title(&job.id, &meta.title).await?;
+            return self.finish_direct_upload(job, &video, &title, true).await;
+        };
         let rendered = self.render(&job.id, &video, &ass, &meta.id).await?;
         self.db
             .set_job_paths(&job.id, None, None, Some(&rendered.to_string_lossy()))?;
-        let title = self
-            .translate_title(&job.id, &meta.title)
-            .await
-            .unwrap_or_else(|_| meta.title.clone());
+        let title = self.translate_title(&job.id, &meta.title).await?;
         self.probe_media(&job.id, &rendered, "rendered_probe")
             .await?;
         let bvid = if let Some(existing) = append_to.as_deref() {
@@ -162,6 +130,71 @@ impl Pipeline {
             .update_job_status(&job.id, JobStatus::Completed, None)?;
         self.after_upload(&job.id, &[&video, &rendered])?;
         Ok(())
+    }
+
+    async fn run_direct(&self, job: &Job, meta: &VideoMetadata, work: &Path) -> Result<()> {
+        let video_fut = self.download_video(&job.id, &job.url, &meta.id, work);
+        let title_fut = self.translate_title(&job.id, &meta.title);
+        let (video, title) = try_join_branches(video_fut, title_fut).await?;
+        self.db
+            .set_job_paths(&job.id, Some(&video.to_string_lossy()), None, None)?;
+        self.finish_direct_upload(job, &video, &title, false).await
+    }
+
+    async fn finish_direct_upload(
+        &self,
+        job: &Job,
+        video: &Path,
+        title: &str,
+        pending_subtitle: bool,
+    ) -> Result<()> {
+        self.probe_media(&job.id, video, "original_probe").await?;
+        let bvid = self.upload(&job.id, video, title, &job.url, None).await?;
+        self.db.set_job_bvid(&job.id, &bvid)?;
+        self.db.update_job_status(
+            &job.id,
+            if pending_subtitle {
+                JobStatus::UploadedOriginalPendingSubtitle
+            } else {
+                JobStatus::Completed
+            },
+            None,
+        )?;
+        self.after_upload(&job.id, &[video])?;
+        Ok(())
+    }
+
+    async fn prepare_translated_subtitle(
+        &self,
+        job: &Job,
+        meta: &VideoMetadata,
+        work: &Path,
+    ) -> Result<Option<PathBuf>> {
+        let Some(raw_sub) = self
+            .download_subtitle(&job.id, &job.url, &meta.id, work)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut cues = subtitle::parse_vtt(&raw_sub)?;
+        cues = self.segment(&job.id, &cues).await?;
+        let segmented = work.join(format!("{}.en.segmented.json", meta.id));
+        subtitle::save_json(&cues, &segmented)?;
+        self.translate(&job.id, &mut cues).await?;
+        let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
+        subtitle::save_json(&cues, &translated)?;
+        let ass = work.join(format!("{}.bilingual.ass", meta.id));
+        subtitle::write_ass(
+            &cues,
+            &ass,
+            meta.width.unwrap_or(1920),
+            meta.height.unwrap_or(1080),
+            &self.config.render.font_cn,
+            &self.config.render.font_en,
+        )?;
+        self.db
+            .set_job_paths(&job.id, None, Some(&ass.to_string_lossy()), None)?;
+        Ok(Some(ass))
     }
 
     fn ensure_disk(&self) -> Result<()> {
@@ -233,8 +266,8 @@ impl Pipeline {
             }
             Err(e) => {
                 self.db
-                    .finish_stage(stage, "missing", 0, 0, Some(&e.to_string()))?;
-                Ok(None)
+                    .finish_stage(stage, "failed", 0, 0, Some(&e.to_string()))?;
+                Err(e).context("字幕下载失败")
             }
         }
     }
@@ -249,8 +282,6 @@ impl Pipeline {
         if let Some(p) = find_video(work, video_id) {
             return Ok(p);
         }
-        self.db
-            .update_job_status(job_id, JobStatus::Downloading, None)?;
         let stage = self
             .db
             .start_stage(job_id, "video_download", None, None, None)?;
@@ -290,8 +321,6 @@ impl Pipeline {
     }
 
     async fn segment(&self, job_id: &str, cues: &[Cue]) -> Result<Vec<Cue>> {
-        self.db
-            .update_job_status(job_id, JobStatus::Segmenting, None)?;
         let stage = self.db.start_stage(
             job_id,
             "segmentation",
@@ -416,8 +445,6 @@ impl Pipeline {
     }
 
     async fn translate(&self, job_id: &str, cues: &mut [Cue]) -> Result<()> {
-        self.db
-            .update_job_status(job_id, JobStatus::Translating, None)?;
         let stage = self.db.start_stage(
             job_id,
             "translation",
@@ -644,7 +671,7 @@ impl Pipeline {
                 "--title",
                 title,
                 "--desc",
-                &format!("来源：{source}\n由 y2b-rs 自动翻译压制"),
+                &format!("URL：{source}\n由 y2b-rs 自动处理"),
                 "--tag",
                 &self.config.bilibili.default_tags.join(","),
                 "--tid",
@@ -778,6 +805,18 @@ impl Pipeline {
 }
 
 const PI_PROMPT_OVERHEAD_TOKENS: usize = 2_048;
+
+fn requires_translated_pipeline(mode: TransferMode, has_append_target: bool) -> bool {
+    mode == TransferMode::Translated || has_append_target
+}
+
+async fn try_join_branches<A, B, FA, FB>(left: FA, right: FB) -> Result<(A, B)>
+where
+    FA: Future<Output = Result<A>>,
+    FB: Future<Output = Result<B>>,
+{
+    tokio::try_join!(left, right)
+}
 
 fn batch_mode_name(mode: BatchMode) -> &'static str {
     match mode {
@@ -1050,6 +1089,8 @@ fn parse_translations(v: &Value) -> Result<Vec<(usize, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
 
     fn cue(index: usize, text: &str) -> Cue {
         Cue {
@@ -1111,5 +1152,39 @@ mod tests {
         validate_translation_indexes(2, &valid).unwrap();
         let duplicate = vec![(0, "甲".into()), (0, "乙".into())];
         assert!(validate_translation_indexes(2, &duplicate).is_err());
+    }
+
+    #[test]
+    fn transfer_mode_routes_only_requested_jobs_through_subtitles() {
+        assert!(!requires_translated_pipeline(TransferMode::Direct, false));
+        assert!(requires_translated_pipeline(
+            TransferMode::Translated,
+            false
+        ));
+        assert!(requires_translated_pipeline(TransferMode::Direct, true));
+    }
+
+    #[tokio::test]
+    async fn media_branches_start_concurrently() {
+        let barrier = Arc::new(Barrier::new(2));
+        let left_barrier = barrier.clone();
+        let right_barrier = barrier.clone();
+        let joined = tokio::time::timeout(
+            Duration::from_secs(1),
+            try_join_branches(
+                async move {
+                    left_barrier.wait().await;
+                    Ok::<_, anyhow::Error>("video")
+                },
+                async move {
+                    right_barrier.wait().await;
+                    Ok::<_, anyhow::Error>("subtitle")
+                },
+            ),
+        )
+        .await
+        .expect("branches did not run concurrently")
+        .unwrap();
+        assert_eq!(joined, ("video", "subtitle"));
     }
 }
