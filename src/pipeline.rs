@@ -678,6 +678,8 @@ impl Pipeline {
                 &self.config.bilibili.default_tid.to_string(),
                 "--copyright",
                 "1",
+                "--no-reprint",
+                "0",
                 "--limit",
                 "1",
             ]);
