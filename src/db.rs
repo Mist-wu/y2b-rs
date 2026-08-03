@@ -530,6 +530,65 @@ fn usage_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AiUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_v3_rows_to_translated_mode() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("v3.db");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            r#"
+            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO schema_migrations(version, applied_at)
+              VALUES(1, CURRENT_TIMESTAMP), (2, CURRENT_TIMESTAMP), (3, CURRENT_TIMESTAMP);
+            CREATE TABLE channels(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              youtube_channel_id TEXT NOT NULL UNIQUE,
+              name TEXT NOT NULL, url TEXT NOT NULL, feed_url TEXT NOT NULL,
+              enabled INTEGER NOT NULL DEFAULT 1, baseline_at TEXT,
+              last_checked_at TEXT, last_reconcile_at TEXT, last_error TEXT,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE jobs(
+              id TEXT PRIMARY KEY, channel_id INTEGER REFERENCES channels(id),
+              video_id TEXT NOT NULL UNIQUE, url TEXT NOT NULL, title TEXT,
+              status TEXT NOT NULL, published_at TEXT, youtube_updated_at TEXT,
+              discovered_at TEXT NOT NULL, is_short INTEGER NOT NULL DEFAULT 0,
+              duration_seconds REAL, width INTEGER, height INTEGER, fps REAL,
+              bvid TEXT, append_to_bvid TEXT, provider TEXT, ai_model TEXT, thinking TEXT,
+              attempt INTEGER NOT NULL DEFAULT 0, error TEXT,
+              raw_video_path TEXT, rendered_path TEXT, subtitle_path TEXT,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            INSERT INTO channels(
+              youtube_channel_id, name, url, feed_url, created_at
+            ) VALUES(
+              'UC-v3', 'v3 channel', 'https://youtube.com/@v3',
+              'https://youtube.com/feeds/videos.xml?channel_id=UC-v3', CURRENT_TIMESTAMP
+            );
+            INSERT INTO jobs(
+              id, channel_id, video_id, url, status, discovered_at, created_at, updated_at
+            ) VALUES(
+              'job-v3', 1, 'video-v3', 'https://youtu.be/video-v3', 'queued',
+              CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            );
+            "#,
+        )
+        .unwrap();
+        drop(old);
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(
+            db.list_channels().unwrap()[0].transfer_mode,
+            TransferMode::Translated
+        );
+        assert_eq!(
+            db.get_job("job-v3").unwrap().unwrap().transfer_mode,
+            TransferMode::Translated
+        );
+    }
+
     #[test]
     fn schema_and_dedup() {
         let t = tempfile::tempdir().unwrap();

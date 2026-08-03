@@ -31,6 +31,19 @@ pub struct EnqueueOutcome {
     pub created: bool,
 }
 
+fn validate_single_video(v: &Value) -> Result<()> {
+    if v.get("_type").and_then(Value::as_str) == Some("playlist")
+        || v.get("entries").and_then(Value::as_array).is_some()
+    {
+        bail!("请输入单个 YouTube 视频 URL，不支持播放列表")
+    }
+    let live = v.get("live_status").and_then(Value::as_str);
+    if matches!(live, Some("is_live" | "is_upcoming" | "post_live")) {
+        bail!("直播或预约内容暂不处理: {live:?}")
+    }
+    Ok(())
+}
+
 impl Monitor {
     pub fn new(config: Config, db: Database) -> Result<Self> {
         Ok(Self {
@@ -272,16 +285,11 @@ impl Monitor {
         }
         let out = run_monitored(cmd, Duration::from_secs(120)).await?;
         let v: Value = serde_json::from_str(out.stdout.trim())?;
+        validate_single_video(&v)?;
         let live = v
             .get("live_status")
             .and_then(Value::as_str)
             .map(str::to_string);
-        if matches!(
-            live.as_deref(),
-            Some("is_live" | "is_upcoming" | "post_live")
-        ) {
-            bail!("直播或预约内容暂不处理: {:?}", live);
-        }
         Ok((
             VideoMetadata {
                 id: v["id"].as_str().unwrap_or_default().into(),
@@ -321,5 +329,29 @@ mod tests {
     #[test]
     fn date() {
         assert!(parse_rfc3339("2026-08-02T12:00:00Z").is_some());
+    }
+
+    #[test]
+    fn manual_queue_rejects_playlists_and_live_content() {
+        assert!(
+            validate_single_video(&serde_json::json!({
+                "_type": "playlist",
+                "entries": []
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("播放列表")
+        );
+        assert!(
+            validate_single_video(&serde_json::json!({ "live_status": "is_live" }))
+                .unwrap_err()
+                .to_string()
+                .contains("直播")
+        );
+        validate_single_video(&serde_json::json!({
+            "_type": "video",
+            "live_status": "not_live"
+        }))
+        .unwrap();
     }
 }
