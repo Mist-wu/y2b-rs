@@ -44,6 +44,38 @@ fn validate_single_video(v: &Value) -> Result<()> {
     Ok(())
 }
 
+fn extract_thumbnail_url(v: &Value) -> Option<String> {
+    let best_sized = v
+        .get("thumbnails")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let url = item.get("url")?.as_str()?;
+                    let width = item.get("width")?.as_u64()?;
+                    let height = item.get("height")?.as_u64()?;
+                    Some((width.saturating_mul(height), url))
+                })
+                .max_by_key(|(area, _)| *area)
+                .map(|(_, url)| url.to_string())
+        });
+    best_sized.or_else(|| {
+        v.get("thumbnail")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                v.get("thumbnails")
+                    .and_then(Value::as_array)
+                    .and_then(|items| {
+                        items.iter().rev().find_map(|item| {
+                            item.get("url").and_then(Value::as_str).map(str::to_string)
+                        })
+                    })
+            })
+    })
+}
+
 impl Monitor {
     pub fn new(config: Config, db: Database) -> Result<Self> {
         Ok(Self {
@@ -318,6 +350,7 @@ impl Monitor {
                 width: v.get("width").and_then(Value::as_i64),
                 height: v.get("height").and_then(Value::as_i64),
                 fps: v.get("fps").and_then(Value::as_f64),
+                thumbnail_url: extract_thumbnail_url(&v),
                 webpage_url: v
                     .get("webpage_url")
                     .and_then(Value::as_str)
@@ -366,5 +399,38 @@ mod tests {
             "live_status": "not_live"
         }))
         .unwrap();
+    }
+
+    #[test]
+    fn metadata_uses_youtube_selected_thumbnail_or_best_fallback() {
+        assert_eq!(
+            extract_thumbnail_url(&serde_json::json!({
+                "thumbnail": "https://i.ytimg.com/selected.jpg",
+                "thumbnails": [{"url": "https://i.ytimg.com/fallback.jpg"}]
+            }))
+            .as_deref(),
+            Some("https://i.ytimg.com/selected.jpg")
+        );
+        assert_eq!(
+            extract_thumbnail_url(&serde_json::json!({
+                "thumbnail": "https://i.ytimg.com/selected-low-resolution.jpg",
+                "thumbnails": [
+                    {"url": "https://i.ytimg.com/small.jpg", "width": 480, "height": 360},
+                    {"url": "https://i.ytimg.com/maxres.jpg", "width": 1920, "height": 1080}
+                ]
+            }))
+            .as_deref(),
+            Some("https://i.ytimg.com/maxres.jpg")
+        );
+        assert_eq!(
+            extract_thumbnail_url(&serde_json::json!({
+                "thumbnails": [
+                    {"url": "https://i.ytimg.com/small.jpg"},
+                    {"url": "https://i.ytimg.com/best.jpg"}
+                ]
+            }))
+            .as_deref(),
+            Some("https://i.ytimg.com/best.jpg")
+        );
     }
 }

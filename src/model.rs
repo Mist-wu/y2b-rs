@@ -165,6 +165,7 @@ pub struct VideoMetadata {
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub fps: Option<f64>,
+    pub thumbnail_url: Option<String>,
     pub webpage_url: Option<String>,
     pub live_status: Option<String>,
 }
@@ -204,6 +205,7 @@ mod tests {
             width: Some(w),
             height: Some(h),
             fps: None,
+            thumbnail_url: None,
             webpage_url: None,
             live_status: None,
         }

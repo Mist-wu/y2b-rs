@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 
 pub struct Pipeline {
@@ -144,13 +144,14 @@ impl Pipeline {
             self.append(&job.id, &rendered, existing).await?;
             existing.to_owned()
         } else {
+            let cover = self.download_cover(&job.id, &meta, &work).await?;
             self.upload(
                 &job.id,
                 &rendered,
                 publication.as_ref().context("投稿元数据未生成")?,
                 &meta,
                 TransferMode::Translated,
-                None,
+                Some(&cover),
             )
             .await?
         };
@@ -183,6 +184,8 @@ impl Pipeline {
         pending_subtitle: bool,
     ) -> Result<()> {
         self.probe_media(&job.id, video, "original_probe").await?;
+        let work = video.parent().context("视频文件没有工作目录")?;
+        let cover = self.download_cover(&job.id, meta, work).await?;
         let bvid = self
             .upload(
                 &job.id,
@@ -190,7 +193,7 @@ impl Pipeline {
                 publication,
                 meta,
                 TransferMode::Direct,
-                None,
+                Some(&cover),
             )
             .await?;
         self.db.set_job_bvid(&job.id, &bvid)?;
@@ -205,6 +208,70 @@ impl Pipeline {
         )?;
         self.after_upload(&job.id, &[video])?;
         Ok(())
+    }
+
+    async fn download_cover(
+        &self,
+        job_id: &str,
+        meta: &VideoMetadata,
+        work: &Path,
+    ) -> Result<PathBuf> {
+        let cover = work.join(format!("{}.youtube-cover.jpg", meta.id));
+        if cover.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+            return Ok(cover);
+        }
+        let thumbnail_url = meta
+            .thumbnail_url
+            .as_deref()
+            .context("YouTube 元数据缺少封面 URL")?;
+        let stage = self
+            .db
+            .start_stage(job_id, "cover_download", None, None, None)?;
+        let started = Instant::now();
+        let source = work.join(format!("{}.youtube-cover.source", meta.id));
+        let result = async {
+            let response = reqwest::Client::new()
+                .get(thumbnail_url)
+                .send()
+                .await?
+                .error_for_status()?;
+            let bytes = response.bytes().await?;
+            if bytes.is_empty() {
+                bail!("YouTube 封面为空")
+            }
+            fs::write(&source, bytes)?;
+            let mut cmd = Command::new(&self.config.render.ffmpeg);
+            cmd.arg("-y")
+                .arg("-i")
+                .arg(&source)
+                .args(["-frames:v", "1", "-q:v", "2", "-update", "1"])
+                .arg(&cover);
+            let output = run_monitored(cmd, Duration::from_secs(120)).await?;
+            if !cover.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+                bail!("FFmpeg 未生成 YouTube 封面")
+            }
+            Ok::<u64, anyhow::Error>(output.peak_rss_kib)
+        }
+        .await;
+        let _ = fs::remove_file(&source);
+        let duration_ms = started.elapsed().as_millis() as i64;
+        match result {
+            Ok(peak_rss_kib) => {
+                self.db.finish_stage(
+                    stage,
+                    "completed",
+                    duration_ms,
+                    peak_rss_kib,
+                    Some(thumbnail_url),
+                )?;
+                Ok(cover)
+            }
+            Err(error) => {
+                self.db
+                    .finish_stage(stage, "failed", duration_ms, 0, Some(&error.to_string()))?;
+                Err(error).context("下载 YouTube 封面失败")
+            }
+        }
     }
 
     async fn prepare_translated_subtitle(
@@ -1487,6 +1554,7 @@ mod tests {
             width: Some(1920),
             height: Some(1080),
             fps: Some(60.0),
+            thumbnail_url: Some("https://i.ytimg.com/vi/video/maxresdefault.jpg".into()),
             webpage_url: Some("https://www.youtube.com/watch?v=video".into()),
             live_status: Some("not_live".into()),
         }
