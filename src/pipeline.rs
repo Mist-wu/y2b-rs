@@ -98,6 +98,45 @@ impl Pipeline {
             return self.run_direct(job, &meta, &work).await;
         }
 
+        // A Bilibili submission can fail after the complete media upload (for
+        // example, rate-limit code 21566).  Retrying that failure must reuse the
+        // expensive rendered file instead of translating and encoding again.
+        if append_to.is_none()
+            && let Some(publication) = self.db.publication_metadata(&job.id)?
+            && let Some(rendered) = self.reusable_render(&meta.id).await?
+        {
+            self.db.event(
+                Some(&job.id),
+                "info",
+                "检测到有效成片，跳过字幕翻译和压制并重试投稿",
+            )?;
+            self.db
+                .set_job_paths(&job.id, None, None, Some(&rendered.to_string_lossy()))?;
+            self.probe_media(&job.id, &rendered, "rendered_probe")
+                .await?;
+            let cover = self.download_cover(&job.id, &meta, &work).await?;
+            let bvid = self
+                .upload(
+                    &job.id,
+                    &rendered,
+                    &publication,
+                    &meta,
+                    TransferMode::Translated,
+                    Some(&cover),
+                )
+                .await?;
+            self.db.set_job_bvid(&job.id, &bvid)?;
+            self.db
+                .update_job_status(&job.id, JobStatus::Completed, None)?;
+            let (raw, _, _) = self.db.job_paths(&job.id)?;
+            if let Some(raw) = raw {
+                self.after_upload(&job.id, &[Path::new(&raw), &rendered])?;
+            } else {
+                self.after_upload(&job.id, &[&rendered])?;
+            }
+            return Ok(());
+        }
+
         let video_fut = self.download_video(&job.id, &job.url, &meta, &work);
         let subtitle_fut = self.prepare_translated_subtitle(job, &meta, &work);
         let (video, subtitle) = try_join_branches(video_fut, subtitle_fut).await?;
@@ -752,13 +791,31 @@ impl Pipeline {
             .runtime
             .output_dir
             .join(format!("{video_id}.bilingual.mp4"));
+        if self.render_file_is_valid(&output).await {
+            self.db.finish_stage(
+                stage,
+                "completed",
+                0,
+                0,
+                Some(&format!("reused {}", output.display())),
+            )?;
+            return Ok(output);
+        }
+        let temporary = self
+            .config
+            .runtime
+            .output_dir
+            .join(format!("{video_id}.bilingual.tmp.mp4"));
+        if temporary.exists() {
+            fs::remove_file(&temporary)?;
+        }
         let filter = format!(
             "ass=filename='{}':fontsdir='{}'",
             escape_filter(ass),
             escape_filter(&self.config.render.fonts_dir)
         );
         let mut cmd = Command::new(&self.config.render.ffmpeg);
-        cmd.arg("-y")
+        cmd.args(["-nostdin", "-y", "-loglevel", "warning"])
             .arg("-i")
             .arg(video)
             .args([
@@ -781,8 +838,29 @@ impl Pipeline {
                 "-movflags",
                 "+faststart",
             ])
-            .arg(&output);
-        let out = run_monitored(cmd, Duration::from_secs(14400)).await?;
+            .arg(&temporary);
+        let out = match run_monitored(cmd, Duration::from_secs(14400)).await {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                self.db
+                    .finish_stage(stage, "failed", 0, 0, Some(&error.to_string()))?;
+                return Err(error);
+            }
+        };
+        if !self.render_file_is_valid(&temporary).await {
+            let _ = fs::remove_file(&temporary);
+            let error = anyhow::anyhow!("FFmpeg 生成的临时成片未通过 ffprobe 校验");
+            self.db.finish_stage(
+                stage,
+                "failed",
+                out.duration_ms,
+                out.peak_rss_kib,
+                Some(&error.to_string()),
+            )?;
+            return Err(error);
+        }
+        fs::rename(&temporary, &output)?;
         self.db.finish_stage(
             stage,
             "completed",
@@ -791,6 +869,52 @@ impl Pipeline {
             Some(&output.to_string_lossy()),
         )?;
         Ok(output)
+    }
+
+    async fn reusable_render(&self, video_id: &str) -> Result<Option<PathBuf>> {
+        let output = self
+            .config
+            .runtime
+            .output_dir
+            .join(format!("{video_id}.bilingual.mp4"));
+        Ok(self.render_file_is_valid(&output).await.then_some(output))
+    }
+
+    async fn render_file_is_valid(&self, path: &Path) -> bool {
+        if !path.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+            return false;
+        }
+        let mut cmd = Command::new(&self.config.render.ffprobe);
+        cmd.args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height,pix_fmt:format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(path);
+        let Ok(output) = run_monitored(cmd, Duration::from_secs(120)).await else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&output.stdout) else {
+            return false;
+        };
+        let Some(stream) = value["streams"]
+            .as_array()
+            .and_then(|streams| streams.first())
+        else {
+            return false;
+        };
+        stream["codec_name"] == "h264"
+            && stream["width"].as_u64().is_some_and(|width| width > 0)
+            && stream["height"].as_u64().is_some_and(|height| height > 0)
+            && value["format"]["duration"]
+                .as_str()
+                .and_then(|duration| duration.parse::<f64>().ok())
+                .is_some_and(|duration| duration > 0.0)
     }
 
     async fn upload(
@@ -814,13 +938,29 @@ impl Pipeline {
         if let Some(c) = cover {
             cmd.arg("--cover").arg(c);
         }
-        let out = run_monitored(cmd, Duration::from_secs(14400)).await?;
+        let out = match run_monitored(cmd, Duration::from_secs(14400)).await {
+            Ok(output) => output,
+            Err(error) => {
+                self.db
+                    .finish_stage(stage, "failed", 0, 0, Some(&error.to_string()))?;
+                return Err(error);
+            }
+        };
         let merged = out.stdout.clone() + "\n" + &out.stderr;
-        let bvid = Regex::new(r"\bBV[0-9A-Za-z]+\b")?
-            .find(&merged)
-            .context("biliup 未返回 BV 号")?
-            .as_str()
-            .to_string();
+        let bvid = match Regex::new(r"\bBV[0-9A-Za-z]+\b")?.find(&merged) {
+            Some(value) => value.as_str().to_string(),
+            None => {
+                let error = anyhow::anyhow!("biliup 未返回 BV 号");
+                self.db.finish_stage(
+                    stage,
+                    "failed",
+                    out.duration_ms,
+                    out.peak_rss_kib,
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
+        };
         self.db.finish_stage(
             stage,
             "completed",

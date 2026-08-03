@@ -275,7 +275,8 @@ impl Database {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn next_queued_job(&self) -> Result<Option<Job>> {
-        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE status IN ('queued','retry_wait') ORDER BY discovered_at LIMIT 1",[],job_from_row).optional().map_err(Into::into)
+        let retry_before = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE status='queued' OR (status='retry_wait' AND updated_at<=?) ORDER BY discovered_at LIMIT 1",[retry_before],job_from_row).optional().map_err(Into::into)
     }
 
     pub fn recover_incomplete_jobs(&self) -> Result<usize> {
@@ -794,5 +795,32 @@ mod tests {
 
         let reopened = Database::open(&path).unwrap();
         assert_eq!(reopened.publication_metadata(&id).unwrap(), Some(metadata));
+    }
+
+    #[test]
+    fn retry_wait_jobs_observe_backoff_before_reclaim() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "backoff-video",
+                url: "https://youtu.be/backoff-video",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        db.update_job_status(&id, JobStatus::RetryWait, Some("rate limited"))
+            .unwrap();
+        assert!(db.next_queued_job().unwrap().is_none());
+
+        let old = (Utc::now() - chrono::Duration::minutes(11)).to_rfc3339();
+        db.conn()
+            .execute("UPDATE jobs SET updated_at=? WHERE id=?", params![old, id])
+            .unwrap();
+        assert_eq!(db.next_queued_job().unwrap().unwrap().id, id);
     }
 }
