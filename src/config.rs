@@ -74,6 +74,7 @@ pub struct AiConfig {
     pub segment_overlap_cues: usize,
     #[serde(alias = "batch_size")]
     pub translation_batch_cues: usize,
+    pub translation_concurrency: usize,
     pub daily_token_limit: Option<i64>,
 }
 
@@ -207,6 +208,7 @@ impl Default for AiConfig {
             safe_context_tokens: 200_000,
             segment_overlap_cues: 12,
             translation_batch_cues: 50,
+            translation_concurrency: 2,
             daily_token_limit: None,
         }
     }
@@ -220,7 +222,7 @@ impl Default for RenderConfig {
             font_cn: "Source Han Sans CN Medium".into(),
             font_en: "Inter SemiBold".into(),
             crf: 20,
-            preset: "medium".into(),
+            preset: "veryfast".into(),
         }
     }
 }
@@ -286,6 +288,7 @@ mod tests {
         assert_eq!(adaptive.context_window_tokens, 256_000);
         assert_eq!(adaptive.safe_context_tokens, 200_000);
         assert_eq!(adaptive.translation_batch_cues, 50);
+        assert_eq!(adaptive.translation_concurrency, 2);
 
         let legacy: AiConfig = toml::from_str("batch_size = 25").unwrap();
         assert_eq!(legacy.translation_batch_cues, 25);

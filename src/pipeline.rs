@@ -6,6 +6,7 @@ use crate::process::{ProcessOutput, run_monitored};
 use crate::subtitle::{self, Cue};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use futures::{StreamExt, TryStreamExt, stream};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::fs;
@@ -624,42 +625,91 @@ impl Pipeline {
         } else {
             translation_batches(cues, budget, self.config.ai.translation_batch_cues)?
         };
+        let concurrency = self
+            .config
+            .ai
+            .translation_concurrency
+            .min(batches.len().max(1));
+        if self.config.ai.translation_concurrency == 0 {
+            bail!("translation_concurrency 必须大于 0")
+        }
+        let wall_started = Instant::now();
+        let source_cues: &[Cue] = cues;
+        let results = stream::iter(batches.iter().copied())
+            .map(|(start, end)| {
+                let chunk = &source_cues[start..end];
+                async move {
+                    let items = chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(i, cue)| json!({"i":i,"text":cue.source}))
+                        .collect::<Vec<_>>();
+                    let payload = json!({
+                        "task":"translate",
+                        "source_lang":self.config.translation.source_lang,
+                        "target_lang":self.config.translation.target_lang,
+                        "items":items
+                    });
+                    let input_json = payload.to_string();
+                    let r = self.call_pi(payload).await?;
+                    let local = parse_translations(&r.value)?;
+                    validate_translation_indexes(chunk.len(), &local)?;
+                    self.db.record_ai_call(
+                        job_id,
+                        stage,
+                        "translate",
+                        &self.config.ai.provider,
+                        &self.config.ai.model,
+                        &self.config.ai.thinking,
+                        &r.usage,
+                        r.output.duration_ms,
+                        &input_json,
+                        &r.value.to_string(),
+                    )?;
+                    Ok::<_, anyhow::Error>((
+                        start,
+                        local,
+                        r.output.duration_ms,
+                        r.output.peak_rss_kib,
+                    ))
+                }
+            })
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<_>>()
+            .await;
+        let mut results = match results {
+            Ok(results) => results,
+            Err(error) => {
+                self.db.finish_stage(
+                    stage,
+                    "failed",
+                    wall_started.elapsed().as_millis() as i64,
+                    0,
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
+        };
+        results.sort_by_key(|(start, _, _, _)| *start);
         let mut all = Vec::new();
-        let mut duration = 0;
+        let mut aggregate_call_ms = 0;
         let mut peak = 0;
-        for &(start, end) in &batches {
-            let chunk = &cues[start..end];
-            let payload = json!({"task":"translate","source_lang":self.config.translation.source_lang,"target_lang":self.config.translation.target_lang,"items":chunk.iter().enumerate().map(|(i,c)|json!({"i":i,"text":c.source})).collect::<Vec<_>>()});
-            let input_json = payload.to_string();
-            let r = self.call_pi(payload).await?;
-            let local = parse_translations(&r.value)?;
-            validate_translation_indexes(chunk.len(), &local)?;
+        for (start, local, duration_ms, peak_rss_kib) in results {
             for (i, t) in local {
                 all.push((i + start, t));
             }
-            self.db.record_ai_call(
-                job_id,
-                stage,
-                "translate",
-                &self.config.ai.provider,
-                &self.config.ai.model,
-                &self.config.ai.thinking,
-                &r.usage,
-                r.output.duration_ms,
-                &input_json,
-                &r.value.to_string(),
-            )?;
-            duration += r.output.duration_ms;
-            peak = peak.max(r.output.peak_rss_kib);
+            aggregate_call_ms += duration_ms;
+            peak = peak.max(peak_rss_kib);
         }
         subtitle::apply_translations(cues, &all)?;
+        let wall_duration_ms = wall_started.elapsed().as_millis() as i64;
         self.db.finish_stage(
             stage,
             "completed",
-            duration,
+            wall_duration_ms,
             peak,
             Some(&format!(
-                "{} cues; mode={}; estimated_tokens={estimated}; calls={}",
+                "{} cues; mode={}; estimated_tokens={estimated}; calls={}; concurrency={concurrency}; aggregate_call_ms={aggregate_call_ms}",
                 cues.len(),
                 batch_mode_name(self.config.ai.batch_mode),
                 batches.len()
