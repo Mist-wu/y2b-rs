@@ -258,6 +258,7 @@ def call_pi(
     terms: list[Term],
     timeout: int,
     extension: str,
+    policy: str,
 ) -> tuple[list[str], dict[str, Any] | None, float]:
     payload = json.dumps(
         {
@@ -271,7 +272,7 @@ def call_pi(
     )
     args = [
         "env",
-        "Y2B_PI_POLICY_PATH=/opt/y2b/pi/policy.json",
+        f"Y2B_PI_POLICY_PATH={policy}",
         "/usr/local/bin/pi",
         "--mode",
         "json",
@@ -346,25 +347,30 @@ def test_batch(
     terms: list[Term],
     timeout: int,
     extension: str,
+    policy: str,
     attempts: int = 2,
 ) -> tuple[list[str], dict[str, Any] | None, float]:
     error: Exception | None = None
     for attempt in range(attempts):
         try:
-            return call_pi(server, model, terms, timeout, extension)
+            return call_pi(server, model, terms, timeout, extension, policy)
         except Exception as exc:  # noqa: BLE001 - retry protocol/provider failures
             error = exc
             if attempt + 1 < attempts:
                 time.sleep(2)
     assert error is not None
     if len(terms) <= 1:
-        raise error
+        print(
+            f"{model} term failed after retries: {terms[0].source!r}: {error}",
+            flush=True,
+        )
+        return [""], None, float(timeout)
     midpoint = len(terms) // 2
     left, left_usage, left_elapsed = test_batch(
-        server, model, terms[:midpoint], timeout, extension, attempts=1
+        server, model, terms[:midpoint], timeout, extension, policy, attempts=1
     )
     right, right_usage, right_elapsed = test_batch(
-        server, model, terms[midpoint:], timeout, extension, attempts=1
+        server, model, terms[midpoint:], timeout, extension, policy, attempts=1
     )
     usage: dict[str, float] = collections.defaultdict(float)
     merge_usage(usage, left_usage)
@@ -401,9 +407,12 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=300)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--extension", default="/opt/y2b/pi/y2b-extension.ts")
+    parser.add_argument("--policy", default="/opt/y2b/pi/audit-policy.json")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--game-version", default="68.250")
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument(
         "--terms-file",
         type=pathlib.Path,
@@ -415,6 +424,8 @@ def main() -> int:
         default=pathlib.Path("/tmp/y2b-brawl-glossary-audit.json"),
     )
     args = parser.parse_args()
+    if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
+        parser.error("--shard-index must be within [0, --shard-count)")
 
     if args.terms_file:
         extracted = json.loads(args.terms_file.read_text(encoding="utf-8"))
@@ -435,6 +446,18 @@ def main() -> int:
         print(
             f"extracted {len(terms)} unambiguous terms "
             f"({source_metadata['ambiguous_terms']} ambiguous excluded)",
+            flush=True,
+        )
+    if args.shard_count > 1:
+        terms = terms[args.shard_index :: args.shard_count]
+        source_metadata = {
+            **source_metadata,
+            "audit_shard_index": args.shard_index,
+            "audit_shard_count": args.shard_count,
+        }
+        print(
+            f"using audit shard {args.shard_index + 1}/{args.shard_count}: "
+            f"{len(terms)} terms",
             flush=True,
         )
     if args.resume and args.output.exists():
@@ -472,7 +495,12 @@ def main() -> int:
             batch_number = start // args.batch_size + 1
             batch = terms[start : start + args.batch_size]
             translations, usage, elapsed = test_batch(
-                args.server, model, batch, args.timeout, args.extension
+                args.server,
+                model,
+                batch,
+                args.timeout,
+                args.extension,
+                args.policy,
             )
             outputs.extend(translations)
             merge_usage(usage_total, usage)

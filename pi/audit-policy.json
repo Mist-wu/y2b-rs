@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "target_audience": "Bilibili viewers watching Brawl Stars/game commentary",
+  "style": [
+    "Natural contemporary Simplified Chinese",
+    "Concise enough for two-line hard subtitles",
+    "Avoid documentary narration tone",
+    "Preserve jokes, emphasis, uncertainty and speaker intent"
+  ],
+  "glossary": {}
+}

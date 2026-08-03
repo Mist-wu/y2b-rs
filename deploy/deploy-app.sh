@@ -8,6 +8,7 @@ binary=${1:-"$root_dir/target/x86_64-unknown-linux-musl/release/y2b"}
 install -m 0755 "$binary" /usr/local/bin/y2b
 install -m 0644 "$root_dir/pi/y2b-extension.ts" /opt/y2b/pi/y2b-extension.ts
 install -m 0644 "$root_dir/pi/policy.json" /opt/y2b/pi/policy.json
+install -m 0644 "$root_dir/pi/audit-policy.json" /opt/y2b/pi/audit-policy.json
 install -m 0644 "$root_dir/pi/brawl-stars-glossary.json" /opt/y2b/pi/brawl-stars-glossary.json
 install -m 0644 "$root_dir/Cargo.lock" /opt/y2b/Cargo.lock
 install -d /opt/y2b/deploy

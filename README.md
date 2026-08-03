@@ -61,7 +61,7 @@ python3 scripts/audit_brawl_glossary.py \
   --output /tmp/y2b-brawl-glossary-audit.json
 ```
 
-脚本固定使用 `thinking=high`，支持 `--terms-file` 重用提取结果和 `--resume` 断点续跑。当前生产词库及数据版本、筛选数量、模型审计统计保存在 `pi/brawl-stars-glossary.json`。
+脚本固定使用 `thinking=high`，默认使用不含任何答案的 `pi/audit-policy.json`，避免生产词库污染模型能力测试；支持 `--terms-file` 重用提取结果、`--resume` 断点续跑和 `--shard-index/--shard-count` 分片。单词调用超时或失败会按错误计入并继续。当前生产词库及数据版本、筛选数量、模型审计统计保存在 `pi/brawl-stars-glossary.json`。
 
 ## 新服务器部署
 
@@ -103,7 +103,7 @@ systemctl show y2b-watch -p MemoryCurrent -p MemoryPeak -p MemorySwapCurrent
 ## 恢复
 
 1. 在空服务器运行 `bootstrap-server.sh`。
-2. 恢复 `/etc/y2b/config.toml`、三份认证文件、`/opt/y2b/fonts`、Pi extension/policy 和 `brawl-stars-glossary.json`。
+2. 恢复 `/etc/y2b/config.toml`、三份认证文件、`/opt/y2b/fonts`、Pi extension/policy、`audit-policy.json` 和 `brawl-stars-glossary.json`。
 3. 从 `/var/lib/y2b/backups/daily` 或 `weekly` 选择数据库，执行 `deploy/restore.sh BACKUP.db`。
 4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时会自动升级到 v5，旧频道和任务的模式均为 `translated`；v5 会持久化已验证的投稿元数据。
 5. SQLite 保存完整任务队列；`queued`/`retry_wait`/`processing` 会在重启后恢复，任务模式和追加目标 BV 不丢失，`dead_letter` 从 TUI 或 CLI 恢复后会重新下载。

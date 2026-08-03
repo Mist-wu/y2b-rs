@@ -116,11 +116,13 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
         detail: format!("v{schema}"),
     });
     let glossary_path = config.ai.policy.with_file_name("brawl-stars-glossary.json");
+    let audit_policy_path = config.ai.policy.with_file_name("audit-policy.json");
     for (name, p) in [
         ("YouTube cookies", &config.youtube.cookies),
         ("Bilibili cookies", &config.bilibili.cookies),
         ("Pi extension", &config.ai.extension),
         ("Pi policy", &config.ai.policy),
+        ("Pi audit policy", &audit_policy_path),
         ("Brawl Stars glossary", &glossary_path),
         ("fonts", &config.render.fonts_dir),
     ] {
@@ -229,9 +231,11 @@ pub async fn write_baseline(config: &Config, dest: &Path) -> Result<Baseline> {
         });
     }
     let glossary_path = config.ai.policy.with_file_name("brawl-stars-glossary.json");
+    let audit_policy_path = config.ai.policy.with_file_name("audit-policy.json");
     for (name, path) in [
         ("pi-extension", config.ai.extension.as_path()),
         ("pi-policy", config.ai.policy.as_path()),
+        ("pi-audit-policy", audit_policy_path.as_path()),
         ("brawl-stars-glossary", glossary_path.as_path()),
     ] {
         if path.exists() {
