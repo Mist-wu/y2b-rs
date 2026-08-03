@@ -10,6 +10,18 @@ type Policy = {
   [key: string]: unknown;
 };
 
+type GlossaryEntry = string | { translation?: string };
+type PatternRule = {
+  pattern?: string;
+  flags?: string;
+  translation?: string;
+};
+type OfficialGlossary = {
+  active: Record<string, GlossaryEntry>;
+  legacy: Record<string, GlossaryEntry>;
+  patterns: PatternRule[];
+};
+
 function normalizeTerm(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
 }
@@ -27,20 +39,62 @@ function promptContainsTerm(prompt: string, term: string): boolean {
   return new RegExp(`${left}${pattern}${right}`, "iu").test(prompt);
 }
 
-function loadOfficialGlossary(policyPath: string): Record<string, string> {
+function loadOfficialGlossary(policyPath: string): OfficialGlossary {
+  if (path.basename(policyPath) === "audit-policy.json") {
+    return { active: {}, legacy: {}, patterns: [] };
+  }
   const glossaryPath = path.join(path.dirname(policyPath), "brawl-stars-glossary.json");
-  if (!fs.existsSync(glossaryPath)) return {};
+  if (!fs.existsSync(glossaryPath)) return { active: {}, legacy: {}, patterns: [] };
   const document = JSON.parse(fs.readFileSync(glossaryPath, "utf8"));
-  return document.glossary ?? {};
+  if (document.version === 1) {
+    return { active: document.glossary ?? {}, legacy: {}, patterns: [] };
+  }
+  return {
+    active: document.active ?? {},
+    legacy: document.legacy ?? {},
+    patterns: document.patterns ?? [],
+  };
+}
+
+function layerTranslations(layer: Record<string, GlossaryEntry>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(layer).flatMap(([term, entry]) => {
+      const translation = typeof entry === "string" ? entry : entry.translation;
+      return typeof translation === "string" ? [[term, translation]] : [];
+    }),
+  );
+}
+
+function patternTranslations(prompt: string, rules: PatternRule[]): Record<string, string> {
+  const translations: Record<string, string> = {};
+  for (const rule of rules) {
+    if (!rule.pattern || !rule.translation) continue;
+    const flags = rule.flags?.includes("g") ? rule.flags : `${rule.flags ?? "i"}g`;
+    for (const match of prompt.matchAll(new RegExp(rule.pattern, flags))) {
+      let translation = rule.translation;
+      for (let index = 1; index < match.length; index += 1) {
+        translation = translation.replaceAll(`{${index}}`, match[index] ?? "");
+      }
+      translations[match[0]] = translation;
+    }
+  }
+  return translations;
 }
 
 function relevantGlossary(
   prompt: string,
-  official: Record<string, string>,
+  official: OfficialGlossary,
   curated: Record<string, string>,
 ): Record<string, string> {
   const merged = new Map<string, [string, string]>();
-  for (const [term, translation] of Object.entries(official)) {
+  for (const layer of [official.legacy, official.active]) {
+    for (const [term, translation] of Object.entries(layerTranslations(layer))) {
+      merged.set(normalizeTerm(term), [term, translation]);
+    }
+  }
+  for (const [term, translation] of Object.entries(
+    patternTranslations(prompt, official.patterns),
+  )) {
     merged.set(normalizeTerm(term), [term, translation]);
   }
   for (const [term, translation] of Object.entries(curated)) {
