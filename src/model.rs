@@ -141,6 +141,15 @@ pub struct AiUsage {
     pub cost: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicationMetadata {
+    pub title: String,
+    pub dynamic: String,
+    pub tags: Vec<String>,
+    pub tid: i64,
+    pub raw_json: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoMetadata {
     pub id: String,

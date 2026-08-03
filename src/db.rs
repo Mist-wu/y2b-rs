@@ -1,4 +1,4 @@
-use crate::model::{AiUsage, Channel, Job, JobStatus, StageRun, TransferMode};
+use crate::model::{AiUsage, Channel, Job, JobStatus, PublicationMetadata, StageRun, TransferMode};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -132,6 +132,18 @@ impl Database {
             )?;
         }
         c.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,CURRENT_TIMESTAMP)",[])?;
+        c.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS publication_metadata(
+              job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+              title TEXT NOT NULL, dynamic TEXT NOT NULL, tags_json TEXT NOT NULL,
+              tid INTEGER NOT NULL, raw_json TEXT NOT NULL, created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO schema_migrations(version,applied_at)
+              VALUES(5,CURRENT_TIMESTAMP);
+            "#,
+        )?;
         Ok(())
     }
 
@@ -325,6 +337,45 @@ impl Database {
         self.conn().execute(
             "UPDATE jobs SET bvid=?,updated_at=? WHERE id=?",
             params![bvid, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+    pub fn publication_metadata(&self, job_id: &str) -> Result<Option<PublicationMetadata>> {
+        self.conn()
+            .query_row(
+                "SELECT title,dynamic,tags_json,tid,raw_json FROM publication_metadata WHERE job_id=?",
+                [job_id],
+                |r| {
+                    let tags_json: String = r.get(2)?;
+                    let tags = serde_json::from_str(&tags_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(PublicationMetadata {
+                        title: r.get(0)?,
+                        dynamic: r.get(1)?,
+                        tags,
+                        tid: r.get(3)?,
+                        raw_json: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+    pub fn save_publication_metadata(
+        &self,
+        job_id: &str,
+        metadata: &PublicationMetadata,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let tags_json = serde_json::to_string(&metadata.tags)?;
+        self.conn().execute(
+            "INSERT INTO publication_metadata(job_id,title,dynamic,tags_json,tid,raw_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET title=excluded.title,dynamic=excluded.dynamic,tags_json=excluded.tags_json,tid=excluded.tid,raw_json=excluded.raw_json,updated_at=excluded.updated_at",
+            params![job_id, metadata.title, metadata.dynamic, tags_json, metadata.tid, metadata.raw_json, now, now],
         )?;
         Ok(())
     }
@@ -578,7 +629,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 5);
         assert_eq!(
             db.list_channels().unwrap()[0].transfer_mode,
             TransferMode::Translated
@@ -594,7 +645,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 5);
         assert!(
             db.create_job(NewJob {
                 channel_id: None,
@@ -710,5 +761,38 @@ mod tests {
             db.get_job(&second).unwrap().unwrap().transfer_mode,
             TransferMode::Translated
         );
+    }
+
+    #[test]
+    fn publication_metadata_survives_reopen_and_retry() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("x.db");
+        let db = Database::open(&path).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "metadata-video",
+                url: "https://youtu.be/metadata-video",
+                title: Some("Original title"),
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        let metadata = PublicationMetadata {
+            title: "中文标题".into(),
+            dynamic: "本期展示精彩对局。".into(),
+            tags: vec!["荒野乱斗".into(), "排位赛".into()],
+            tid: 172,
+            raw_json: r#"{"title":"中文标题"}"#.into(),
+        };
+        db.save_publication_metadata(&id, &metadata).unwrap();
+        db.update_job_status(&id, JobStatus::RetryWait, Some("test"))
+            .unwrap();
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.publication_metadata(&id).unwrap(), Some(metadata));
     }
 }
