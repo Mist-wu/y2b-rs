@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use feed_rs::parser;
 use serde_json::Value;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -15,6 +16,8 @@ pub struct Monitor {
     config: Config,
     db: Database,
     client: reqwest::Client,
+    /// 已确认是直播/预约内容的视频，本进程内不再重复拉取元数据。
+    skipped_live: Mutex<std::collections::HashSet<String>>,
 }
 
 /// 构造带公共参数（js 运行时、cookies）的 yt-dlp 命令，供各子命令复用。
@@ -43,10 +46,24 @@ pub struct EnqueueOutcome {
 
 const LIVE_CONTENT_PENDING_PREFIX: &str = "直播或预约内容暂不处理";
 
+/// yt-dlp 在元数据阶段就会拒绝未开始的直播/预约事件（不返回 JSON，直接报错）。
+const LIVE_EVENT_NOT_STARTED_MARKERS: &[&str] = &[
+    "This live event will begin",
+    "This live stream will begin",
+    "has not yet started",
+    "This live event has ended",
+];
+
 pub fn is_live_content_pending(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().starts_with(LIVE_CONTENT_PENDING_PREFIX))
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        if message.starts_with(LIVE_CONTENT_PENDING_PREFIX) {
+            return true;
+        }
+        LIVE_EVENT_NOT_STARTED_MARKERS
+            .iter()
+            .any(|marker| message.contains(marker))
+    })
 }
 
 fn validate_single_video(v: &Value) -> Result<()> {
@@ -56,7 +73,10 @@ fn validate_single_video(v: &Value) -> Result<()> {
         bail!("请输入单个 YouTube 视频 URL，不支持播放列表")
     }
     let live = v.get("live_status").and_then(Value::as_str);
-    if matches!(live, Some("is_live" | "is_upcoming" | "post_live")) {
+    if matches!(
+        live,
+        Some("is_live" | "is_upcoming" | "post_live" | "was_live")
+    ) {
         bail!("{LIVE_CONTENT_PENDING_PREFIX}: {live:?}")
     }
     Ok(())
@@ -111,6 +131,7 @@ impl Monitor {
             client: reqwest::Client::builder()
                 .user_agent("y2b-rs/0.1")
                 .build()?,
+            skipped_live: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -320,6 +341,26 @@ impl Monitor {
                 .map(|l| l.href.clone())
                 .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={video_id}"));
             let title = e.title.as_ref().map(|x| x.content.as_str());
+            if enqueue {
+                if self.skipped_live.lock().unwrap().contains(&video_id) {
+                    continue;
+                }
+                if self.db.get_job_by_video_id(&video_id)?.is_some() {
+                    continue;
+                }
+                // 直播预告/直播回放按策略不转载：先拉取元数据确认非直播内容。
+                match self.fetch_metadata(&link).await {
+                    Ok(_) => {}
+                    Err(error) if is_live_content_pending(&error) => {
+                        tracing::warn!(video_id, error = %error, "跳过直播/预约内容");
+                        self.skipped_live.lock().unwrap().insert(video_id.clone());
+                        continue;
+                    }
+                    Err(_) => {
+                        // 其他错误（网络等）不阻塞入队，交给流水线重试。
+                    }
+                }
+            }
             if enqueue
                 && self
                     .db
@@ -412,12 +453,15 @@ mod tests {
             .to_string()
             .contains("播放列表")
         );
-        assert!(
-            validate_single_video(&serde_json::json!({ "live_status": "is_live" }))
-                .unwrap_err()
-                .to_string()
-                .contains("直播")
-        );
+        for live in ["is_live", "is_upcoming", "post_live", "was_live"] {
+            assert!(
+                validate_single_video(&serde_json::json!({ "live_status": live }))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("直播"),
+                "live_status={live} 应被拒绝"
+            );
+        }
         validate_single_video(&serde_json::json!({
             "_type": "video",
             "live_status": "not_live"
@@ -435,6 +479,22 @@ mod tests {
         assert!(is_live_content_pending(&error));
         assert!(!is_live_content_pending(&anyhow::anyhow!(
             "network timeout"
+        )));
+    }
+
+    #[test]
+    fn ytdlp_live_event_begin_error_is_classified_as_live_content() {
+        for message in [
+            "ERROR: [youtube] ZIGzQ-zJFWc: This live event will begin in 3 days.",
+            "This live stream will begin in 12 days.",
+        ] {
+            assert!(
+                is_live_content_pending(&anyhow::anyhow!(message)),
+                "消息应被识别为直播内容: {message}"
+            );
+        }
+        assert!(!is_live_content_pending(&anyhow::anyhow!(
+            "ERROR: [youtube] abc: Video unavailable"
         )));
     }
 
