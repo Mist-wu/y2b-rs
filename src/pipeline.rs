@@ -6,7 +6,7 @@ use crate::process::{ProcessOutput, run_monitored};
 use crate::subtitle::{self, Cue};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, stream};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::fs;
@@ -403,8 +403,8 @@ impl Pipeline {
             }
         };
 
-        match load_translated_cache(&translated, &cues) {
-            Ok(Some(cached)) => {
+        match load_translation_checkpoint(&translated, &cues) {
+            Ok(Some(cached)) if translation_checkpoint_complete(&cached) => {
                 self.db.event(
                     Some(&job.id),
                     "info",
@@ -412,14 +412,28 @@ impl Pipeline {
                 )?;
                 cues = cached;
             }
+            Ok(Some(cached)) => {
+                let completed = cached
+                    .iter()
+                    .filter(|cue| cue.translation.is_some())
+                    .count();
+                self.db.event(
+                    Some(&job.id),
+                    "info",
+                    &format!("续传翻译检查点: {completed}/{} cues", cached.len()),
+                )?;
+                cues = cached;
+                self.translate(&job.id, &mut cues, &translated).await?;
+                subtitle::save_json(&cues, &translated)?;
+            }
             Ok(None) => {
-                self.translate(&job.id, &mut cues).await?;
+                self.translate(&job.id, &mut cues, &translated).await?;
                 subtitle::save_json(&cues, &translated)?;
             }
             Err(error) => {
                 self.db
                     .event(Some(&job.id), "warn", &format!("忽略无效翻译缓存: {error}"))?;
-                self.translate(&job.id, &mut cues).await?;
+                self.translate(&job.id, &mut cues, &translated).await?;
                 subtitle::save_json(&cues, &translated)?;
             }
         }
@@ -719,7 +733,7 @@ impl Pipeline {
         Ok((local, r.output.duration_ms, r.output.peak_rss_kib))
     }
 
-    async fn translate(&self, job_id: &str, cues: &mut [Cue]) -> Result<()> {
+    async fn translate(&self, job_id: &str, cues: &mut [Cue], checkpoint: &Path) -> Result<()> {
         let stage = self.db.start_stage(
             job_id,
             "translation",
@@ -739,49 +753,57 @@ impl Pipeline {
         } else {
             translation_batches(cues, budget, self.config.ai.translation_batch_cues)?
         };
+        if self.config.ai.translation_concurrency == 0 {
+            bail!("translation_concurrency 必须大于 0")
+        }
+        let batch_inputs = batches
+            .iter()
+            .filter(|(start, end)| !translation_batch_checkpointed(cues, *start, *end))
+            .map(|(start, end)| (*start, cues[*start..*end].to_vec()))
+            .collect::<Vec<_>>();
+        let reused_batches = batches.len() - batch_inputs.len();
         let concurrency = self
             .config
             .ai
             .translation_concurrency
-            .min(batches.len().max(1));
-        if self.config.ai.translation_concurrency == 0 {
-            bail!("translation_concurrency 必须大于 0")
-        }
+            .min(batch_inputs.len().max(1));
         let wall_started = Instant::now();
-        let source_cues: &[Cue] = cues;
-        let results = stream::iter(batches.iter().copied())
-            .map(|(start, end)| {
-                let chunk = &source_cues[start..end];
-                self.translate_batch_with_retry(job_id, stage, start, chunk)
+        let mut results = stream::iter(batch_inputs)
+            .map(|(start, chunk)| async move {
+                self.translate_batch_with_retry(job_id, stage, start, &chunk)
+                    .await
             })
-            .buffer_unordered(concurrency)
-            .try_collect::<Vec<_>>()
-            .await;
-        let mut results = match results {
-            Ok(results) => results,
-            Err(error) => {
-                self.db.finish_stage(
-                    stage,
-                    "failed",
-                    wall_started.elapsed().as_millis() as i64,
-                    0,
-                    Some(&error.to_string()),
-                )?;
-                return Err(error);
-            }
-        };
-        results.sort_by_key(|(start, _, _, _)| *start);
-        let mut all = Vec::new();
+            .buffer_unordered(concurrency);
         let mut aggregate_call_ms = 0;
         let mut peak = 0;
-        for (start, local, duration_ms, peak_rss_kib) in results {
-            for (i, t) in local {
-                all.push((i + start, t));
-            }
+        let mut checkpointed_batches = reused_batches;
+        while let Some(result) = results.next().await {
+            let (start, local, duration_ms, peak_rss_kib) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    self.db.finish_stage(
+                        stage,
+                        "failed",
+                        wall_started.elapsed().as_millis() as i64,
+                        peak,
+                        Some(&format!(
+                            "checkpointed={checkpointed_batches}/{}; {error}",
+                            batches.len()
+                        )),
+                    )?;
+                    return Err(error);
+                }
+            };
+            let global = local
+                .into_iter()
+                .map(|(index, translation)| (index + start, translation))
+                .collect::<Vec<_>>();
+            subtitle::apply_translations(cues, &global)?;
+            subtitle::save_json(cues, checkpoint)?;
+            checkpointed_batches += 1;
             aggregate_call_ms += duration_ms;
             peak = peak.max(peak_rss_kib);
         }
-        subtitle::apply_translations(cues, &all)?;
         let wall_duration_ms = wall_started.elapsed().as_millis() as i64;
         self.db.finish_stage(
             stage,
@@ -789,10 +811,10 @@ impl Pipeline {
             wall_duration_ms,
             peak,
             Some(&format!(
-                "{} cues; mode={}; estimated_tokens={estimated}; calls={}; concurrency={concurrency}; aggregate_call_ms={aggregate_call_ms}",
+                "{} cues; mode={}; estimated_tokens={estimated}; calls={}; reused_batches={reused_batches}; concurrency={concurrency}; aggregate_call_ms={aggregate_call_ms}",
                 cues.len(),
                 batch_mode_name(self.config.ai.batch_mode),
-                batches.len()
+                batches.len() - reused_batches
             )),
         )?;
         Ok(())
@@ -1882,7 +1904,7 @@ fn load_segmented_cache(path: &Path) -> Result<Option<Vec<Cue>>> {
     Ok(Some(cues))
 }
 
-fn load_translated_cache(path: &Path, source: &[Cue]) -> Result<Option<Vec<Cue>>> {
+fn load_translation_checkpoint(path: &Path, source: &[Cue]) -> Result<Option<Vec<Cue>>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -1898,17 +1920,24 @@ fn load_translated_cache(path: &Path, source: &[Cue]) -> Result<Option<Vec<Cue>>
         {
             bail!("翻译缓存第 {index} 条与分句缓存不匹配")
         }
-        let Some(translation) = cached.translation.as_deref() else {
-            bail!("翻译缓存第 {index} 条缺少译文")
-        };
-        if translation.trim().is_empty() && cached.source.chars().any(char::is_alphanumeric) {
-            bail!("翻译缓存第 {index} 条译文为空")
-        }
-        if translation.chars().any(|ch| ch.is_control() && ch != '\n') {
-            bail!("翻译缓存第 {index} 条含非法控制字符")
+        if let Some(translation) = cached.translation.as_deref() {
+            if translation.trim().is_empty() && cached.source.chars().any(char::is_alphanumeric) {
+                bail!("翻译缓存第 {index} 条译文为空")
+            }
+            if translation.chars().any(|ch| ch.is_control() && ch != '\n') {
+                bail!("翻译缓存第 {index} 条含非法控制字符")
+            }
         }
     }
     Ok(Some(cues))
+}
+
+fn translation_checkpoint_complete(cues: &[Cue]) -> bool {
+    cues.iter().all(|cue| cue.translation.is_some())
+}
+
+fn translation_batch_checkpointed(cues: &[Cue], start: usize, end: usize) -> bool {
+    cues[start..end].iter().all(|cue| cue.translation.is_some())
 }
 
 fn validate_cached_cues(cues: &[Cue]) -> Result<()> {
@@ -2204,6 +2233,32 @@ mod tests {
         let mut invalid_source = valid;
         invalid_source[0].source.clear();
         assert!(validate_cached_cues(&invalid_source).is_err());
+    }
+
+    #[test]
+    fn partial_translation_checkpoint_resumes_only_missing_batches() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("translated.json");
+        let source = vec![cue(0, "hello"), cue(1, "world"), cue(2, "again")];
+        let mut partial = source.clone();
+        partial[0].translation = Some("你好".into());
+        partial[1].translation = Some("世界".into());
+        subtitle::save_json(&partial, &path).unwrap();
+
+        let loaded = load_translation_checkpoint(&path, &source)
+            .unwrap()
+            .unwrap();
+        assert!(!translation_checkpoint_complete(&loaded));
+        assert!(translation_batch_checkpointed(&loaded, 0, 2));
+        assert!(!translation_batch_checkpointed(&loaded, 2, 3));
+
+        let mut completed = loaded;
+        completed[2].translation = Some("再来".into());
+        subtitle::save_json(&completed, &path).unwrap();
+        let loaded = load_translation_checkpoint(&path, &source)
+            .unwrap()
+            .unwrap();
+        assert!(translation_checkpoint_complete(&loaded));
     }
 
     #[test]

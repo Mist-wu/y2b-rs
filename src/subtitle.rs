@@ -118,7 +118,13 @@ pub fn save_json(cues: &[Cue], path: &Path) -> Result<()> {
     if let Some(p) = path.parent() {
         fs::create_dir_all(p)?;
     }
-    fs::write(path, serde_json::to_vec_pretty(cues)?)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("subtitles.json");
+    let temporary = path.with_file_name(format!(".{name}.tmp"));
+    fs::write(&temporary, serde_json::to_vec_pretty(cues)?)?;
+    fs::rename(&temporary, path)?;
     Ok(())
 }
 pub fn load_json(path: &Path) -> Result<Vec<Cue>> {
@@ -207,6 +213,24 @@ mod tests {
         }];
         apply_translations(&mut c, &[(0, "你好".into())]).unwrap();
         assert_eq!(c[0].translation.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn json_checkpoint_replaces_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("translated.json");
+        let mut cues = vec![Cue {
+            start: 0.,
+            end: 1.,
+            source: "hello".into(),
+            translation: None,
+        }];
+        save_json(&cues, &path).unwrap();
+        cues[0].translation = Some("你好".into());
+        save_json(&cues, &path).unwrap();
+
+        assert_eq!(load_json(&path).unwrap(), cues);
+        assert!(!directory.path().join(".translated.json.tmp").exists());
     }
 
     #[test]
