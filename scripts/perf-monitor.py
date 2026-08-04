@@ -35,6 +35,13 @@ def read_cpu_stat(path: Path) -> dict[str, int]:
         return {}
 
 
+def read_text(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
 def process_snapshots() -> list[dict[str, int | str]]:
     snapshots: list[dict[str, int | str]] = []
     for entry in Path("/proc").iterdir():
@@ -112,7 +119,7 @@ def snapshot(args: argparse.Namespace) -> dict[str, object]:
             "memory_current": read_int(cgroup / "memory.current"),
             "memory_peak": read_int(cgroup / "memory.peak"),
             "memory_swap_current": read_int(cgroup / "memory.swap.current"),
-            "memory_events": (cgroup / "memory.events").read_text().strip(),
+            "memory_events": read_text(cgroup / "memory.events"),
             "cpu": read_cpu_stat(cgroup / "cpu.stat"),
         },
         "disk": {"total": disk.total, "used": disk.used, "free": disk.free},
