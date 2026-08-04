@@ -356,6 +356,16 @@ impl Database {
         )?;
         Ok(())
     }
+    pub fn claim_prepared_upload(&self, id: &str, status: JobStatus) -> Result<bool> {
+        if !matches!(status, JobStatus::Uploading | JobStatus::Appending) {
+            anyhow::bail!("无效的上传领取状态: {status}")
+        }
+        let changed = self.conn().execute(
+            "UPDATE jobs SET status=?,error=NULL,updated_at=? WHERE id=? AND status IN ('ready_to_upload','upload_retry_wait')",
+            params![status.to_string(), Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(changed == 1)
+    }
     pub fn update_job_metadata(
         &self,
         id: &str,
@@ -1299,6 +1309,45 @@ mod tests {
         assert_eq!(job.attempt, 0);
         assert!(job.error.is_none());
         assert_eq!(db.prepared_upload(&id).unwrap(), Some(plan));
+    }
+
+    #[test]
+    fn paused_prepared_job_cannot_be_claimed_for_upload() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "pause-upload",
+                url: "https://youtu.be/pause-upload",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        db.queue_prepared_upload(
+            &id,
+            &PreparedUpload::Submission {
+                video_path: "/tmp/pause.mp4".into(),
+                cover_path: "/tmp/pause.jpg".into(),
+                mode: TransferMode::Direct,
+                completion_status: JobStatus::Completed,
+            },
+        )
+        .unwrap();
+        db.update_job_status(&id, JobStatus::Paused, None).unwrap();
+
+        assert!(!db.claim_prepared_upload(&id, JobStatus::Uploading).unwrap());
+        assert_eq!(db.get_job(&id).unwrap().unwrap().status, JobStatus::Paused);
+
+        db.retry_job(&id).unwrap();
+        assert!(db.claim_prepared_upload(&id, JobStatus::Uploading).unwrap());
+        assert_eq!(
+            db.get_job(&id).unwrap().unwrap().status,
+            JobStatus::Uploading
+        );
     }
 
     #[test]

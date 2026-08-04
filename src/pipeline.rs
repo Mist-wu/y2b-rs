@@ -1239,6 +1239,13 @@ impl Pipeline {
                     .db
                     .source_metadata(&job.id)?
                     .with_context(|| format!("待上传任务 {} 缺少来源元数据", job.id))?;
+                if !self.wait_for_bilibili_submission(&job.id).await?
+                    || !self
+                        .db
+                        .claim_prepared_upload(&job.id, JobStatus::Uploading)?
+                {
+                    return Ok(());
+                }
                 let bvid = self
                     .upload(&job.id, &video, &publication, &meta, mode, Some(&cover))
                     .await?;
@@ -1247,6 +1254,12 @@ impl Pipeline {
             PreparedUpload::Append { video_path, bvid } => {
                 let video = PathBuf::from(video_path);
                 ensure_prepared_file(&video, "追加视频")?;
+                if !self
+                    .db
+                    .claim_prepared_upload(&job.id, JobStatus::Appending)?
+                {
+                    return Ok(());
+                }
                 self.append(&job.id, &video, &bvid).await?;
                 (bvid, JobStatus::Completed, true)
             }
@@ -1280,9 +1293,6 @@ impl Pipeline {
         mode: TransferMode,
         cover: Option<&Path>,
     ) -> Result<String> {
-        self.wait_for_bilibili_submission(job_id).await?;
-        self.db
-            .update_job_status(job_id, JobStatus::Uploading, None)?;
         let stage = self.db.start_stage(job_id, "upload", None, None, None)?;
         let mut cmd = Command::new(&self.config.bilibili.biliup);
         cmd.arg("-u")
@@ -1327,18 +1337,27 @@ impl Pipeline {
         Ok(bvid)
     }
 
-    async fn wait_for_bilibili_submission(&self, job_id: &str) -> Result<()> {
+    async fn wait_for_bilibili_submission(&self, job_id: &str) -> Result<bool> {
+        self.wait_for_bilibili_submission_with_poll(job_id, Duration::from_secs(2))
+            .await
+    }
+
+    async fn wait_for_bilibili_submission_with_poll(
+        &self,
+        job_id: &str,
+        poll_interval: Duration,
+    ) -> Result<bool> {
         let Some(value) = self.db.get_setting(NEXT_BILIBILI_SUBMIT_AT)? else {
-            return Ok(());
+            return Ok(true);
         };
         let not_before = DateTime::parse_from_rfc3339(&value)
             .with_context(|| format!("投稿冷却时间无效: {value}"))?
             .with_timezone(&Utc);
         let Ok(wait) = (not_before - Utc::now()).to_std() else {
-            return Ok(());
+            return Ok(true);
         };
         if wait.is_zero() {
-            return Ok(());
+            return Ok(true);
         }
         self.db.event(
             Some(job_id),
@@ -1349,8 +1368,31 @@ impl Pipeline {
                 wait.as_secs().div_ceil(60)
             ),
         )?;
-        sleep(wait).await;
-        Ok(())
+        let poll_interval = poll_interval.max(Duration::from_millis(1));
+        loop {
+            let job = self
+                .db
+                .get_job(job_id)?
+                .with_context(|| format!("等待投稿窗口时任务不存在: {job_id}"))?;
+            if !matches!(
+                job.status,
+                JobStatus::ReadyToUpload | JobStatus::UploadRetryWait
+            ) {
+                self.db.event(
+                    Some(job_id),
+                    "info",
+                    &format!("已停止等待 Bilibili 投稿窗口，任务状态为 {}", job.status),
+                )?;
+                return Ok(false);
+            }
+            let Ok(remaining) = (not_before - Utc::now()).to_std() else {
+                return Ok(true);
+            };
+            if remaining.is_zero() {
+                return Ok(true);
+            }
+            sleep(remaining.min(poll_interval)).await;
+        }
     }
 
     fn defer_bilibili_submissions(&self, seconds: u64) -> Result<()> {
@@ -1373,8 +1415,6 @@ impl Pipeline {
                 self.config.bilibili.max_parts
             )
         }
-        self.db
-            .update_job_status(job_id, JobStatus::Appending, None)?;
         let stage = self.db.start_stage(job_id, "append", None, None, None)?;
         let mut cmd = Command::new(&self.config.bilibili.biliup);
         cmd.arg("-u")
@@ -2236,6 +2276,7 @@ fn parse_translations(v: &Value) -> Result<Vec<(usize, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::NewJob;
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
@@ -2614,5 +2655,92 @@ mod tests {
         .expect("branches did not run concurrently")
         .unwrap();
         assert_eq!(joined, ("video", "subtitle"));
+    }
+
+    #[tokio::test]
+    async fn pausing_job_interrupts_submission_window_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "pause-window",
+                url: "https://youtu.be/pause-window",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        db.queue_prepared_upload(
+            &id,
+            &PreparedUpload::Submission {
+                video_path: "/tmp/pause-window.mp4".into(),
+                cover_path: "/tmp/pause-window.jpg".into(),
+                mode: TransferMode::Direct,
+                completion_status: JobStatus::Completed,
+            },
+        )
+        .unwrap();
+        db.set_setting(
+            NEXT_BILIBILI_SUBMIT_AT,
+            &(Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
+        )
+        .unwrap();
+        let pipeline = Pipeline::new(Config::default(), db.clone());
+        let wait_id = id.clone();
+        let waiter = tokio::spawn(async move {
+            pipeline
+                .wait_for_bilibili_submission_with_poll(&wait_id, Duration::from_millis(5))
+                .await
+        });
+        tokio::task::yield_now().await;
+        db.update_job_status(&id, JobStatus::Paused, None).unwrap();
+
+        let should_upload = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("暂停后仍未退出投稿窗口等待")
+            .unwrap()
+            .unwrap();
+        assert!(!should_upload);
+        assert_eq!(db.get_job(&id).unwrap().unwrap().status, JobStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn submission_window_handles_missing_past_and_invalid_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+        let pipeline = Pipeline::new(Config::default(), db.clone());
+
+        assert!(
+            pipeline
+                .wait_for_bilibili_submission("unused")
+                .await
+                .unwrap()
+        );
+
+        db.set_setting(
+            NEXT_BILIBILI_SUBMIT_AT,
+            &(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
+        )
+        .unwrap();
+        assert!(
+            pipeline
+                .wait_for_bilibili_submission("unused")
+                .await
+                .unwrap()
+        );
+
+        db.set_setting(NEXT_BILIBILI_SUBMIT_AT, "not-a-timestamp")
+            .unwrap();
+        assert!(
+            pipeline
+                .wait_for_bilibili_submission("unused")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("投稿冷却时间无效")
+        );
     }
 }
