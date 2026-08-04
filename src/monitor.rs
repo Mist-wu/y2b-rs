@@ -1,5 +1,5 @@
 use crate::{
-    config::Config,
+    config::{Config, YoutubeConfig},
     db::{Database, NewJob},
     model::{Job, TransferMode, VideoMetadata},
     process::run_monitored,
@@ -15,6 +15,16 @@ pub struct Monitor {
     config: Config,
     db: Database,
     client: reqwest::Client,
+}
+
+/// 构造带公共参数（js 运行时、cookies）的 yt-dlp 命令，供各子命令复用。
+pub(crate) fn ytdlp_command(config: &YoutubeConfig) -> Command {
+    let mut cmd = Command::new(&config.yt_dlp);
+    cmd.args(["--js-runtimes", "node"]);
+    if config.cookies.exists() {
+        cmd.arg("--cookies").arg(&config.cookies);
+    }
+    cmd
 }
 
 #[derive(Debug, Clone)]
@@ -53,9 +63,9 @@ fn validate_single_video(v: &Value) -> Result<()> {
 }
 
 fn extract_thumbnail_url(v: &Value) -> Option<String> {
-    let best_sized = v
-        .get("thumbnails")
-        .and_then(Value::as_array)
+    let thumbnails = v.get("thumbnails").and_then(Value::as_array);
+    // 优先选带尺寸的项里面积最大者（yt-dlp 通常把最高清缩略图列在首位）。
+    let best_sized = thumbnails
         .and_then(|items| {
             items
                 .iter()
@@ -68,20 +78,20 @@ fn extract_thumbnail_url(v: &Value) -> Option<String> {
                 .max_by_key(|(area, _)| *area)
                 .map(|(_, url)| url.to_string())
         });
-    best_sized.or_else(|| {
-        v.get("thumbnail")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| {
-                v.get("thumbnails")
-                    .and_then(Value::as_array)
-                    .and_then(|items| {
-                        items.iter().rev().find_map(|item| {
-                            item.get("url").and_then(Value::as_str).map(str::to_string)
-                        })
-                    })
-            })
-    })
+    if let Some(url) = best_sized {
+        return Some(url);
+    }
+    // 退而求其次：YouTube 选中图，或缩略图列表末尾项。
+    v.get("thumbnail")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            thumbnails?
+                .last()
+                .and_then(|item| item.get("url"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
 }
 
 fn reconcile_after_baseline(
@@ -107,10 +117,8 @@ impl Monitor {
     }
 
     pub async fn resolve_channel(&self, url: &str) -> Result<ResolvedChannel> {
-        let mut cmd = Command::new(&self.config.youtube.yt_dlp);
+        let mut cmd = ytdlp_command(&self.config.youtube);
         cmd.args([
-            "--js-runtimes",
-            "node",
             "--flat-playlist",
             "--playlist-items",
             "1",
@@ -118,9 +126,6 @@ impl Monitor {
             "--skip-download",
             url,
         ]);
-        if self.config.youtube.cookies.exists() {
-            cmd.arg("--cookies").arg(&self.config.youtube.cookies);
-        }
         let out = run_monitored(cmd, Duration::from_secs(90)).await?;
         let v: Value = serde_json::from_str(out.stdout.trim()).context("yt-dlp 频道 JSON 无效")?;
         let channel_id = v
@@ -218,10 +223,8 @@ impl Monitor {
     async fn reconcile_channel(&self, id: i64, url: &str) -> Result<usize> {
         let transfer_mode = self.db.channel_transfer_mode(id)?;
         let baseline = self.db.channel_baseline(id)?;
-        let mut cmd = Command::new(&self.config.youtube.yt_dlp);
+        let mut cmd = ytdlp_command(&self.config.youtube);
         cmd.args([
-            "--js-runtimes",
-            "node",
             "--flat-playlist",
             "--playlist-end",
             &self.config.monitor.reconcile_limit.to_string(),
@@ -229,9 +232,6 @@ impl Monitor {
             "--skip-download",
             url,
         ]);
-        if self.config.youtube.cookies.exists() {
-            cmd.arg("--cookies").arg(&self.config.youtube.cookies);
-        }
         let out = run_monitored(cmd, Duration::from_secs(180)).await?;
         let v: Value = serde_json::from_str(out.stdout.trim()).context("yt-dlp 校对 JSON 无效")?;
         let mut added = 0;
@@ -344,18 +344,8 @@ impl Monitor {
     }
 
     pub async fn fetch_metadata(&self, url: &str) -> Result<(VideoMetadata, u64, i64)> {
-        let mut cmd = Command::new(&self.config.youtube.yt_dlp);
-        cmd.args([
-            "--js-runtimes",
-            "node",
-            "--dump-single-json",
-            "--skip-download",
-            "--no-playlist",
-            url,
-        ]);
-        if self.config.youtube.cookies.exists() {
-            cmd.arg("--cookies").arg(&self.config.youtube.cookies);
-        }
+        let mut cmd = ytdlp_command(&self.config.youtube);
+        cmd.args(["--dump-single-json", "--skip-download", "--no-playlist", url]);
         let out = run_monitored(cmd, Duration::from_secs(120)).await?;
         let v: Value = serde_json::from_str(out.stdout.trim())?;
         validate_single_video(&v)?;
@@ -404,19 +394,9 @@ impl Monitor {
     }
 }
 
-pub fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|x| x.with_timezone(&Utc))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn date() {
-        assert!(parse_rfc3339("2026-08-02T12:00:00Z").is_some());
-    }
 
     #[test]
     fn manual_queue_rejects_playlists_and_live_content() {
