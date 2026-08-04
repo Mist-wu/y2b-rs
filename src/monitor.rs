@@ -31,6 +31,14 @@ pub struct EnqueueOutcome {
     pub created: bool,
 }
 
+const LIVE_CONTENT_PENDING_PREFIX: &str = "直播或预约内容暂不处理";
+
+pub fn is_live_content_pending(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with(LIVE_CONTENT_PENDING_PREFIX))
+}
+
 fn validate_single_video(v: &Value) -> Result<()> {
     if v.get("_type").and_then(Value::as_str) == Some("playlist")
         || v.get("entries").and_then(Value::as_array).is_some()
@@ -39,7 +47,7 @@ fn validate_single_video(v: &Value) -> Result<()> {
     }
     let live = v.get("live_status").and_then(Value::as_str);
     if matches!(live, Some("is_live" | "is_upcoming" | "post_live")) {
-        bail!("直播或预约内容暂不处理: {live:?}")
+        bail!("{LIVE_CONTENT_PENDING_PREFIX}: {live:?}")
     }
     Ok(())
 }
@@ -432,6 +440,19 @@ mod tests {
             "live_status": "not_live"
         }))
         .unwrap();
+    }
+
+    #[test]
+    fn live_content_pending_error_is_classified_through_context() {
+        let error = validate_single_video(&serde_json::json!({
+            "live_status": "is_live"
+        }))
+        .unwrap_err()
+        .context("metadata probe failed");
+        assert!(is_live_content_pending(&error));
+        assert!(!is_live_content_pending(&anyhow::anyhow!(
+            "network timeout"
+        )));
     }
 
     #[test]

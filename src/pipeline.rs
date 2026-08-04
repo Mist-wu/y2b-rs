@@ -1,7 +1,7 @@
 use crate::config::{BatchMode, Config};
 use crate::db::Database;
 use crate::model::{AiUsage, Job, JobStatus, PublicationMetadata, TransferMode, VideoMetadata};
-use crate::monitor::Monitor;
+use crate::monitor::{Monitor, is_live_content_pending};
 use crate::process::{ProcessOutput, run_monitored};
 use crate::subtitle::{self, Cue};
 use anyhow::{Context, Result, bail};
@@ -42,14 +42,21 @@ impl Pipeline {
     pub async fn run_job(&self, job: Job) -> Result<()> {
         let result = self.run_job_inner(&job).await;
         if let Err(e) = &result {
-            let attempt = self.db.increment_attempt(&job.id)?;
+            let live_pending = is_live_content_pending(e);
+            let attempt = if live_pending {
+                job.attempt
+            } else {
+                self.db.increment_attempt(&job.id)?
+            };
             let failed_status = self.db.get_job(&job.id)?.map(|job| job.status);
             let upload_failure = matches!(
                 failed_status,
                 Some(JobStatus::Uploading | JobStatus::Appending)
             );
             let rate_limited = e.to_string().contains("21566");
-            let status = if rate_limited
+            let status = if live_pending {
+                JobStatus::RetryWait
+            } else if rate_limited
                 || (upload_failure && attempt >= self.config.monitor.max_attempts as i64)
             {
                 JobStatus::Paused
@@ -61,7 +68,11 @@ impl Pipeline {
             };
             self.db
                 .update_job_status(&job.id, status, Some(&e.to_string()))?;
-            self.db.event(Some(&job.id), "error", &e.to_string())?;
+            self.db.event(
+                Some(&job.id),
+                if live_pending { "info" } else { "error" },
+                &e.to_string(),
+            )?;
         }
         result
     }
@@ -91,7 +102,24 @@ impl Pipeline {
             .update_job_status(&job.id, JobStatus::Inspecting, None)?;
         let stage = self.db.start_stage(&job.id, "metadata", None, None, None)?;
         let monitor = Monitor::new(self.config.clone(), self.db.clone())?;
-        let (meta, peak, duration) = monitor.fetch_metadata(&job.url).await?;
+        let metadata_started = Instant::now();
+        let (meta, peak, duration) = match monitor.fetch_metadata(&job.url).await {
+            Ok(result) => result,
+            Err(error) => {
+                self.db.finish_stage(
+                    stage,
+                    if is_live_content_pending(&error) {
+                        "deferred"
+                    } else {
+                        "failed"
+                    },
+                    metadata_started.elapsed().as_millis() as i64,
+                    0,
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
+        };
         self.db
             .finish_stage(stage, "completed", duration, peak, None)?;
         self.db.update_job_metadata(
