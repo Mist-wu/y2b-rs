@@ -10,7 +10,7 @@ Rust CLI/TUI 工具：监控 YouTube 频道更新，按频道选择原片直传�
 - `translated`：英文字幕 → Pi 分句 → Pi 翻译 → 双语 ASS → H.264/AAC 压制 → 投稿。
 - `translated` 无字幕时自动直传原片，状态设为 `uploaded_original_pending_subtitle`；之后重查字幕并以 `biliup append --vid` 追加双语分P。
 - 普通投稿按每个视频一次无状态 `publish_metadata` Pi 请求生成中文标题、动态文案和标签。字幕模式在预算内传入完整双语字幕，超限时保留首尾并均匀采样；结果持久化后，任务重试或服务重启不会重复调用 Pi。标题或动态不合格会重试，不会用英文原标题或固定动态投稿。
-- 投稿固定为手机游戏分区 `tid=172`、自制 `copyright=1` 并允许转载；不使用 Bilibili 转载来源字段。标签始终以“荒野乱斗”开头，简介按清理 hashtag 后的原标题、YouTube 来源、原作者、处理方式和工具地址确定性生成。
+- 投稿固定为手机游戏分区 `tid=172`、自制 `copyright=1` 并允许转载；不使用 Bilibili 转载来源字段。标签始终以“荒野乱斗”开头，简介按清理 hashtag 后的原标题、YouTube 来源、原作者和工具地址确定性生成。
 - 所有新投稿都下载 yt-dlp 选定的 YouTube 原封面，转为 JPEG 后通过 biliup `--cover` 上传；封面失败时任务重试而不会无封面投稿。
 - Pi 默认 `openai-codex/gpt-5.6-luna`，thinking `high`；每次调用使用 `--no-session --no-tools`，只加载 `pi/y2b-extension.ts`。
 - `pi/brawl-stars-glossary.json` 来自国际服客户端英文/简中本地化资源。审计脚本从游戏逻辑 TID 中提取无歧义术语并依次测试 Terra、Luna、Sol，只把至少一个模型译错的官译加入词库；extension 每次仅注入当前输入实际出现的词条，避免全量词库占用上下文。
