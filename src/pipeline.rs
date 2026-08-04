@@ -491,19 +491,36 @@ impl Pipeline {
         )?;
         let budget = self.ai_token_budget()?;
         let estimated = estimate_segment_tokens(cues);
+        let estimated_bytes = estimate_segment_argument_bytes(cues);
+        let wall_started = Instant::now();
         let mut ranges = Vec::new();
         let mut duration = 0;
         let mut peak = 0;
         let mut calls = 0;
-        if self.config.ai.batch_mode == BatchMode::WholeVideo || estimated <= budget {
-            if estimated > budget {
+        let full_payload_fits =
+            estimated <= budget && estimated_bytes <= PI_MAX_PROMPT_ARGUMENT_BYTES;
+        if self.config.ai.batch_mode == BatchMode::WholeVideo || full_payload_fits {
+            if !full_payload_fits {
                 bail!(
-                    "whole_video 分句预计需要 {estimated} tokens，超过安全阈值 {budget}；请改用 adaptive"
+                    "whole_video 分句超过安全输入阈值: estimated_tokens={estimated}/{budget}, bytes={estimated_bytes}/{PI_MAX_PROMPT_ARGUMENT_BYTES}；请改用 adaptive"
                 )
             }
-            let (local, elapsed, rss) = self
+            let batch = self
                 .segment_batch(job_id, stage, cues, 0, cues.len().saturating_sub(1))
-                .await?;
+                .await;
+            let (local, elapsed, rss) = match batch {
+                Ok(result) => result,
+                Err(error) => {
+                    self.db.finish_stage(
+                        stage,
+                        "failed",
+                        wall_started.elapsed().as_millis() as i64,
+                        0,
+                        Some(&error.to_string()),
+                    )?;
+                    return Err(error);
+                }
+            };
             ranges = local;
             duration += elapsed;
             peak = peak.max(rss);
@@ -513,7 +530,12 @@ impl Pipeline {
             let mut cursor = 0;
             while cursor < cues.len() {
                 let window_start = cursor.saturating_sub(overlap);
-                let window_end = max_segment_window_end(cues, window_start, budget)?;
+                let window_end = max_segment_window_end(
+                    cues,
+                    window_start,
+                    budget,
+                    PI_MAX_PROMPT_ARGUMENT_BYTES,
+                )?;
                 if window_end < cursor {
                     bail!("安全 token 阈值过小，无法容纳分句核心字幕")
                 }
@@ -523,7 +545,7 @@ impl Pipeline {
                 } else {
                     cues.len() - 1
                 };
-                let (local, elapsed, rss) = self
+                let batch = self
                     .segment_batch(
                         job_id,
                         stage,
@@ -531,7 +553,20 @@ impl Pipeline {
                         cursor - window_start,
                         preferred_end - window_start,
                     )
-                    .await?;
+                    .await;
+                let (local, elapsed, rss) = match batch {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.db.finish_stage(
+                            stage,
+                            "failed",
+                            wall_started.elapsed().as_millis() as i64,
+                            peak,
+                            Some(&error.to_string()),
+                        )?;
+                        return Err(error);
+                    }
+                };
                 let chosen_end = if has_more {
                     choose_adaptive_boundary(
                         &local,
@@ -557,7 +592,7 @@ impl Pipeline {
             duration,
             peak,
             Some(&format!(
-                "{} -> {} cues; mode={}; estimated_tokens={estimated}; calls={calls}",
+                "{} -> {} cues; mode={}; estimated_tokens={estimated}; estimated_bytes={estimated_bytes}; calls={calls}",
                 cues.len(),
                 result.len(),
                 batch_mode_name(self.config.ai.batch_mode)
@@ -1546,28 +1581,58 @@ fn estimate_segment_tokens(cues: &[Cue]) -> usize {
     PI_PROMPT_OVERHEAD_TOKENS + cues.iter().map(segment_cue_tokens).sum::<usize>()
 }
 
+fn segment_cue_argument_bytes(index: usize, cue: &Cue) -> usize {
+    serde_json::to_string(&json!({
+        "i": index,
+        "start": cue.start,
+        "end": cue.end,
+        "text": cue.source
+    }))
+    .map_or(usize::MAX, |value| value.len().saturating_add(1))
+}
+
+fn estimate_segment_argument_bytes(cues: &[Cue]) -> usize {
+    512usize.saturating_add(
+        cues.iter()
+            .enumerate()
+            .map(|(index, cue)| segment_cue_argument_bytes(index, cue))
+            .sum::<usize>(),
+    )
+}
+
 fn estimate_translation_tokens(cues: &[Cue]) -> usize {
     PI_PROMPT_OVERHEAD_TOKENS + cues.iter().map(translation_cue_tokens).sum::<usize>()
 }
 
-fn max_segment_window_end(cues: &[Cue], start: usize, budget: usize) -> Result<usize> {
+fn max_segment_window_end(
+    cues: &[Cue],
+    start: usize,
+    token_budget: usize,
+    byte_budget: usize,
+) -> Result<usize> {
     if start >= cues.len() {
         bail!("分句窗口起点越界: {start}/{}", cues.len())
     }
     let mut total = PI_PROMPT_OVERHEAD_TOKENS;
+    let mut bytes = 512usize;
     let mut end = None;
     for (index, cue) in cues.iter().enumerate().skip(start) {
         let item = segment_cue_tokens(cue);
-        if total.saturating_add(item) > budget {
+        let item_bytes = segment_cue_argument_bytes(index - start, cue);
+        if total.saturating_add(item) > token_budget
+            || bytes.saturating_add(item_bytes) > byte_budget
+        {
             break;
         }
         total += item;
+        bytes += item_bytes;
         end = Some(index);
     }
     end.with_context(|| {
         format!(
-            "单条字幕已超过安全 token 阈值 {budget}: cue={start}, estimated={}",
-            PI_PROMPT_OVERHEAD_TOKENS + segment_cue_tokens(&cues[start])
+            "单条字幕已超过安全输入阈值: cue={start}, estimated_tokens={}/{token_budget}, bytes={}/{byte_budget}",
+            PI_PROMPT_OVERHEAD_TOKENS + segment_cue_tokens(&cues[start]),
+            512 + segment_cue_argument_bytes(0, &cues[start])
         )
     })
 }
@@ -1858,6 +1923,20 @@ mod tests {
             translation_batches(&cues, 200_000, 50).unwrap(),
             vec![(0, 50), (50, 100), (100, 107)]
         );
+    }
+
+    #[test]
+    fn adaptive_segmentation_respects_process_argument_byte_limit() {
+        let long_text = "x".repeat(1_000);
+        let cues = (0..100)
+            .map(|index| cue(index, &long_text))
+            .collect::<Vec<_>>();
+        assert!(estimate_segment_tokens(&cues) < 200_000);
+        assert!(estimate_segment_argument_bytes(&cues) > PI_MAX_PROMPT_ARGUMENT_BYTES);
+
+        let end = max_segment_window_end(&cues, 0, 200_000, PI_MAX_PROMPT_ARGUMENT_BYTES).unwrap();
+        assert!(end < cues.len() - 1);
+        assert!(estimate_segment_argument_bytes(&cues[..=end]) <= PI_MAX_PROMPT_ARGUMENT_BYTES);
     }
 
     #[test]
