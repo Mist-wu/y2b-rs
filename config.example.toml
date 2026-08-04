@@ -72,8 +72,8 @@ ffprobe = "/usr/local/bin/ffprobe"
 fonts_dir = "/opt/y2b/fonts"
 font_cn = "Source Han Sans CN Medium"
 font_en = "Inter SemiBold"
-crf = 20
-preset = "superfast"
+crf = 18
+preset = "ultrafast"
 
 [storage]
 warn_free_gib = 10

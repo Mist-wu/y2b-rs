@@ -227,8 +227,8 @@ impl Default for RenderConfig {
             fonts_dir: "/opt/y2b/fonts".into(),
             font_cn: "Source Han Sans CN Medium".into(),
             font_en: "Inter SemiBold".into(),
-            crf: 20,
-            preset: "superfast".into(),
+            crf: 18,
+            preset: "ultrafast".into(),
         }
     }
 }

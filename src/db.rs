@@ -284,6 +284,10 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         let recovered=c.execute("UPDATE jobs SET status='queued',error='服务重启后自动恢复',updated_at=? WHERE status IN ('inspecting','processing','downloading','segmenting','translating','rendering')",[&now])?;
         c.execute("UPDATE jobs SET status='paused',error='服务重启时上传或追加结果不确定，请确认 Bilibili 后手动重试',updated_at=? WHERE status IN ('uploading','appending')",[&now])?;
+        c.execute(
+            "UPDATE stage_runs SET status='failed',finished_at=?,duration_ms=COALESCE(duration_ms,CAST(MAX(0,(julianday(?) - julianday(started_at))*86400000) AS INTEGER)),detail=COALESCE(detail,'服务重启中断阶段') WHERE status='running'",
+            params![&now, &now],
+        )?;
         Ok(recovered)
     }
 
@@ -833,6 +837,41 @@ mod tests {
             .execute("UPDATE jobs SET updated_at=? WHERE id=?", params![old, id])
             .unwrap();
         assert_eq!(db.next_queued_job().unwrap().unwrap().id, id);
+    }
+
+    #[test]
+    fn recovery_closes_running_stage_rows() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "interrupted-video",
+                url: "https://youtu.be/interrupted-video",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        db.update_job_status(&id, JobStatus::Rendering, None)
+            .unwrap();
+        let stage = db.start_stage(&id, "render", None, None, None).unwrap();
+
+        assert_eq!(db.recover_incomplete_jobs().unwrap(), 1);
+        let row: (String, Option<String>, Option<i64>, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT status,finished_at,duration_ms,detail FROM stage_runs WHERE id=?",
+                [stage],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "failed");
+        assert!(row.1.is_some());
+        assert!(row.2.is_some_and(|duration| duration >= 0));
+        assert_eq!(row.3.as_deref(), Some("服务重启中断阶段"));
     }
 
     #[test]
