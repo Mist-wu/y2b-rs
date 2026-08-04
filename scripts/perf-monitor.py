@@ -42,6 +42,17 @@ def read_text(path: Path) -> str | None:
         return None
 
 
+def read_keyed_ints(path: Path) -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        for line in path.read_text().splitlines():
+            key, value = line.split(":", maxsplit=1)
+            values[key] = int(value.strip())
+    except (OSError, ValueError):
+        return {}
+    return values
+
+
 def process_snapshots() -> list[dict[str, int | str]]:
     snapshots: list[dict[str, int | str]] = []
     for entry in Path("/proc").iterdir():
@@ -58,6 +69,8 @@ def process_snapshots() -> list[dict[str, int | str]]:
             cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
                 "utf-8", errors="replace"
             )
+            stat = (entry / "stat").read_text().split()
+            io = read_keyed_ints(entry / "io")
             if name == "pi":
                 cmdline = "pi [prompt omitted]"
             snapshots.append(
@@ -65,10 +78,14 @@ def process_snapshots() -> list[dict[str, int | str]]:
                     "pid": int(entry.name),
                     "name": name,
                     "rss_kib": rss_kib,
+                    "cpu_user_ticks": int(stat[13]),
+                    "cpu_system_ticks": int(stat[14]),
+                    "read_bytes": io.get("read_bytes", 0),
+                    "write_bytes": io.get("write_bytes", 0),
                     "cmdline": cmdline[:512],
                 }
             )
-        except (OSError, StopIteration, ValueError):
+        except (IndexError, OSError, StopIteration, ValueError):
             continue
     return sorted(snapshots, key=lambda item: int(item["pid"]))
 
