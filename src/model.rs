@@ -169,7 +169,10 @@ impl VideoMetadata {
                 .webpage_url
                 .as_deref()
                 .is_some_and(|u| u.contains("/shorts/"));
-        let max_duration = if self.timestamp.is_some_and(|ts| ts < SHORTS_DURATION_60S_CUTOFF) {
+        let max_duration = if self
+            .timestamp
+            .is_some_and(|ts| ts < SHORTS_DURATION_60S_CUTOFF)
+        {
             60.0
         } else {
             180.0

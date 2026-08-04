@@ -385,10 +385,7 @@ impl Pipeline {
         let mut cues = match cached {
             Some(cues) => cues,
             None => {
-                let Some(fresh) = self
-                    .segment_uncached(job, meta, work, &segmented)
-                    .await?
-                else {
+                let Some(fresh) = self.segment_uncached(job, meta, work, &segmented).await? else {
                     return Ok(None);
                 };
                 fresh
@@ -418,7 +415,10 @@ impl Pipeline {
                 self.translate_and_save(&job.id, &mut cues, &translated)
                     .await?;
             }
-            Ok(None) => self.translate_and_save(&job.id, &mut cues, &translated).await?,
+            Ok(None) => {
+                self.translate_and_save(&job.id, &mut cues, &translated)
+                    .await?
+            }
             Err(error) => {
                 self.db
                     .event(Some(&job.id), "warn", &format!("忽略无效翻译缓存: {error}"))?;
@@ -890,15 +890,14 @@ impl Pipeline {
                                     self.translate_batch_with_retry(job_id, stage, start, left),
                                 )
                                 .await?;
-                                let (_, right_result, right_ms, right_peak) = Box::pin(
-                                    self.translate_batch_with_retry(
+                                let (_, right_result, right_ms, right_peak) =
+                                    Box::pin(self.translate_batch_with_retry(
                                         job_id,
                                         stage,
                                         start + mid,
                                         right,
-                                    ),
-                                )
-                                .await?;
+                                    ))
+                                    .await?;
                                 let merged = left_result
                                     .into_iter()
                                     .chain(
