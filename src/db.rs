@@ -1,4 +1,6 @@
-use crate::model::{AiUsage, Channel, Job, JobStatus, PublicationMetadata, StageRun, TransferMode};
+use crate::model::{
+    AiUsage, Channel, Job, JobStatus, PreparedUpload, PublicationMetadata, StageRun, TransferMode,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -148,6 +150,15 @@ impl Database {
               VALUES(6,CURRENT_TIMESTAMP);
             "#,
         )?;
+        // v7: 上传调度器可在重启后直接恢复投稿，无需重新准备成片和来源元数据。
+        for column in ["source_metadata_json", "prepared_upload_json"] {
+            if !self.has_column("jobs", column)? {
+                self.conn()
+                    .execute(&format!("ALTER TABLE jobs ADD COLUMN {column} TEXT"), [])?;
+            }
+        }
+        self.conn()
+            .execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(7,CURRENT_TIMESTAMP)",[])?;
         Ok(())
     }
 
@@ -311,6 +322,16 @@ impl Database {
         )
     }
 
+    pub fn next_ready_to_upload_job(&self) -> Result<Option<Job>> {
+        let retry_before = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        self.job_opt(
+            &format!(
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='ready_to_upload' OR (status='upload_retry_wait' AND updated_at<=?) ORDER BY discovered_at LIMIT 1"
+            ),
+            [retry_before],
+        )
+    }
+
     pub fn recover_incomplete_jobs(&self) -> Result<usize> {
         let c = self.conn();
         let now = Utc::now().to_rfc3339();
@@ -358,6 +379,81 @@ impl Database {
             "UPDATE jobs SET provider=?,ai_model=?,thinking=?,updated_at=? WHERE id=?",
             params![provider, model, thinking, Utc::now().to_rfc3339(), id],
         )?;
+        Ok(())
+    }
+    pub fn save_source_metadata(
+        &self,
+        id: &str,
+        metadata: &crate::model::VideoMetadata,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE jobs SET source_metadata_json=?,updated_at=? WHERE id=?",
+            params![
+                serde_json::to_string(metadata)?,
+                Utc::now().to_rfc3339(),
+                id
+            ],
+        )?;
+        Ok(())
+    }
+    pub fn source_metadata(&self, id: &str) -> Result<Option<crate::model::VideoMetadata>> {
+        let value = self
+            .conn()
+            .query_row(
+                "SELECT source_metadata_json FROM jobs WHERE id=?",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        value
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .transpose()
+    }
+    pub fn queue_prepared_upload(&self, id: &str, upload: &PreparedUpload) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE jobs SET prepared_upload_json=?,status='ready_to_upload',error=NULL,updated_at=? WHERE id=?",
+            params![serde_json::to_string(upload)?, Utc::now().to_rfc3339(), id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("任务不存在: {id}")
+        }
+        Ok(())
+    }
+    pub fn prepared_upload(&self, id: &str) -> Result<Option<PreparedUpload>> {
+        let value = self
+            .conn()
+            .query_row(
+                "SELECT prepared_upload_json FROM jobs WHERE id=?",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        value
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .transpose()
+    }
+    pub fn finish_prepared_upload(
+        &self,
+        id: &str,
+        bvid: &str,
+        status: JobStatus,
+        clear_append_target: bool,
+    ) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE jobs SET bvid=?,status=?,error=NULL,prepared_upload_json=NULL,append_to_bvid=CASE WHEN ? THEN NULL ELSE append_to_bvid END,updated_at=? WHERE id=?",
+            params![
+                bvid,
+                status.to_string(),
+                clear_append_target,
+                Utc::now().to_rfc3339(),
+                id
+            ],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("任务不存在: {id}")
+        }
         Ok(())
     }
     pub fn set_job_paths(
@@ -462,7 +558,7 @@ impl Database {
 
     pub fn retry_job(&self, id: &str) -> Result<()> {
         let changed = self.conn().execute(
-            "UPDATE jobs SET status='queued',attempt=0,error=NULL,updated_at=? WHERE id=?",
+            "UPDATE jobs SET status=CASE WHEN prepared_upload_json IS NOT NULL THEN 'ready_to_upload' ELSE 'queued' END,attempt=0,error=NULL,updated_at=? WHERE id=?",
             params![Utc::now().to_rfc3339(), id],
         )?;
         if changed == 0 {
@@ -678,6 +774,27 @@ fn usage_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AiUsage> {
 mod tests {
     use super::*;
 
+    fn source_metadata() -> crate::model::VideoMetadata {
+        crate::model::VideoMetadata {
+            id: "ready-video".into(),
+            url: "https://youtu.be/ready-video".into(),
+            title: "Ready video".into(),
+            description: Some("description".into()),
+            uploader: Some("uploader".into()),
+            upload_date: Some("20260804".into()),
+            channel: Some("channel".into()),
+            channel_id: Some("UC-ready".into()),
+            timestamp: Some(1_800_000_000),
+            duration: Some(60.0),
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(60.0),
+            thumbnail_url: Some("https://i.ytimg.com/ready.jpg".into()),
+            webpage_url: Some("https://youtube.com/watch?v=ready-video".into()),
+            live_status: Some("not_live".into()),
+        }
+    }
+
     #[test]
     fn migrates_v3_rows_to_translated_mode() {
         let t = tempfile::tempdir().unwrap();
@@ -725,7 +842,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 6);
+        assert_eq!(db.schema_version().unwrap(), 7);
         assert_eq!(
             db.list_channels().unwrap()[0].transfer_mode,
             TransferMode::Translated
@@ -741,7 +858,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
-        assert_eq!(db.schema_version().unwrap(), 6);
+        assert_eq!(db.schema_version().unwrap(), 7);
         assert!(
             db.create_job(NewJob {
                 channel_id: None,
@@ -948,6 +1065,146 @@ mod tests {
     }
 
     #[test]
+    fn preparation_and_upload_queues_are_independent_and_durable() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("x.db");
+        let db = Database::open(&path).unwrap();
+        let upload_id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "ready-video",
+                url: "https://youtu.be/ready-video",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        let queued_id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "queued-video",
+                url: "https://youtu.be/queued-video",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        let plan = PreparedUpload::Submission {
+            video_path: "/tmp/ready.mp4".into(),
+            cover_path: "/tmp/ready.jpg".into(),
+            mode: TransferMode::Translated,
+            completion_status: JobStatus::Completed,
+        };
+        db.save_source_metadata(&upload_id, &source_metadata())
+            .unwrap();
+        db.queue_prepared_upload(&upload_id, &plan).unwrap();
+
+        assert_eq!(db.next_queued_job().unwrap().unwrap().id, queued_id);
+        assert_eq!(
+            db.next_ready_to_upload_job().unwrap().unwrap().id,
+            upload_id
+        );
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.recover_incomplete_jobs().unwrap(), 0);
+        let source = reopened.source_metadata(&upload_id).unwrap().unwrap();
+        assert_eq!(source.id, "ready-video");
+        assert_eq!(source.uploader.as_deref(), Some("uploader"));
+        assert_eq!(reopened.prepared_upload(&upload_id).unwrap(), Some(plan));
+        assert_eq!(
+            reopened.next_ready_to_upload_job().unwrap().unwrap().id,
+            upload_id
+        );
+    }
+
+    #[test]
+    fn upload_retry_wait_has_backoff_without_blocking_preparation_queue() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        let upload_id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "upload-retry",
+                url: "https://youtu.be/upload-retry",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        let queued_id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "prepare-now",
+                url: "https://youtu.be/prepare-now",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        db.update_job_status(&upload_id, JobStatus::UploadRetryWait, Some("test"))
+            .unwrap();
+
+        assert!(db.next_ready_to_upload_job().unwrap().is_none());
+        assert_eq!(db.next_queued_job().unwrap().unwrap().id, queued_id);
+
+        let old = (Utc::now() - chrono::Duration::minutes(11)).to_rfc3339();
+        db.conn()
+            .execute(
+                "UPDATE jobs SET updated_at=? WHERE id=?",
+                params![old, upload_id],
+            )
+            .unwrap();
+        assert_eq!(
+            db.next_ready_to_upload_job().unwrap().unwrap().id,
+            upload_id
+        );
+    }
+
+    #[test]
+    fn finishing_prepared_upload_is_atomic() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "append-ready",
+                url: "https://youtu.be/append-ready",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        db.set_job_bvid(&id, "BV1original").unwrap();
+        db.queue_subtitle_recheck(&id).unwrap();
+        db.queue_prepared_upload(
+            &id,
+            &PreparedUpload::Append {
+                video_path: "/tmp/append.mp4".into(),
+                bvid: "BV1original".into(),
+            },
+        )
+        .unwrap();
+        db.finish_prepared_upload(&id, "BV1original", JobStatus::Completed, true)
+            .unwrap();
+        let job = db.get_job(&id).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Completed);
+        assert_eq!(job.bvid.as_deref(), Some("BV1original"));
+        assert!(job.append_to_bvid.is_none());
+        assert!(db.prepared_upload(&id).unwrap().is_none());
+    }
+
+    #[test]
     fn recovery_closes_running_stage_rows() {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
@@ -1007,6 +1264,41 @@ mod tests {
         assert_eq!(job.status, JobStatus::Queued);
         assert_eq!(job.attempt, 0);
         assert!(job.error.is_none());
+    }
+
+    #[test]
+    fn retry_job_preserves_completed_preparation() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "retry-upload",
+                url: "https://youtu.be/retry-upload",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        let plan = PreparedUpload::Submission {
+            video_path: "/tmp/retry.mp4".into(),
+            cover_path: "/tmp/retry.jpg".into(),
+            mode: TransferMode::Direct,
+            completion_status: JobStatus::Completed,
+        };
+        db.queue_prepared_upload(&id, &plan).unwrap();
+        db.increment_attempt(&id).unwrap();
+        db.update_job_status(&id, JobStatus::Paused, Some("failed"))
+            .unwrap();
+
+        db.retry_job(&id).unwrap();
+        let job = db.get_job(&id).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::ReadyToUpload);
+        assert_eq!(job.attempt, 0);
+        assert!(job.error.is_none());
+        assert_eq!(db.prepared_upload(&id).unwrap(), Some(plan));
     }
 
     #[test]

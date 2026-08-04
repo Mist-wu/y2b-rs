@@ -316,15 +316,37 @@ async fn watch(config_path: PathBuf, config: Config, db: Database) -> Result<()>
     );
     let mut backup_tick = tokio::time::interval(Duration::from_secs(6 * 3600));
     let mut auth_tick = tokio::time::interval(Duration::from_secs(24 * 3600));
-    let mut worker: Option<tokio::task::JoinHandle<()>> = None;
+    let mut scheduler_tick = tokio::time::interval(Duration::from_secs(1));
+    scheduler_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut prepare_worker: Option<tokio::task::JoinHandle<()>> = None;
+    let mut upload_worker: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         tokio::select! {
          _=tokio::signal::ctrl_c()=>break,
          _=poll.tick()=>{
              match monitor.poll_all().await{Ok(_)=>{},Err(e)=>tracing::error!(error=%e,"轮询失败")}
-             if worker.as_ref().is_some_and(|w|w.is_finished()) && let Some(done)=worker.take() && let Err(e)=done.await{tracing::error!(error=%e,"任务工作线程异常");}
-             let idle=worker.is_none();
-             if idle && let Some(job)=db.next_queued_job()?{let fresh=Config::load(&config_path).unwrap_or_else(|_|config.clone());let worker_db=db.clone();worker=Some(tokio::spawn(async move{if let Err(e)=Pipeline::new(fresh,worker_db).run_job(job).await{tracing::error!(error=%e,"任务失败");}}));}
+         },
+         _=scheduler_tick.tick()=>{
+             reap_worker(&mut prepare_worker, "准备工作线程").await;
+             reap_worker(&mut upload_worker, "上传工作线程").await;
+             if prepare_worker.is_none() && let Some(job)=db.next_queued_job()? {
+                 let fresh=Config::load(&config_path).unwrap_or_else(|_|config.clone());
+                 let worker_db=db.clone();
+                 prepare_worker=Some(tokio::spawn(async move{
+                     if let Err(e)=Pipeline::new(fresh,worker_db).prepare_job(job).await {
+                         tracing::error!(error=%e,"任务准备失败");
+                     }
+                 }));
+             }
+             if upload_worker.is_none() && let Some(job)=db.next_ready_to_upload_job()? {
+                 let fresh=Config::load(&config_path).unwrap_or_else(|_|config.clone());
+                 let worker_db=db.clone();
+                 upload_worker=Some(tokio::spawn(async move{
+                     if let Err(e)=Pipeline::new(fresh,worker_db).upload_prepared_job(job).await {
+                         tracing::error!(error=%e,"待上传任务失败");
+                     }
+                 }));
+             }
          },
          _=reconcile.tick()=>match monitor.reconcile_all().await{Ok(n)=>tracing::info!(added=n,"yt-dlp 校对完成"),Err(e)=>tracing::error!(error=%e,"yt-dlp 校对失败")},
          _=backup_tick.tick()=>{
@@ -334,11 +356,20 @@ async fn watch(config_path: PathBuf, config: Config, db: Database) -> Result<()>
          _=auth_tick.tick()=>if let Err(e)=check_auth(&config,&db).await{tracing::error!(error=%e,"认证检查失败");},
         }
     }
-    if let Some(worker) = worker {
+    for worker in [prepare_worker, upload_worker].into_iter().flatten() {
         worker.abort();
         let _ = worker.await;
     }
     Ok(())
+}
+
+async fn reap_worker(worker: &mut Option<tokio::task::JoinHandle<()>>, name: &str) {
+    if worker.as_ref().is_some_and(|handle| handle.is_finished())
+        && let Some(done) = worker.take()
+        && let Err(error) = done.await
+    {
+        tracing::error!(error = %error, worker = name, "工作线程异常");
+    }
 }
 
 async fn check_auth(config: &Config, db: &Database) -> Result<()> {

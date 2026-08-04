@@ -14,7 +14,9 @@ pub enum JobStatus {
     Segmenting,
     Translating,
     Rendering,
+    ReadyToUpload,
     Uploading,
+    UploadRetryWait,
     UploadedOriginalPendingSubtitle,
     Appending,
     Completed,
@@ -135,6 +137,21 @@ pub struct PublicationMetadata {
     pub tags: Vec<String>,
     pub tid: i64,
     pub raw_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PreparedUpload {
+    Submission {
+        video_path: String,
+        cover_path: String,
+        mode: TransferMode,
+        completion_status: JobStatus,
+    },
+    Append {
+        video_path: String,
+        bvid: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

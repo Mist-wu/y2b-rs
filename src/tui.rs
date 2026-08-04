@@ -340,6 +340,8 @@ fn app(
                     let color = match j.status {
                         JobStatus::Completed => Color::Green,
                         JobStatus::Failed | JobStatus::DeadLetter => Color::Red,
+                        JobStatus::ReadyToUpload => Color::Cyan,
+                        JobStatus::UploadRetryWait => Color::Yellow,
                         JobStatus::UploadedOriginalPendingSubtitle => Color::Magenta,
                         JobStatus::Paused => Color::DarkGray,
                         _ => Color::White,
@@ -505,7 +507,7 @@ fn app(
                                 Err(e) => notice = format!("补字幕排队失败: {e}"),
                             }
                         } else {
-                            db.update_job_status(&j.id, JobStatus::Queued, None)?;
+                            db.retry_job(&j.id)?;
                             notice = format!("已重新排队 {}", j.video_id);
                         }
                     }

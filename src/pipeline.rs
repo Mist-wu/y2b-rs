@@ -1,6 +1,8 @@
 use crate::config::{BatchMode, Config};
 use crate::db::Database;
-use crate::model::{AiUsage, Job, JobStatus, PublicationMetadata, TransferMode, VideoMetadata};
+use crate::model::{
+    AiUsage, Job, JobStatus, PreparedUpload, PublicationMetadata, TransferMode, VideoMetadata,
+};
 use crate::monitor::{Monitor, is_live_content_pending, ytdlp_command};
 use crate::process::{ProcessOutput, run_monitored};
 use crate::subtitle::{self, Cue};
@@ -42,7 +44,18 @@ impl Pipeline {
     }
 
     pub async fn run_job(&self, job: Job) -> Result<()> {
-        let result = self.run_job_inner(&job).await;
+        self.prepare_job(job.clone()).await?;
+        let Some(prepared) = self.db.get_job(&job.id)? else {
+            bail!("准备完成后任务不存在: {}", job.id)
+        };
+        if prepared.status == JobStatus::ReadyToUpload {
+            self.upload_prepared_job(prepared).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn prepare_job(&self, job: Job) -> Result<()> {
+        let result = self.prepare_job_inner(&job).await;
         if let Err(e) = &result {
             let live_pending = is_live_content_pending(e);
             let attempt = if live_pending {
@@ -50,19 +63,8 @@ impl Pipeline {
             } else {
                 self.db.increment_attempt(&job.id)?
             };
-            let failed_status = self.db.get_job(&job.id)?.map(|job| job.status);
-            let upload_failure = matches!(
-                failed_status,
-                Some(JobStatus::Uploading | JobStatus::Appending)
-            );
-            let rate_limited = e.to_string().contains("21566");
-            if rate_limited {
-                self.defer_bilibili_submissions(self.config.bilibili.rate_limit_cooldown_seconds)?;
-            }
-            let status = if live_pending || rate_limited {
+            let status = if live_pending {
                 JobStatus::RetryWait
-            } else if upload_failure && attempt >= self.config.monitor.max_attempts as i64 {
-                JobStatus::Paused
             } else if attempt >= self.config.monitor.max_attempts as i64 {
                 self.cleanup_large(&job.id).ok();
                 JobStatus::DeadLetter
@@ -80,19 +82,32 @@ impl Pipeline {
         result
     }
 
-    async fn run_job_inner(&self, job: &Job) -> Result<()> {
+    pub async fn upload_prepared_job(&self, job: Job) -> Result<()> {
+        let result = self.upload_prepared_job_inner(&job).await;
+        if let Err(error) = &result {
+            let attempt = self.db.increment_attempt(&job.id)?;
+            let rate_limited = error.to_string().contains("21566");
+            if rate_limited {
+                self.defer_bilibili_submissions(self.config.bilibili.rate_limit_cooldown_seconds)?;
+            }
+            let status = if attempt >= self.config.monitor.max_attempts as i64 {
+                JobStatus::Paused
+            } else {
+                JobStatus::UploadRetryWait
+            };
+            self.db
+                .update_job_status(&job.id, status, Some(&error.to_string()))?;
+            self.db.event(Some(&job.id), "error", &error.to_string())?;
+        }
+        result
+    }
+
+    async fn prepare_job_inner(&self, job: &Job) -> Result<()> {
         self.ensure_disk()?;
         if let Some(limit) = self.config.ai.daily_token_limit
             && self.db.ai_tokens_today()? >= limit
         {
             bail!("已达到每日 token 上限 {limit}")
-        }
-        if self
-            .db
-            .get_setting("auth.bilibili")?
-            .is_some_and(|s| s.starts_with("failed"))
-        {
-            bail!("Bilibili 认证失效，暂停处理并保留现有文件")
         }
         let append_to = job.append_to_bvid.clone();
         self.db.set_job_model(
@@ -133,6 +148,7 @@ impl Pipeline {
             meta.width,
             meta.height,
         )?;
+        self.db.save_source_metadata(&job.id, &meta)?;
         let work = self.config.runtime.download_dir.join(&meta.id);
         fs::create_dir_all(&work)?;
         self.db
@@ -145,7 +161,7 @@ impl Pipeline {
         // example, rate-limit code 21566).  Retrying that failure must reuse the
         // expensive rendered file instead of translating and encoding again.
         if append_to.is_none()
-            && let Some(publication) = self.db.publication_metadata(&job.id)?
+            && self.db.publication_metadata(&job.id)?.is_some()
             && let Some(rendered) = self.reusable_render(&meta.id).await?
         {
             self.db.event(
@@ -158,25 +174,15 @@ impl Pipeline {
             self.probe_media(&job.id, &rendered, "rendered_probe")
                 .await?;
             let cover = self.download_cover(&job.id, &meta, &work).await?;
-            let bvid = self
-                .upload(
-                    &job.id,
-                    &rendered,
-                    &publication,
-                    &meta,
-                    TransferMode::Translated,
-                    Some(&cover),
-                )
-                .await?;
-            self.db.set_job_bvid(&job.id, &bvid)?;
-            self.db
-                .update_job_status(&job.id, JobStatus::Completed, None)?;
-            let (raw, _, _) = self.db.job_paths(&job.id)?;
-            if let Some(raw) = raw {
-                self.after_upload(&job.id, &[Path::new(&raw), &rendered])?;
-            } else {
-                self.after_upload(&job.id, &[&rendered])?;
-            }
+            self.db.queue_prepared_upload(
+                &job.id,
+                &PreparedUpload::Submission {
+                    video_path: rendered.to_string_lossy().into_owned(),
+                    cover_path: cover.to_string_lossy().into_owned(),
+                    mode: TransferMode::Translated,
+                    completion_status: JobStatus::Completed,
+                },
+            )?;
             return Ok(());
         }
 
@@ -195,11 +201,15 @@ impl Pipeline {
                 )?;
                 return Ok(());
             }
-            let publication = self
-                .publish_metadata(&job.id, TransferMode::Direct, &meta, None)
+            self.publish_metadata(&job.id, TransferMode::Direct, &meta, None)
                 .await?;
             return self
-                .finish_direct_upload(job, &meta, &video, &publication, true)
+                .prepare_direct_upload(
+                    job,
+                    &meta,
+                    &video,
+                    JobStatus::UploadedOriginalPendingSubtitle,
+                )
                 .await;
         };
         let publication = if append_to.is_none() {
@@ -222,73 +232,54 @@ impl Pipeline {
             .set_job_paths(&job.id, None, None, Some(&rendered.to_string_lossy()))?;
         self.probe_media(&job.id, &rendered, "rendered_probe")
             .await?;
-        let bvid = if let Some(existing) = append_to.as_deref() {
-            self.append(&job.id, &rendered, existing).await?;
-            existing.to_owned()
+        let prepared = if let Some(bvid) = append_to {
+            PreparedUpload::Append {
+                video_path: rendered.to_string_lossy().into_owned(),
+                bvid,
+            }
         } else {
+            publication.as_ref().context("投稿元数据未生成")?;
             let cover = self.download_cover(&job.id, &meta, &work).await?;
-            self.upload(
-                &job.id,
-                &rendered,
-                publication.as_ref().context("投稿元数据未生成")?,
-                &meta,
-                TransferMode::Translated,
-                Some(&cover),
-            )
-            .await?
+            PreparedUpload::Submission {
+                video_path: rendered.to_string_lossy().into_owned(),
+                cover_path: cover.to_string_lossy().into_owned(),
+                mode: TransferMode::Translated,
+                completion_status: JobStatus::Completed,
+            }
         };
-        self.db.set_job_bvid(&job.id, &bvid)?;
-        if append_to.is_some() {
-            self.db.clear_job_append_target(&job.id)?;
-        }
-        self.db
-            .update_job_status(&job.id, JobStatus::Completed, None)?;
-        self.after_upload(&job.id, &[&video, &rendered])?;
+        self.db.queue_prepared_upload(&job.id, &prepared)?;
         Ok(())
     }
 
     async fn run_direct(&self, job: &Job, meta: &VideoMetadata, work: &Path) -> Result<()> {
         let video_fut = self.download_video(&job.id, &job.url, meta, work);
         let metadata_fut = self.publish_metadata(&job.id, TransferMode::Direct, meta, None);
-        let (video, publication) = try_join_branches(video_fut, metadata_fut).await?;
+        let (video, _) = try_join_branches(video_fut, metadata_fut).await?;
         self.db
             .set_job_paths(&job.id, Some(&video.to_string_lossy()), None, None)?;
-        self.finish_direct_upload(job, meta, &video, &publication, false)
+        self.prepare_direct_upload(job, meta, &video, JobStatus::Completed)
             .await
     }
 
-    async fn finish_direct_upload(
+    async fn prepare_direct_upload(
         &self,
         job: &Job,
         meta: &VideoMetadata,
         video: &Path,
-        publication: &PublicationMetadata,
-        pending_subtitle: bool,
+        completion_status: JobStatus,
     ) -> Result<()> {
         self.probe_media(&job.id, video, "original_probe").await?;
         let work = video.parent().context("视频文件没有工作目录")?;
         let cover = self.download_cover(&job.id, meta, work).await?;
-        let bvid = self
-            .upload(
-                &job.id,
-                video,
-                publication,
-                meta,
-                TransferMode::Direct,
-                Some(&cover),
-            )
-            .await?;
-        self.db.set_job_bvid(&job.id, &bvid)?;
-        self.db.update_job_status(
+        self.db.queue_prepared_upload(
             &job.id,
-            if pending_subtitle {
-                JobStatus::UploadedOriginalPendingSubtitle
-            } else {
-                JobStatus::Completed
+            &PreparedUpload::Submission {
+                video_path: video.to_string_lossy().into_owned(),
+                cover_path: cover.to_string_lossy().into_owned(),
+                mode: TransferMode::Direct,
+                completion_status,
             },
-            None,
         )?;
-        self.after_upload(&job.id, &[video])?;
         Ok(())
     }
 
@@ -1205,6 +1196,81 @@ impl Pipeline {
                 .is_some_and(|duration| duration > 0.0)
     }
 
+    async fn upload_prepared_job_inner(&self, job: &Job) -> Result<()> {
+        if !matches!(
+            job.status,
+            JobStatus::ReadyToUpload | JobStatus::UploadRetryWait
+        ) {
+            bail!("任务 {} 当前状态不是待上传: {}", job.id, job.status)
+        }
+        if self
+            .db
+            .get_setting("auth.bilibili")?
+            .is_some_and(|status| status.starts_with("failed"))
+        {
+            bail!("Bilibili 认证失效，暂停上传并保留现有文件")
+        }
+        let prepared = self
+            .db
+            .prepared_upload(&job.id)?
+            .with_context(|| format!("待上传任务 {} 缺少持久化上传计划", job.id))?;
+        let (bvid, completion_status, clear_append_target) = match prepared {
+            PreparedUpload::Submission {
+                video_path,
+                cover_path,
+                mode,
+                completion_status,
+            } => {
+                if !matches!(
+                    completion_status,
+                    JobStatus::Completed | JobStatus::UploadedOriginalPendingSubtitle
+                ) {
+                    bail!("待上传任务 {} 的完成状态无效: {completion_status}", job.id)
+                }
+                let video = PathBuf::from(video_path);
+                let cover = PathBuf::from(cover_path);
+                ensure_prepared_file(&video, "视频")?;
+                ensure_prepared_file(&cover, "封面")?;
+                let publication = self
+                    .db
+                    .publication_metadata(&job.id)?
+                    .with_context(|| format!("待上传任务 {} 缺少投稿元数据", job.id))?;
+                let meta = self
+                    .db
+                    .source_metadata(&job.id)?
+                    .with_context(|| format!("待上传任务 {} 缺少来源元数据", job.id))?;
+                let bvid = self
+                    .upload(&job.id, &video, &publication, &meta, mode, Some(&cover))
+                    .await?;
+                (bvid, completion_status, false)
+            }
+            PreparedUpload::Append { video_path, bvid } => {
+                let video = PathBuf::from(video_path);
+                ensure_prepared_file(&video, "追加视频")?;
+                self.append(&job.id, &video, &bvid).await?;
+                (bvid, JobStatus::Completed, true)
+            }
+        };
+        self.db
+            .finish_prepared_upload(&job.id, &bvid, completion_status, clear_append_target)?;
+        let (raw, _, rendered) = self.db.job_paths(&job.id)?;
+        let paths = [raw, rendered]
+            .into_iter()
+            .flatten()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let path_refs = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+        if let Err(error) = self.after_upload(&job.id, &path_refs) {
+            tracing::warn!(job_id = %job.id, error = %error, "上传成功后的文件清理失败");
+            self.db.event(
+                Some(&job.id),
+                "warn",
+                &format!("上传成功后的文件清理失败: {error}"),
+            )?;
+        }
+        Ok(())
+    }
+
     async fn upload(
         &self,
         job_id: &str,
@@ -1315,7 +1381,14 @@ impl Pipeline {
             .arg(&self.config.bilibili.cookies)
             .args(build_append_args(bvid))
             .arg(video);
-        let out = run_monitored(cmd, Duration::from_secs(14400)).await?;
+        let out = match run_monitored(cmd, Duration::from_secs(14400)).await {
+            Ok(output) => output,
+            Err(error) => {
+                self.db
+                    .finish_stage(stage, "failed", 0, 0, Some(&error.to_string()))?;
+                return Err(error);
+            }
+        };
         self.db.finish_stage(
             stage,
             "completed",
@@ -1397,6 +1470,13 @@ impl Pipeline {
         }
         Ok(())
     }
+}
+
+fn ensure_prepared_file(path: &Path, label: &str) -> Result<()> {
+    if !path.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        bail!("待上传{label}不存在或为空: {}", path.display())
+    }
+    Ok(())
 }
 
 const PI_PROMPT_OVERHEAD_TOKENS: usize = 2_048;
