@@ -8,6 +8,7 @@ Type=simple
 WorkingDirectory=/var/lib/y2b
 Environment=HOME=/root
 Environment=PI_CODING_AGENT_DIR=/root/.pi/agent
+EnvironmentFile=/etc/y2b/y2b.env
 Environment=RUST_LOG=y2b_rs=info
 ExecStart=/usr/local/bin/y2b --config /etc/y2b/config.toml watch
 Restart=on-failure
