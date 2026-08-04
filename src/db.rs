@@ -386,20 +386,16 @@ impl Database {
     }
     pub fn queue_subtitle_recheck(&self, id: &str) -> Result<()> {
         let c = self.conn();
-        let (status, bvid, existing): (String, Option<String>, Option<String>) = c
+        let (bvid, existing): (Option<String>, Option<String>) = c
             .query_row(
-                "SELECT status,bvid,append_to_bvid FROM jobs WHERE id=?",
+                "SELECT bvid,append_to_bvid FROM jobs WHERE id=?",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?
             .with_context(|| format!("任务不存在: {id}"))?;
         let target = existing
-            .or_else(|| {
-                (status == JobStatus::UploadedOriginalPendingSubtitle.to_string())
-                    .then_some(bvid)
-                    .flatten()
-            })
+            .or(bvid)
             .filter(|value| !value.trim().is_empty())
             .with_context(|| format!("任务 {id} 没有可追加的原稿 BV"))?;
         c.execute(
@@ -727,6 +723,34 @@ mod tests {
         let recovered = db.get_job(&id).unwrap().unwrap();
         assert_eq!(recovered.status, JobStatus::Queued);
         assert_eq!(recovered.append_to_bvid.as_deref(), Some("BV1test"));
+    }
+
+    #[test]
+    fn completed_direct_job_can_be_queued_for_subtitle_append() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "direct-completed",
+                url: "https://youtu.be/direct-completed",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+
+        db.set_job_bvid(&id, "BV1direct").unwrap();
+        db.update_job_status(&id, JobStatus::Completed, None)
+            .unwrap();
+        db.queue_subtitle_recheck(&id).unwrap();
+
+        let queued = db.get_job(&id).unwrap().unwrap();
+        assert_eq!(queued.status, JobStatus::Queued);
+        assert_eq!(queued.transfer_mode, TransferMode::Translated);
+        assert_eq!(queued.append_to_bvid.as_deref(), Some("BV1direct"));
     }
 
     #[test]
