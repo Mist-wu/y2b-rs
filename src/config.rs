@@ -176,7 +176,7 @@ impl Default for BilibiliConfig {
             default_tid: 172,
             default_tags: vec!["荒野乱斗".into()],
             max_parts: 199,
-            submit_interval_seconds: 3600,
+            submit_interval_seconds: 1800,
             rate_limit_cooldown_seconds: 21600,
         }
     }
