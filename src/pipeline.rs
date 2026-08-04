@@ -64,7 +64,8 @@ impl Pipeline {
                 self.db.increment_attempt(&job.id)?
             };
             let status = if live_pending {
-                JobStatus::RetryWait
+                // 直播预告/直播回放按策略永久跳过，不反复重试。
+                JobStatus::DeadLetter
             } else if attempt >= self.config.monitor.max_attempts as i64 {
                 self.cleanup_large(&job.id).ok();
                 JobStatus::DeadLetter
@@ -957,8 +958,7 @@ impl Pipeline {
             validate_publication_metadata(&saved)?;
             return Ok(saved);
         }
-        let payload = build_publication_payload(mode, meta, cues, self.ai_token_budget()?)?;
-        let input_json = payload.to_string();
+        let budget = self.ai_token_budget()?;
         let stage = self.db.start_stage(
             job_id,
             "publish_metadata",
@@ -966,29 +966,53 @@ impl Pipeline {
             Some(&self.config.ai.model),
             Some(&self.config.ai.thinking),
         )?;
-        let r = match self.call_pi(payload).await {
-            Ok(result) => result,
-            Err(error) => {
-                self.db
-                    .finish_stage(stage, "failed", 0, 0, Some(&error.to_string()))?;
-                return Err(error);
+        let mut feedback: Option<String> = None;
+        for attempt in 0..=PUBLICATION_FEEDBACK_RETRIES {
+            let mut payload = build_publication_payload(mode, meta, cues, budget)?;
+            if let Some(message) = &feedback {
+                payload["feedback"] = json!(message);
             }
-        };
-        self.db.record_ai_call(
-            job_id,
-            stage,
-            "publish_metadata",
-            &self.config.ai.provider,
-            &self.config.ai.model,
-            &self.config.ai.thinking,
-            &r.usage,
-            r.output.duration_ms,
-            &input_json,
-            &r.value.to_string(),
-        )?;
-        let metadata = match parse_publication_metadata(&r.value) {
-            Ok(metadata) => metadata,
-            Err(error) => {
+            let input_json = payload.to_string();
+            let r = match self.call_pi(payload).await {
+                Ok(result) => result,
+                Err(error) => {
+                    self.db
+                        .finish_stage(stage, "failed", 0, 0, Some(&error.to_string()))?;
+                    return Err(error);
+                }
+            };
+            self.db.record_ai_call(
+                job_id,
+                stage,
+                "publish_metadata",
+                &self.config.ai.provider,
+                &self.config.ai.model,
+                &self.config.ai.thinking,
+                &r.usage,
+                r.output.duration_ms,
+                &input_json,
+                &r.value.to_string(),
+            )?;
+            let metadata = match parse_publication_metadata(&r.value) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    self.db.finish_stage(
+                        stage,
+                        "failed",
+                        r.output.duration_ms,
+                        r.output.peak_rss_kib,
+                        Some(&error.to_string()),
+                    )?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = validate_publication_metadata(&metadata) {
+                if attempt < PUBLICATION_FEEDBACK_RETRIES {
+                    feedback = Some(format!(
+                        "上一轮输出被拒绝：{error}。请按原因修正（通常需要缩短标题/动态）后重新输出完整 JSON。"
+                    ));
+                    continue;
+                }
                 self.db.finish_stage(
                     stage,
                     "failed",
@@ -998,25 +1022,29 @@ impl Pipeline {
                 )?;
                 return Err(error);
             }
-        };
-        if let Err(error) = self.db.save_publication_metadata(job_id, &metadata) {
+            if let Err(error) = self.db.save_publication_metadata(job_id, &metadata) {
+                self.db.finish_stage(
+                    stage,
+                    "failed",
+                    r.output.duration_ms,
+                    r.output.peak_rss_kib,
+                    Some(&error.to_string()),
+                )?;
+                return Err(error);
+            }
             self.db.finish_stage(
                 stage,
-                "failed",
+                "completed",
                 r.output.duration_ms,
                 r.output.peak_rss_kib,
-                Some(&error.to_string()),
+                Some(&format!(
+                    "{} 次尝试后通过校验",
+                    attempt + 1
+                )),
             )?;
-            return Err(error);
+            return Ok(metadata);
         }
-        self.db.finish_stage(
-            stage,
-            "completed",
-            r.output.duration_ms,
-            r.output.peak_rss_kib,
-            None,
-        )?;
-        Ok(metadata)
+        unreachable!("publish_metadata 重试循环必须收敛")
     }
 
     async fn call_pi(&self, payload: Value) -> Result<PiResult> {
@@ -1525,6 +1553,9 @@ const BILIBILI_TID: i64 = 172;
 const CORE_TAG: &str = "荒野乱斗";
 const MAX_TITLE_WIDTH: usize = 70;
 const MAX_DYNAMIC_WIDTH: usize = 120;
+
+/// 投稿元数据校验失败（如标题宽度超限）时，把原因作为反馈让 AI 重写的最大次数。
+const PUBLICATION_FEEDBACK_RETRIES: usize = 2;
 const MAX_TAG_CHARS: usize = 20;
 const MAX_TAGS: usize = 4;
 
@@ -1825,13 +1856,14 @@ fn build_description(meta: &VideoMetadata) -> String {
         .as_deref()
         .or(meta.channel.as_deref())
         .unwrap_or("未知");
-    let mut lines = Vec::with_capacity(4);
+    let mut lines = Vec::with_capacity(5);
     if let Some(title) = original_title_without_hashtags(&meta.title) {
         lines.push(format!("原标题：{title}"));
     }
     lines.extend([
         format!("来源：{source_url}"),
         format!("原作者：{uploader}"),
+        format!("原视频发布时间：{}", publication_date(meta)),
         "处理工具：https://github.com/Mist-wu/y2b-rs".to_string(),
     ]);
     lines.join("\n")
@@ -2577,23 +2609,25 @@ mod tests {
         assert!(description.contains("原标题：Best Ranked Match 2026"));
         assert!(description.contains("来源：https://www.youtube.com/watch?v=video"));
         assert!(description.contains("原作者：Player One"));
+        assert!(description.contains("原视频发布时间："));
         assert!(!description.contains("原发布日期："));
         assert!(description.contains("处理工具：https://github.com/Mist-wu/y2b-rs"));
         assert!(!description.contains("处理方式"));
     }
 
     #[test]
-    fn description_removes_hashtags_and_publication_date() {
+    fn description_removes_hashtags_and_includes_publication_date() {
         let mut meta = metadata();
         meta.title = "Poor   Alli #bs #brawlstars ＃keepbrawlalive".into();
         meta.url = "https://www.youtube.com/watch?v=F8yN5-ctCZw".into();
         meta.webpage_url = Some(meta.url.clone());
         meta.uploader = Some("Bazilious".into());
         let description = build_description(&meta);
-        assert_eq!(
-            description,
-            "原标题：Poor Alli\n来源：https://www.youtube.com/watch?v=F8yN5-ctCZw\n原作者：Bazilious\n处理工具：https://github.com/Mist-wu/y2b-rs"
+        let expected = format!(
+            "原标题：Poor Alli\n来源：https://www.youtube.com/watch?v=F8yN5-ctCZw\n原作者：Bazilious\n原视频发布时间：{}\n处理工具：https://github.com/Mist-wu/y2b-rs",
+            publication_date(&meta)
         );
+        assert_eq!(description, expected);
     }
 
     #[test]
