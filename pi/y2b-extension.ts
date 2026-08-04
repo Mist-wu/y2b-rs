@@ -155,11 +155,12 @@ Task publish_metadata:
 - Input: {"task":"publish_metadata","transfer_mode":"direct|translated","youtube":{"title":"...","description":"...","url":"...","uploader":"...","published_date":"YYYY-MM-DD"},"subtitle_sampling":{"sampled":false,"total":0,"included":0},"subtitles":[{"i":0,"start":0.0,"end":2.0,"source":"...","translation":"..."}]}
 - Output exactly: {"title":"...","dynamic":"...","tags":["荒野乱斗","..."]}
 - Generate all three fields together from this one input. Do not output tid or any additional fields.
-- title must be a faithful, natural Chinese translation of the YouTube title. Do not add a prefix, source, uploader, hashtags, emoji, or marketing language. Preserve names, game terminology, and numbers. Maximum 70 Chinese-width characters.
+- title must be a faithful, natural Chinese translation of the YouTube title. Do not add a prefix, source, uploader, hashtags, emoji, or marketing language. Preserve names, game terminology, and numbers. Maximum 70 Chinese-width characters. 中文宽度计法：中文/全角字符计 2，ASCII 字母数字与空格计 1（70 宽度 ≈ 35 个汉字）。若直译超限，必须主动删减副标题、系列后缀（如年份、“第2078集”等）和冗余修饰以满足限制，绝不允许超宽。
 - dynamic must be one paragraph of 1-2 concise Chinese sentences describing the video's concrete highlights. Maximum 120 Chinese-width characters. Do not include a source URL, source attribution, hashtags, emoji, calls to follow/like/coin/subscribe/share, or generic promotional filler.
 - tags must contain 1-4 concrete Chinese tags. “荒野乱斗” must be the first item. Add at most 3 specific topic tags supported by the title, description, or subtitles. Do not prefix tags with # and do not use commas inside a tag. Each tag must be at most 20 characters.
 - For transfer_mode=direct, rely only on the YouTube metadata; subtitles will be empty.
 - For transfer_mode=translated, use the bilingual subtitles to identify the actual content. subtitle_sampling.sampled=true means the caller retained the beginning/end and uniformly sampled the rest; do not infer unsupported details from omitted sections.
+- If the input contains a "feedback" field: the previous output was rejected for the reason given (for example 标题宽度 79 超过上限 70). Fix exactly that issue (typically by shortening the title/dynamic) and output a corrected, complete JSON with the same fields.
 
 Project policy and glossary:
 ${JSON.stringify(runtimePolicy, null, 2)}`,
