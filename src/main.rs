@@ -327,7 +327,10 @@ async fn watch(config_path: PathBuf, config: Config, db: Database) -> Result<()>
              if idle && let Some(job)=db.next_queued_job()?{let fresh=Config::load(&config_path).unwrap_or_else(|_|config.clone());let worker_db=db.clone();worker=Some(tokio::spawn(async move{if let Err(e)=Pipeline::new(fresh,worker_db).run_job(job).await{tracing::error!(error=%e,"任务失败");}}));}
          },
          _=reconcile.tick()=>match monitor.reconcile_all().await{Ok(n)=>tracing::info!(added=n,"yt-dlp 校对完成"),Err(e)=>tracing::error!(error=%e,"yt-dlp 校对失败")},
-         _=backup_tick.tick()=>if let Err(e)=backup(&config,&db){tracing::error!(error=%e,"备份失败");},
+         _=backup_tick.tick()=>{
+             if let Err(e)=backup(&config,&db){tracing::error!(error=%e,"备份失败");}
+             if let Err(e)=db.prune_history(HISTORY_RETENTION_DAYS){tracing::error!(error=%e,"历史清理失败");}
+         },
          _=auth_tick.tick()=>if let Err(e)=check_auth(&config,&db).await{tracing::error!(error=%e,"认证检查失败");},
         }
     }
@@ -358,6 +361,8 @@ async fn check_auth(config: &Config, db: &Database) -> Result<()> {
     }
     Ok(())
 }
+
+const HISTORY_RETENTION_DAYS: i64 = 30;
 
 fn backup(config: &Config, db: &Database) -> Result<()> {
     let now = chrono::Utc::now();
