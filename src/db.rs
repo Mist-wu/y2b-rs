@@ -20,6 +20,11 @@ pub struct NewJob<'a> {
     pub transfer_mode: TransferMode,
 }
 
+/// jobs 表业务列清单，供所有按 id/video_id/队列查询复用。
+const JOB_COLUMNS: &str = "id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error";
+/// ai_calls 用量聚合列，供全局/按任务/按频道汇总复用。
+const AI_USAGE_SELECT: &str = "COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(cache_read_tokens),0),COALESCE(SUM(cache_write_tokens),0),COALESCE(SUM(total_tokens),0),SUM(cost)";
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -87,52 +92,34 @@ impl Database {
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
         INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, CURRENT_TIMESTAMP);
         "#)?;
-        let c = self.conn();
-        let mut columns = c.prepare("PRAGMA table_info(ai_calls)")?;
-        let names = columns
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(columns);
-        if !names.iter().any(|n| n == "input_json") {
-            c.execute("ALTER TABLE ai_calls ADD COLUMN input_json TEXT", [])?;
+        // v2: ai_calls 记录完整请求/响应 JSON，便于审计与排障。
+        for column in ["input_json", "output_json"] {
+            if !self.has_column("ai_calls", column)? {
+                self.conn()
+                    .execute(&format!("ALTER TABLE ai_calls ADD COLUMN {column} TEXT"), [])?;
+            }
         }
-        if !names.iter().any(|n| n == "output_json") {
-            c.execute("ALTER TABLE ai_calls ADD COLUMN output_json TEXT", [])?;
+        self.conn()
+            .execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)",[])?;
+        // v3: jobs 支持把翻译版追加到已投稿的原稿分P。
+        if !self.has_column("jobs", "append_to_bvid")? {
+            self.conn()
+                .execute("ALTER TABLE jobs ADD COLUMN append_to_bvid TEXT", [])?;
         }
-        c.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)",[])?;
-        let mut columns = c.prepare("PRAGMA table_info(jobs)")?;
-        let names = columns
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(columns);
-        if !names.iter().any(|n| n == "append_to_bvid") {
-            c.execute("ALTER TABLE jobs ADD COLUMN append_to_bvid TEXT", [])?;
+        self.conn()
+            .execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,CURRENT_TIMESTAMP)",[])?;
+        // v4: channels/jobs 记录转移模式（direct 或 translated）。
+        for table in ["channels", "jobs"] {
+            if !self.has_column(table, "transfer_mode")? {
+                self.conn().execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN transfer_mode TEXT NOT NULL DEFAULT 'translated'"),
+                    [],
+                )?;
+            }
         }
-        c.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,CURRENT_TIMESTAMP)",[])?;
-        let mut columns = c.prepare("PRAGMA table_info(channels)")?;
-        let channel_names = columns
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(columns);
-        if !channel_names.iter().any(|n| n == "transfer_mode") {
-            c.execute(
-                "ALTER TABLE channels ADD COLUMN transfer_mode TEXT NOT NULL DEFAULT 'translated'",
-                [],
-            )?;
-        }
-        let mut columns = c.prepare("PRAGMA table_info(jobs)")?;
-        let job_names = columns
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(columns);
-        if !job_names.iter().any(|n| n == "transfer_mode") {
-            c.execute(
-                "ALTER TABLE jobs ADD COLUMN transfer_mode TEXT NOT NULL DEFAULT 'translated'",
-                [],
-            )?;
-        }
-        c.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,CURRENT_TIMESTAMP)",[])?;
-        c.execute_batch(
+        self.conn()
+            .execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,CURRENT_TIMESTAMP)",[])?;
+        self.conn().execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS publication_metadata(
               job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
@@ -149,6 +136,16 @@ impl Database {
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().expect("database mutex poisoned")
+    }
+
+    /// 判断表是否已含某列（用于幂等迁移）。
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let c = self.conn();
+        let mut q = c.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = q
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(names.iter().any(|name| name == column))
     }
 
     pub fn integrity_check(&self) -> Result<String> {
@@ -261,22 +258,40 @@ impl Database {
         Ok((changed == 1).then_some(id))
     }
 
+    /// 按调用方给定的 WHERE 子句查询单条任务。
+    fn job_opt(&self, sql: &str, params: impl rusqlite::Params) -> Result<Option<Job>> {
+        self.conn()
+            .query_row(sql, params, job_from_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn get_job_by_video_id(&self, video_id: &str) -> Result<Option<Job>> {
-        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE video_id=?",[video_id],job_from_row).optional().map_err(Into::into)
+        self.job_opt(
+            &format!("SELECT {JOB_COLUMNS} FROM jobs WHERE video_id=?"),
+            [video_id],
+        )
     }
 
     pub fn get_job(&self, id: &str) -> Result<Option<Job>> {
-        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE id=?",[id],job_from_row).optional().map_err(Into::into)
+        self.job_opt(&format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id=?"), [id])
     }
     pub fn list_jobs(&self, limit: usize) -> Result<Vec<Job>> {
         let c = self.conn();
-        let mut q=c.prepare("SELECT id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs ORDER BY discovered_at DESC LIMIT ?")?;
+        let mut q = c.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs ORDER BY discovered_at DESC LIMIT ?"
+        ))?;
         Ok(q.query_map([limit as i64], job_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn next_queued_job(&self) -> Result<Option<Job>> {
         let retry_before = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
-        self.conn().query_row("SELECT id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error FROM jobs WHERE status='queued' OR (status='retry_wait' AND updated_at<=?) ORDER BY discovered_at LIMIT 1",[retry_before],job_from_row).optional().map_err(Into::into)
+        self.job_opt(
+            &format!(
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='queued' OR (status='retry_wait' AND updated_at<=?) ORDER BY discovered_at LIMIT 1"
+            ),
+            [retry_before],
+        )
     }
 
     pub fn recover_incomplete_jobs(&self) -> Result<usize> {
@@ -501,13 +516,13 @@ impl Database {
         Ok(())
     }
     pub fn ai_totals(&self) -> Result<AiUsage> {
-        self.conn().query_row("SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(cache_read_tokens),0),COALESCE(SUM(cache_write_tokens),0),COALESCE(SUM(total_tokens),0),SUM(cost) FROM ai_calls",[],|r|Ok(AiUsage{input:r.get(0)?,output:r.get(1)?,reasoning:r.get(2)?,cache_read:r.get(3)?,cache_write:r.get(4)?,total:r.get(5)?,cost:r.get(6)?})).map_err(Into::into)
+        self.conn().query_row(&format!("SELECT {AI_USAGE_SELECT} FROM ai_calls"), [], usage_from_row).map_err(Into::into)
     }
     pub fn ai_totals_for_job(&self, job_id: &str) -> Result<AiUsage> {
-        self.conn().query_row("SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(cache_read_tokens),0),COALESCE(SUM(cache_write_tokens),0),COALESCE(SUM(total_tokens),0),SUM(cost) FROM ai_calls WHERE job_id=?",[job_id],usage_from_row).map_err(Into::into)
+        self.conn().query_row(&format!("SELECT {AI_USAGE_SELECT} FROM ai_calls WHERE job_id=?"), [job_id], usage_from_row).map_err(Into::into)
     }
     pub fn ai_totals_for_channel(&self, channel_id: i64) -> Result<AiUsage> {
-        self.conn().query_row("SELECT COALESCE(SUM(a.input_tokens),0),COALESCE(SUM(a.output_tokens),0),COALESCE(SUM(a.reasoning_tokens),0),COALESCE(SUM(a.cache_read_tokens),0),COALESCE(SUM(a.cache_write_tokens),0),COALESCE(SUM(a.total_tokens),0),SUM(a.cost) FROM ai_calls a JOIN jobs j ON j.id=a.job_id WHERE j.channel_id=?",[channel_id],usage_from_row).map_err(Into::into)
+        self.conn().query_row(&format!("SELECT {AI_USAGE_SELECT} FROM ai_calls a JOIN jobs j ON j.id=a.job_id WHERE j.channel_id=?"), [channel_id], usage_from_row).map_err(Into::into)
     }
     pub fn ai_tokens_today(&self) -> Result<i64> {
         let day = Utc::now().format("%Y-%m-%d").to_string();
@@ -542,6 +557,17 @@ impl Database {
         }
         self.conn().backup(rusqlite::MAIN_DB, dest, None)?;
         Ok(())
+    }
+
+    /// 清理超过保留期的审计/事件/阶段记录，防止 state.db 无限增长。
+    /// 返回 (ai_calls, events, stage_runs) 各删除的行数。
+    pub fn prune_history(&self, keep_days: i64) -> Result<(usize, usize, usize)> {
+        let cutoff = (Utc::now() - chrono::Duration::days(keep_days)).to_rfc3339();
+        let c = self.conn();
+        let ai_calls = c.execute("DELETE FROM ai_calls WHERE created_at < ?", [&cutoff])?;
+        let events = c.execute("DELETE FROM events WHERE created_at < ?", [&cutoff])?;
+        let stage_runs = c.execute("DELETE FROM stage_runs WHERE started_at < ?", [&cutoff])?;
+        Ok((ai_calls, events, stage_runs))
     }
 }
 
@@ -923,5 +949,50 @@ mod tests {
         assert_eq!(job.status, JobStatus::Queued);
         assert_eq!(job.attempt, 0);
         assert!(job.error.is_none());
+    }
+
+    #[test]
+    fn prune_history_removes_only_rows_older_than_retention() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "prune-video",
+                url: "https://youtu.be/prune-video",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        let old = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+        let fresh = Utc::now().to_rfc3339();
+        for stamp in [&old, &fresh] {
+            db.conn()
+                .execute(
+                    "INSERT INTO ai_calls(job_id,task,provider,model,thinking,created_at) VALUES(?,?,?,?,?,?)",
+                    params![id, "t", "p", "m", "h", stamp],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO events(job_id,level,message,created_at) VALUES(?,?,?,?)",
+                    params![id, "info", "msg", stamp],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO stage_runs(job_id,stage,status,started_at) VALUES(?,?,?,?)",
+                    params![id, "s", "running", stamp],
+                )
+                .unwrap();
+        }
+
+        let (ai, events, stages) = db.prune_history(30).unwrap();
+        assert_eq!((ai, events, stages), (1, 1, 1));
+        let (ai2, events2, stages2) = db.prune_history(30).unwrap();
+        assert_eq!((ai2, events2, stages2), (0, 0, 0));
     }
 }
