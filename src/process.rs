@@ -32,15 +32,23 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
         stderr.read_to_end(&mut b).await.map(|_| b)
     });
     let started = Instant::now();
-    let mut peak = 0u64;
-    let mut ticker = tokio::time::interval(Duration::from_millis(500));
-    let status = loop {
-        tokio::select! {
-            _ = ticker.tick() => { peak=peak.max(process_tree_rss(pid)); }
-            status = child.wait() => break status?,
-            _ = tokio::time::sleep_until((tokio::time::Instant::now()+timeout).min(tokio::time::Instant::now()+timeout.saturating_sub(started.elapsed()))) => {
-                let _=child.kill().await; bail!("子进程超时: {}s",timeout.as_secs());
+    let mut sys = System::new();
+    let (status, peak) = match tokio::time::timeout(timeout, async {
+        let mut peak = 0u64;
+        let mut ticker = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => { peak = peak.max(process_tree_rss(pid, &mut sys)); }
+                status = child.wait() => return Ok::<(std::process::ExitStatus, u64), anyhow::Error>((status?, peak)),
             }
+        }
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!("子进程超时: {}s", timeout.as_secs());
         }
     };
     let out = stdout_task.await??;
@@ -62,15 +70,14 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
     })
 }
 
-fn process_tree_rss(root: u32) -> u64 {
-    let mut s = System::new();
-    s.refresh_processes(ProcessesToUpdate::All, true);
+fn process_tree_rss(root: u32, sys: &mut System) -> u64 {
     let root = Pid::from_u32(root);
+    sys.refresh_processes(ProcessesToUpdate::All, true);
     let mut wanted = HashSet::from([root]);
     let mut changed = true;
     while changed {
         changed = false;
-        for (p, proc_) in s.processes() {
+        for (p, proc_) in sys.processes() {
             if let Some(parent) = proc_.parent()
                 && wanted.contains(&parent)
                 && wanted.insert(*p)
@@ -81,7 +88,7 @@ fn process_tree_rss(root: u32) -> u64 {
     }
     wanted
         .into_iter()
-        .filter_map(|p| s.process(p))
+        .filter_map(|p| sys.process(p))
         .map(|p| p.memory() / 1024)
         .sum()
 }
