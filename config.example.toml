@@ -42,8 +42,10 @@ context_window_tokens = 256000
 safe_context_tokens = 200000
 segment_overlap_cues = 12
 translation_batch_cues = 50
-# Pi 翻译批次并发。2 GiB 服务器建议 2；每个 Pi 进程独立计入内存。
-translation_concurrency = 2
+# Pi 翻译批次并发。2 GiB 服务器实测 3 个 Luna 进程可用；继续受 systemd 内存上限保护。
+translation_concurrency = 3
+# 单批输出不是有效 JSON、索引校验失败或 Pi 调用失败时的额外重试次数。
+translation_batch_retries = 2
 # daily_token_limit = 1000000
 
 [[ai.allowed_models]]
@@ -68,7 +70,7 @@ fonts_dir = "/opt/y2b/fonts"
 font_cn = "Source Han Sans CN Medium"
 font_en = "Inter SemiBold"
 crf = 20
-preset = "veryfast"
+preset = "superfast"
 
 [storage]
 warn_free_gib = 10

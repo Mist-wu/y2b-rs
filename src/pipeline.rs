@@ -14,6 +14,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
+use tokio::time::sleep;
 
 pub struct Pipeline {
     pub config: Config,
@@ -330,20 +331,67 @@ impl Pipeline {
         meta: &VideoMetadata,
         work: &Path,
     ) -> Result<Option<PreparedSubtitle>> {
-        let Some(raw_sub) = self
-            .download_subtitle(&job.id, &job.url, &meta.id, work)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let mut cues = subtitle::parse_vtt(&raw_sub)?;
-        cues = self.segment(&job.id, &cues).await?;
         let segmented = work.join(format!("{}.en.segmented.json", meta.id));
-        subtitle::save_json(&cues, &segmented)?;
-        self.translate(&job.id, &mut cues).await?;
         let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
-        subtitle::save_json(&cues, &translated)?;
         let ass = work.join(format!("{}.bilingual.ass", meta.id));
+
+        let mut cues = match load_segmented_cache(&segmented) {
+            Ok(Some(cues)) => {
+                self.db.event(
+                    Some(&job.id),
+                    "info",
+                    &format!("复用分句缓存: {} cues", cues.len()),
+                )?;
+                cues
+            }
+            Ok(None) => {
+                let Some(raw_sub) = self
+                    .download_subtitle(&job.id, &job.url, &meta.id, work)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                let source = subtitle::parse_vtt(&raw_sub)?;
+                let cues = self.segment(&job.id, &source).await?;
+                subtitle::save_json(&cues, &segmented)?;
+                cues
+            }
+            Err(error) => {
+                self.db
+                    .event(Some(&job.id), "warn", &format!("忽略无效分句缓存: {error}"))?;
+                let Some(raw_sub) = self
+                    .download_subtitle(&job.id, &job.url, &meta.id, work)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                let source = subtitle::parse_vtt(&raw_sub)?;
+                let cues = self.segment(&job.id, &source).await?;
+                subtitle::save_json(&cues, &segmented)?;
+                cues
+            }
+        };
+
+        match load_translated_cache(&translated, &cues) {
+            Ok(Some(cached)) => {
+                self.db.event(
+                    Some(&job.id),
+                    "info",
+                    &format!("复用翻译缓存: {} cues", cached.len()),
+                )?;
+                cues = cached;
+            }
+            Ok(None) => {
+                self.translate(&job.id, &mut cues).await?;
+                subtitle::save_json(&cues, &translated)?;
+            }
+            Err(error) => {
+                self.db
+                    .event(Some(&job.id), "warn", &format!("忽略无效翻译缓存: {error}"))?;
+                self.translate(&job.id, &mut cues).await?;
+                subtitle::save_json(&cues, &translated)?;
+            }
+        }
         subtitle::write_ass(
             &cues,
             &ass,
@@ -673,41 +721,7 @@ impl Pipeline {
         let results = stream::iter(batches.iter().copied())
             .map(|(start, end)| {
                 let chunk = &source_cues[start..end];
-                async move {
-                    let items = chunk
-                        .iter()
-                        .enumerate()
-                        .map(|(i, cue)| json!({"i":i,"text":cue.source}))
-                        .collect::<Vec<_>>();
-                    let payload = json!({
-                        "task":"translate",
-                        "source_lang":self.config.translation.source_lang,
-                        "target_lang":self.config.translation.target_lang,
-                        "items":items
-                    });
-                    let input_json = payload.to_string();
-                    let r = self.call_pi(payload).await?;
-                    let local = parse_translations(&r.value)?;
-                    validate_translation_indexes(chunk.len(), &local)?;
-                    self.db.record_ai_call(
-                        job_id,
-                        stage,
-                        "translate",
-                        &self.config.ai.provider,
-                        &self.config.ai.model,
-                        &self.config.ai.thinking,
-                        &r.usage,
-                        r.output.duration_ms,
-                        &input_json,
-                        &r.value.to_string(),
-                    )?;
-                    Ok::<_, anyhow::Error>((
-                        start,
-                        local,
-                        r.output.duration_ms,
-                        r.output.peak_rss_kib,
-                    ))
-                }
+                self.translate_batch_with_retry(job_id, stage, start, chunk)
             })
             .buffer_unordered(concurrency)
             .try_collect::<Vec<_>>()
@@ -751,6 +765,86 @@ impl Pipeline {
             )),
         )?;
         Ok(())
+    }
+
+    async fn translate_batch_with_retry(
+        &self,
+        job_id: &str,
+        stage: i64,
+        start: usize,
+        chunk: &[Cue],
+    ) -> Result<(usize, Vec<(usize, String)>, i64, u64)> {
+        let items = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, cue)| json!({"i":i,"text":cue.source}))
+            .collect::<Vec<_>>();
+        let payload = json!({
+            "task":"translate",
+            "source_lang":self.config.translation.source_lang,
+            "target_lang":self.config.translation.target_lang,
+            "items":items
+        });
+        let input_json = payload.to_string();
+        let attempts = self.config.ai.translation_batch_retries.saturating_add(1);
+        let mut aggregate_duration_ms = 0;
+        let mut peak_rss_kib = 0;
+        let mut last_error = None;
+
+        for attempt in 1..=attempts {
+            match self.call_pi(payload.clone()).await {
+                Ok(result) => {
+                    aggregate_duration_ms += result.output.duration_ms;
+                    peak_rss_kib = peak_rss_kib.max(result.output.peak_rss_kib);
+                    self.db.record_ai_call(
+                        job_id,
+                        stage,
+                        "translate",
+                        &self.config.ai.provider,
+                        &self.config.ai.model,
+                        &self.config.ai.thinking,
+                        &result.usage,
+                        result.output.duration_ms,
+                        &input_json,
+                        &result.value.to_string(),
+                    )?;
+                    match parse_translations(&result.value).and_then(|translations| {
+                        validate_translation_indexes(chunk.len(), &translations)?;
+                        Ok(translations)
+                    }) {
+                        Ok(translations) => {
+                            return Ok((start, translations, aggregate_duration_ms, peak_rss_kib));
+                        }
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                Err(error) => last_error = Some(error),
+            }
+
+            let error = last_error
+                .as_ref()
+                .expect("translation retry must retain the preceding error");
+            self.db.event(
+                Some(job_id),
+                if attempt < attempts { "warn" } else { "error" },
+                &format!(
+                    "翻译批次 {}..{} 第 {attempt}/{attempts} 次失败: {error}",
+                    start,
+                    start + chunk.len()
+                ),
+            )?;
+            if attempt < attempts {
+                sleep(Duration::from_secs(attempt.min(5) as u64)).await;
+            }
+        }
+
+        Err(last_error
+            .expect("translation retry loop must run at least once")
+            .context(format!(
+                "翻译批次 {}..{} 在 {attempts} 次尝试后失败",
+                start,
+                start + chunk.len()
+            )))
     }
 
     fn ai_token_budget(&self) -> Result<usize> {
@@ -1696,6 +1790,66 @@ fn validate_translation_indexes(len: usize, translations: &[(usize, String)]) ->
     Ok(())
 }
 
+fn load_segmented_cache(path: &Path) -> Result<Option<Vec<Cue>>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut cues = subtitle::load_json(path).with_context(|| format!("读取 {}", path.display()))?;
+    validate_cached_cues(&cues)?;
+    for cue in &mut cues {
+        cue.translation = None;
+    }
+    Ok(Some(cues))
+}
+
+fn load_translated_cache(path: &Path, source: &[Cue]) -> Result<Option<Vec<Cue>>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let cues = subtitle::load_json(path).with_context(|| format!("读取 {}", path.display()))?;
+    validate_cached_cues(&cues)?;
+    if cues.len() != source.len() {
+        bail!("翻译缓存数量不匹配: {}/{}", cues.len(), source.len())
+    }
+    for (index, (cached, original)) in cues.iter().zip(source).enumerate() {
+        if cached.source != original.source
+            || (cached.start - original.start).abs() > 0.001
+            || (cached.end - original.end).abs() > 0.001
+        {
+            bail!("翻译缓存第 {index} 条与分句缓存不匹配")
+        }
+        let Some(translation) = cached.translation.as_deref() else {
+            bail!("翻译缓存第 {index} 条缺少译文")
+        };
+        if translation.trim().is_empty() && cached.source.chars().any(char::is_alphanumeric) {
+            bail!("翻译缓存第 {index} 条译文为空")
+        }
+        if translation.chars().any(|ch| ch.is_control() && ch != '\n') {
+            bail!("翻译缓存第 {index} 条含非法控制字符")
+        }
+    }
+    Ok(Some(cues))
+}
+
+fn validate_cached_cues(cues: &[Cue]) -> Result<()> {
+    if cues.is_empty() {
+        bail!("字幕缓存为空")
+    }
+    for (index, cue) in cues.iter().enumerate() {
+        if !cue.start.is_finite() || !cue.end.is_finite() || cue.start < 0.0 || cue.end <= cue.start
+        {
+            bail!("字幕缓存第 {index} 条时间无效")
+        }
+        if cue.source.trim().is_empty() {
+            bail!("字幕缓存第 {index} 条原文为空")
+        }
+        if index > 0 && cue.start + 0.001 < cues[index - 1].start {
+            bail!("字幕缓存第 {index} 条开始时间早于前一条")
+        }
+    }
+    Ok(())
+}
+
 fn choose_adaptive_boundary(
     local: &[(usize, usize)],
     window_start: usize,
@@ -1956,6 +2110,20 @@ mod tests {
         validate_translation_indexes(2, &valid).unwrap();
         let duplicate = vec![(0, "甲".into()), (0, "乙".into())];
         assert!(validate_translation_indexes(2, &duplicate).is_err());
+    }
+
+    #[test]
+    fn cached_cues_require_valid_timeline_and_source() {
+        let valid = vec![cue(0, "hello"), cue(1, "world")];
+        validate_cached_cues(&valid).unwrap();
+
+        let mut invalid_time = valid.clone();
+        invalid_time[1].start = f64::NAN;
+        assert!(validate_cached_cues(&invalid_time).is_err());
+
+        let mut invalid_source = valid;
+        invalid_source[0].source.clear();
+        assert!(validate_cached_cues(&invalid_source).is_err());
     }
 
     #[test]
