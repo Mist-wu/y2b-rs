@@ -31,25 +31,46 @@ pub struct BaselineItem {
     pub sha256: Option<String>,
 }
 
+/// 依赖工具清单：名称、可执行路径、版本探测参数。
+/// `run` 与 `write_baseline` 共用，保证两边检测一致。
+fn tool_checks(config: &Config) -> [(&'static str, PathBuf, Vec<&'static str>); 5] {
+    [
+        ("pi", PathBuf::from(&config.ai.pi), vec!["--version"]),
+        (
+            "yt-dlp",
+            PathBuf::from(&config.youtube.yt_dlp),
+            vec!["--version"],
+        ),
+        (
+            "ffmpeg",
+            PathBuf::from(&config.render.ffmpeg),
+            vec!["-version"],
+        ),
+        (
+            "ffprobe",
+            PathBuf::from(&config.render.ffprobe),
+            vec!["-version"],
+        ),
+        (
+            "biliup",
+            PathBuf::from(&config.bilibili.biliup),
+            vec!["--version"],
+        ),
+    ]
+}
+
 pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
     let mut out = Vec::new();
-    for (name, path, args) in [
-        ("pi", &config.ai.pi, vec!["--version"]),
-        ("yt-dlp", &config.youtube.yt_dlp, vec!["--version"]),
-        ("ffmpeg", &config.render.ffmpeg, vec!["-version"]),
-        ("ffprobe", &config.render.ffprobe, vec!["-version"]),
-        ("biliup", &config.bilibili.biliup, vec!["--version"]),
-    ] {
-        let p = Path::new(path);
-        if !p.exists() {
+    for (name, path, args) in tool_checks(config) {
+        if !path.exists() {
             out.push(CheckItem {
                 name: name.into(),
                 ok: false,
-                detail: format!("未找到 {path}"),
+                detail: format!("未找到 {}", path.display()),
             });
             continue;
         }
-        let mut c = Command::new(path);
+        let mut c = Command::new(&path);
         c.args(args);
         match run_monitored(c, Duration::from_secs(20)).await {
             Ok(r) => out.push(CheckItem {
@@ -191,24 +212,11 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
 
 pub async fn write_baseline(config: &Config, dest: &Path) -> Result<Baseline> {
     let mut items = Vec::new();
-    for (name, path, args) in [
-        ("pi", PathBuf::from(&config.ai.pi), vec!["--version"]),
-        (
-            "yt-dlp",
-            PathBuf::from(&config.youtube.yt_dlp),
-            vec!["--version"],
-        ),
-        (
-            "ffmpeg",
-            PathBuf::from(&config.render.ffmpeg),
-            vec!["-version"],
-        ),
-        (
-            "biliup",
-            PathBuf::from(&config.bilibili.biliup),
-            vec!["--version"],
-        ),
-    ] {
+    // 基线只记录会被二进制更新影响的工具，ffprobe 由 run() 检查但不入基线。
+    for (name, path, args) in tool_checks(config)
+        .into_iter()
+        .filter(|(name, _, _)| *name != "ffprobe")
+    {
         if !path.exists() {
             continue;
         }
