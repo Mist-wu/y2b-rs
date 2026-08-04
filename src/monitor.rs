@@ -65,19 +65,18 @@ fn validate_single_video(v: &Value) -> Result<()> {
 fn extract_thumbnail_url(v: &Value) -> Option<String> {
     let thumbnails = v.get("thumbnails").and_then(Value::as_array);
     // 优先选带尺寸的项里面积最大者（yt-dlp 通常把最高清缩略图列在首位）。
-    let best_sized = thumbnails
-        .and_then(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    let url = item.get("url")?.as_str()?;
-                    let width = item.get("width")?.as_u64()?;
-                    let height = item.get("height")?.as_u64()?;
-                    Some((width.saturating_mul(height), url))
-                })
-                .max_by_key(|(area, _)| *area)
-                .map(|(_, url)| url.to_string())
-        });
+    let best_sized = thumbnails.and_then(|items| {
+        items
+            .iter()
+            .filter_map(|item| {
+                let url = item.get("url")?.as_str()?;
+                let width = item.get("width")?.as_u64()?;
+                let height = item.get("height")?.as_u64()?;
+                Some((width.saturating_mul(height), url))
+            })
+            .max_by_key(|(area, _)| *area)
+            .map(|(_, url)| url.to_string())
+    });
     if let Some(url) = best_sized {
         return Some(url);
     }
@@ -87,10 +86,9 @@ fn extract_thumbnail_url(v: &Value) -> Option<String> {
         .map(str::to_string)
         .or_else(|| {
             thumbnails?
-                .last()
-                .and_then(|item| item.get("url"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
+                .iter()
+                .rev()
+                .find_map(|item| item.get("url")?.as_str().map(str::to_string))
         })
 }
 
@@ -345,7 +343,12 @@ impl Monitor {
 
     pub async fn fetch_metadata(&self, url: &str) -> Result<(VideoMetadata, u64, i64)> {
         let mut cmd = ytdlp_command(&self.config.youtube);
-        cmd.args(["--dump-single-json", "--skip-download", "--no-playlist", url]);
+        cmd.args([
+            "--dump-single-json",
+            "--skip-download",
+            "--no-playlist",
+            url,
+        ]);
         let out = run_monitored(cmd, Duration::from_secs(120)).await?;
         let v: Value = serde_json::from_str(out.stdout.trim())?;
         validate_single_video(&v)?;
@@ -460,7 +463,8 @@ mod tests {
             extract_thumbnail_url(&serde_json::json!({
                 "thumbnails": [
                     {"url": "https://i.ytimg.com/small.jpg"},
-                    {"url": "https://i.ytimg.com/best.jpg"}
+                    {"url": "https://i.ytimg.com/best.jpg"},
+                    {"width": 1920, "height": 1080}
                 ]
             }))
             .as_deref(),
