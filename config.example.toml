@@ -26,6 +26,9 @@ cookies = "/var/lib/y2b/bilibili_cookies.json"
 default_tid = 172
 default_tags = ["荒野乱斗"]
 max_parts = 199
+# 新投稿之间至少间隔 1 小时；B站返回 21566 后全局冷却 6 小时。
+submit_interval_seconds = 3600
+rate_limit_cooldown_seconds = 21600
 
 [ai]
 pi = "/usr/local/bin/pi"

@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::sleep;
 
+const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
+
 pub struct Pipeline {
     pub config: Config,
     pub db: Database,
@@ -54,11 +56,12 @@ impl Pipeline {
                 Some(JobStatus::Uploading | JobStatus::Appending)
             );
             let rate_limited = e.to_string().contains("21566");
-            let status = if live_pending {
+            if rate_limited {
+                self.defer_bilibili_submissions(self.config.bilibili.rate_limit_cooldown_seconds)?;
+            }
+            let status = if live_pending || rate_limited {
                 JobStatus::RetryWait
-            } else if rate_limited
-                || (upload_failure && attempt >= self.config.monitor.max_attempts as i64)
-            {
+            } else if upload_failure && attempt >= self.config.monitor.max_attempts as i64 {
                 JobStatus::Paused
             } else if attempt >= self.config.monitor.max_attempts as i64 {
                 self.cleanup_large(&job.id).ok();
@@ -1143,6 +1146,7 @@ impl Pipeline {
         mode: TransferMode,
         cover: Option<&Path>,
     ) -> Result<String> {
+        self.wait_for_bilibili_submission(job_id).await?;
         self.db
             .update_job_status(job_id, JobStatus::Uploading, None)?;
         let stage = self.db.start_stage(job_id, "upload", None, None, None)?;
@@ -1185,7 +1189,46 @@ impl Pipeline {
             out.peak_rss_kib,
             Some(&bvid),
         )?;
+        self.defer_bilibili_submissions(self.config.bilibili.submit_interval_seconds)?;
         Ok(bvid)
+    }
+
+    async fn wait_for_bilibili_submission(&self, job_id: &str) -> Result<()> {
+        let Some(value) = self.db.get_setting(NEXT_BILIBILI_SUBMIT_AT)? else {
+            return Ok(());
+        };
+        let not_before = DateTime::parse_from_rfc3339(&value)
+            .with_context(|| format!("投稿冷却时间无效: {value}"))?
+            .with_timezone(&Utc);
+        let Ok(wait) = (not_before - Utc::now()).to_std() else {
+            return Ok(());
+        };
+        if wait.is_zero() {
+            return Ok(());
+        }
+        self.db.event(
+            Some(job_id),
+            "info",
+            &format!(
+                "等待 Bilibili 投稿窗口至 {}（约 {} 分钟）",
+                not_before.to_rfc3339(),
+                wait.as_secs().div_ceil(60)
+            ),
+        )?;
+        sleep(wait).await;
+        Ok(())
+    }
+
+    fn defer_bilibili_submissions(&self, seconds: u64) -> Result<()> {
+        if seconds == 0 {
+            return Ok(());
+        }
+        let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+        let not_before = Utc::now()
+            .checked_add_signed(chrono::Duration::seconds(seconds))
+            .context("Bilibili 投稿冷却时间溢出")?;
+        self.db
+            .set_setting(NEXT_BILIBILI_SUBMIT_AT, &not_before.to_rfc3339())
     }
     async fn append(&self, job_id: &str, video: &Path, bvid: &str) -> Result<()> {
         if let Some(parts) = self.bilibili_part_count(bvid).await?
@@ -1429,18 +1472,18 @@ fn uniform_sample_indices(len: usize, count: usize) -> Vec<usize> {
 }
 
 fn parse_publication_metadata(value: &Value) -> Result<PublicationMetadata> {
-    let title = value
-        .get("title")
-        .and_then(Value::as_str)
-        .context("Pi 投稿元数据缺少字符串 title")?
-        .trim()
-        .to_string();
-    let dynamic = value
-        .get("dynamic")
-        .and_then(Value::as_str)
-        .context("Pi 投稿元数据缺少字符串 dynamic")?
-        .trim()
-        .to_string();
+    let title = sanitize_publication_text(
+        value
+            .get("title")
+            .and_then(Value::as_str)
+            .context("Pi 投稿元数据缺少字符串 title")?,
+    );
+    let dynamic = sanitize_publication_text(
+        value
+            .get("dynamic")
+            .and_then(Value::as_str)
+            .context("Pi 投稿元数据缺少字符串 dynamic")?,
+    );
     let raw_tags = value
         .get("tags")
         .and_then(Value::as_array)
@@ -1539,6 +1582,15 @@ fn chinese_width(text: &str) -> usize {
 fn is_emoji(ch: char) -> bool {
     matches!(ch as u32,
         0x1F000..=0x1FAFF | 0x2600..=0x26FF | 0x2700..=0x27BF | 0xFE00..=0xFE0F)
+}
+
+fn sanitize_publication_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !is_emoji(*ch) && !matches!(*ch, '\u{200D}' | '\u{20E3}'))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn sanitize_tags(raw: &[String]) -> Vec<String> {
@@ -2192,6 +2244,18 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn publication_metadata_removes_emoji_from_text_fields() {
+        let parsed = parse_publication_metadata(&json!({
+            "title": "新英雄登场 💀🔥",
+            "dynamic": "本期展示冠军对局。🏆",
+            "tags": ["荒野乱斗"]
+        }))
+        .unwrap();
+        assert_eq!(parsed.title, "新英雄登场");
+        assert_eq!(parsed.dynamic, "本期展示冠军对局。");
     }
 
     #[test]

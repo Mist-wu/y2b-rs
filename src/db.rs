@@ -428,6 +428,17 @@ impl Database {
             .query_row("SELECT attempt FROM jobs WHERE id=?", [id], |r| r.get(0))?)
     }
 
+    pub fn retry_job(&self, id: &str) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE jobs SET status='queued',attempt=0,error=NULL,updated_at=? WHERE id=?",
+            params![Utc::now().to_rfc3339(), id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("任务不存在: {id}")
+        }
+        Ok(())
+    }
+
     pub fn start_stage(
         &self,
         job_id: &str,
@@ -822,5 +833,32 @@ mod tests {
             .execute("UPDATE jobs SET updated_at=? WHERE id=?", params![old, id])
             .unwrap();
         assert_eq!(db.next_queued_job().unwrap().unwrap().id, id);
+    }
+
+    #[test]
+    fn retry_job_resets_attempts_and_error() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "retry-video",
+                url: "https://youtu.be/retry-video",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        db.increment_attempt(&id).unwrap();
+        db.update_job_status(&id, JobStatus::DeadLetter, Some("failed"))
+            .unwrap();
+
+        db.retry_job(&id).unwrap();
+        let job = db.get_job(&id).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Queued);
+        assert_eq!(job.attempt, 0);
+        assert!(job.error.is_none());
     }
 }

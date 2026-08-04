@@ -252,7 +252,7 @@ async fn main() -> Result<()> {
                     db.queue_subtitle_recheck(&id)?;
                     println!("已排队补字幕并将追加到原稿 {id}");
                 } else {
-                    db.update_job_status(&id, JobStatus::Queued, None)?;
+                    db.retry_job(&id)?;
                     println!("已重新排队 {id}");
                 }
             }
