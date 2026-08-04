@@ -33,24 +33,28 @@ pub enum TransferMode {
     Translated,
 }
 
-impl Display for TransferMode {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            serde_json::to_value(self).unwrap().as_str().unwrap()
-        )
-    }
+macro_rules! serde_enum_display_fromstr {
+    ($ty:ty) => {
+        impl Display for $ty {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "{}",
+                    serde_json::to_value(self).unwrap().as_str().unwrap()
+                )
+            }
+        }
+        impl FromStr for $ty {
+            type Err = anyhow::Error;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Ok(serde_json::from_value(serde_json::Value::String(
+                    s.to_owned(),
+                ))?)
+            }
+        }
+    };
 }
-
-impl FromStr for TransferMode {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(serde_json::from_value(serde_json::Value::String(
-            s.to_owned(),
-        ))?)
-    }
-}
+serde_enum_display_fromstr!(TransferMode);
 
 impl JobStatus {
     pub fn is_terminal(self) -> bool {
@@ -58,24 +62,7 @@ impl JobStatus {
     }
 }
 
-impl Display for JobStatus {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            serde_json::to_value(self).unwrap().as_str().unwrap()
-        )
-    }
-}
-
-impl FromStr for JobStatus {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(serde_json::from_value(serde_json::Value::String(
-            s.to_owned(),
-        ))?)
-    }
-}
+serde_enum_display_fromstr!(JobStatus);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
@@ -170,6 +157,10 @@ pub struct VideoMetadata {
     pub live_status: Option<String>,
 }
 
+/// 2024-10-30 起 YouTube 将 Shorts 时长上限从 60 秒提升到 180 秒。
+/// 发布时间早于该时间戳的视频按旧规则（60 秒）判定，之后按新规则。
+const SHORTS_DURATION_60S_CUTOFF: i64 = 1_728_950_400;
+
 impl VideoMetadata {
     pub fn is_short(&self) -> bool {
         let vertical_or_square = matches!((self.width, self.height), (Some(w), Some(h)) if h >= w);
@@ -178,7 +169,7 @@ impl VideoMetadata {
                 .webpage_url
                 .as_deref()
                 .is_some_and(|u| u.contains("/shorts/"));
-        let max_duration = if self.timestamp.is_some_and(|ts| ts < 1_728_950_400) {
+        let max_duration = if self.timestamp.is_some_and(|ts| ts < SHORTS_DURATION_60S_CUTOFF) {
             60.0
         } else {
             180.0
