@@ -24,6 +24,8 @@ pub struct NewJob<'a> {
 const JOB_COLUMNS: &str = "id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error";
 /// ai_calls 用量聚合列，供全局/按任务/按频道汇总复用。
 const AI_USAGE_SELECT: &str = "COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(cache_read_tokens),0),COALESCE(SUM(cache_write_tokens),0),COALESCE(SUM(total_tokens),0),SUM(cost)";
+/// 原始调用与已归档汇总的统一用量数据源。
+const AI_USAGE_ROWS: &str = "(SELECT job_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost FROM ai_calls UNION ALL SELECT job_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost FROM ai_usage_rollups) usage";
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -95,8 +97,10 @@ impl Database {
         // v2: ai_calls 记录完整请求/响应 JSON，便于审计与排障。
         for column in ["input_json", "output_json"] {
             if !self.has_column("ai_calls", column)? {
-                self.conn()
-                    .execute(&format!("ALTER TABLE ai_calls ADD COLUMN {column} TEXT"), [])?;
+                self.conn().execute(
+                    &format!("ALTER TABLE ai_calls ADD COLUMN {column} TEXT"),
+                    [],
+                )?;
             }
         }
         self.conn()
@@ -129,6 +133,19 @@ impl Database {
             );
             INSERT OR IGNORE INTO schema_migrations(version,applied_at)
               VALUES(5,CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS ai_usage_rollups(
+              job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+              input_tokens INTEGER NOT NULL DEFAULT 0,
+              output_tokens INTEGER NOT NULL DEFAULT 0,
+              reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+              cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+              cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+              total_tokens INTEGER NOT NULL DEFAULT 0,
+              cost REAL,
+              updated_at TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO schema_migrations(version,applied_at)
+              VALUES(6,CURRENT_TIMESTAMP);
             "#,
         )?;
         Ok(())
@@ -516,13 +533,25 @@ impl Database {
         Ok(())
     }
     pub fn ai_totals(&self) -> Result<AiUsage> {
-        self.conn().query_row(&format!("SELECT {AI_USAGE_SELECT} FROM ai_calls"), [], usage_from_row).map_err(Into::into)
+        self.conn()
+            .query_row(
+                &format!("SELECT {AI_USAGE_SELECT} FROM {AI_USAGE_ROWS}"),
+                [],
+                usage_from_row,
+            )
+            .map_err(Into::into)
     }
     pub fn ai_totals_for_job(&self, job_id: &str) -> Result<AiUsage> {
-        self.conn().query_row(&format!("SELECT {AI_USAGE_SELECT} FROM ai_calls WHERE job_id=?"), [job_id], usage_from_row).map_err(Into::into)
+        self.conn()
+            .query_row(
+                &format!("SELECT {AI_USAGE_SELECT} FROM {AI_USAGE_ROWS} WHERE job_id=?"),
+                [job_id],
+                usage_from_row,
+            )
+            .map_err(Into::into)
     }
     pub fn ai_totals_for_channel(&self, channel_id: i64) -> Result<AiUsage> {
-        self.conn().query_row(&format!("SELECT {AI_USAGE_SELECT} FROM ai_calls a JOIN jobs j ON j.id=a.job_id WHERE j.channel_id=?"), [channel_id], usage_from_row).map_err(Into::into)
+        self.conn().query_row(&format!("SELECT {AI_USAGE_SELECT} FROM {AI_USAGE_ROWS} JOIN jobs j ON j.id=usage.job_id WHERE j.channel_id=?"), [channel_id], usage_from_row).map_err(Into::into)
     }
     pub fn ai_tokens_today(&self) -> Result<i64> {
         let day = Utc::now().format("%Y-%m-%d").to_string();
@@ -563,10 +592,39 @@ impl Database {
     /// 返回 (ai_calls, events, stage_runs) 各删除的行数。
     pub fn prune_history(&self, keep_days: i64) -> Result<(usize, usize, usize)> {
         let cutoff = (Utc::now() - chrono::Duration::days(keep_days)).to_rfc3339();
-        let c = self.conn();
-        let ai_calls = c.execute("DELETE FROM ai_calls WHERE created_at < ?", [&cutoff])?;
-        let events = c.execute("DELETE FROM events WHERE created_at < ?", [&cutoff])?;
-        let stage_runs = c.execute("DELETE FROM stage_runs WHERE started_at < ?", [&cutoff])?;
+        let now = Utc::now().to_rfc3339();
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        tx.execute(
+            r#"
+            INSERT INTO ai_usage_rollups(
+              job_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,
+              cache_write_tokens,total_tokens,cost,updated_at
+            )
+            SELECT job_id,COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),
+              COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(cache_read_tokens),0),
+              COALESCE(SUM(cache_write_tokens),0),COALESCE(SUM(total_tokens),0),SUM(cost),?
+            FROM ai_calls WHERE created_at < ? GROUP BY job_id
+            ON CONFLICT(job_id) DO UPDATE SET
+              input_tokens=ai_usage_rollups.input_tokens+excluded.input_tokens,
+              output_tokens=ai_usage_rollups.output_tokens+excluded.output_tokens,
+              reasoning_tokens=ai_usage_rollups.reasoning_tokens+excluded.reasoning_tokens,
+              cache_read_tokens=ai_usage_rollups.cache_read_tokens+excluded.cache_read_tokens,
+              cache_write_tokens=ai_usage_rollups.cache_write_tokens+excluded.cache_write_tokens,
+              total_tokens=ai_usage_rollups.total_tokens+excluded.total_tokens,
+              cost=CASE
+                WHEN ai_usage_rollups.cost IS NULL THEN excluded.cost
+                WHEN excluded.cost IS NULL THEN ai_usage_rollups.cost
+                ELSE ai_usage_rollups.cost+excluded.cost
+              END,
+              updated_at=excluded.updated_at
+            "#,
+            params![now, cutoff],
+        )?;
+        let ai_calls = tx.execute("DELETE FROM ai_calls WHERE created_at < ?", [&cutoff])?;
+        let events = tx.execute("DELETE FROM events WHERE created_at < ?", [&cutoff])?;
+        let stage_runs = tx.execute("DELETE FROM stage_runs WHERE started_at < ?", [&cutoff])?;
+        tx.commit()?;
         Ok((ai_calls, events, stage_runs))
     }
 }
@@ -667,7 +725,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
         assert_eq!(
             db.list_channels().unwrap()[0].transfer_mode,
             TransferMode::Translated
@@ -683,7 +741,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
         assert!(
             db.create_job(NewJob {
                 channel_id: None,
@@ -955,9 +1013,18 @@ mod tests {
     fn prune_history_removes_only_rows_older_than_retention() {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
+        let channel_id = db
+            .add_channel(
+                "UC-prune",
+                "prune",
+                "https://youtube.com/@prune/videos",
+                "https://youtube.com/feeds/videos.xml?channel_id=UC-prune",
+                TransferMode::Translated,
+            )
+            .unwrap();
         let id = db
             .create_job(NewJob {
-                channel_id: None,
+                channel_id: Some(channel_id),
                 video_id: "prune-video",
                 url: "https://youtu.be/prune-video",
                 title: None,
@@ -969,11 +1036,13 @@ mod tests {
             .unwrap();
         let old = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
         let fresh = Utc::now().to_rfc3339();
-        for stamp in [&old, &fresh] {
+        for (stamp, input_tokens, total_tokens, cost) in
+            [(&old, 10, 12, Some(0.25)), (&fresh, 20, 24, None)]
+        {
             db.conn()
                 .execute(
-                    "INSERT INTO ai_calls(job_id,task,provider,model,thinking,created_at) VALUES(?,?,?,?,?,?)",
-                    params![id, "t", "p", "m", "h", stamp],
+                    "INSERT INTO ai_calls(job_id,task,provider,model,thinking,input_tokens,total_tokens,cost,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    params![id, "t", "p", "m", "h", input_tokens, total_tokens, cost, stamp],
                 )
                 .unwrap();
             db.conn()
@@ -990,9 +1059,26 @@ mod tests {
                 .unwrap();
         }
 
+        let before = db.ai_totals().unwrap();
+        assert_eq!(before.input, 30);
+        assert_eq!(before.total, 36);
+        assert_eq!(before.cost, Some(0.25));
         let (ai, events, stages) = db.prune_history(30).unwrap();
         assert_eq!((ai, events, stages), (1, 1, 1));
+        for usage in [
+            db.ai_totals().unwrap(),
+            db.ai_totals_for_job(&id).unwrap(),
+            db.ai_totals_for_channel(channel_id).unwrap(),
+        ] {
+            assert_eq!(usage.input, before.input);
+            assert_eq!(usage.total, before.total);
+            assert_eq!(usage.cost, before.cost);
+        }
         let (ai2, events2, stages2) = db.prune_history(30).unwrap();
         assert_eq!((ai2, events2, stages2), (0, 0, 0));
+        let after_second_prune = db.ai_totals().unwrap();
+        assert_eq!(after_second_prune.input, before.input);
+        assert_eq!(after_second_prune.total, before.total);
+        assert_eq!(after_second_prune.cost, before.cost);
     }
 }
