@@ -213,7 +213,7 @@ impl Default for AiConfig {
             safe_context_tokens: 200_000,
             segment_overlap_cues: 12,
             translation_batch_cues: 50,
-            translation_concurrency: 3,
+            translation_concurrency: 4,
             translation_batch_retries: 2,
             daily_token_limit: None,
         }
@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(adaptive.context_window_tokens, 256_000);
         assert_eq!(adaptive.safe_context_tokens, 200_000);
         assert_eq!(adaptive.translation_batch_cues, 50);
-        assert_eq!(adaptive.translation_concurrency, 3);
+        assert_eq!(adaptive.translation_concurrency, 4);
         assert_eq!(adaptive.translation_batch_retries, 2);
 
         let legacy: AiConfig = toml::from_str("batch_size = 25").unwrap();

@@ -45,8 +45,8 @@ context_window_tokens = 256000
 safe_context_tokens = 200000
 segment_overlap_cues = 12
 translation_batch_cues = 50
-# Pi 翻译批次并发。2 GiB 服务器实测 3 个 Luna 进程可用；继续受 systemd 内存上限保护。
-translation_concurrency = 3
+# Pi 翻译批次并发。2 GiB 服务器实测 3 路仅约 320–380 MiB，默认提高到 4；继续受 systemd 内存上限保护。
+translation_concurrency = 4
 # 单批输出不是有效 JSON、索引校验失败或 Pi 调用失败时的额外重试次数。
 translation_batch_retries = 2
 # daily_token_limit = 1000000
