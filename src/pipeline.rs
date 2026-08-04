@@ -1,7 +1,7 @@
 use crate::config::{BatchMode, Config};
 use crate::db::Database;
 use crate::model::{AiUsage, Job, JobStatus, PublicationMetadata, TransferMode, VideoMetadata};
-use crate::monitor::{Monitor, is_live_content_pending};
+use crate::monitor::{Monitor, is_live_content_pending, ytdlp_command};
 use crate::process::{ProcessOutput, run_monitored};
 use crate::subtitle::{self, Cue};
 use anyhow::{Context, Result, bail};
@@ -366,40 +366,32 @@ impl Pipeline {
         let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
         let ass = work.join(format!("{}.bilingual.ass", meta.id));
 
-        let mut cues = match load_segmented_cache(&segmented) {
+        let cached = match load_segmented_cache(&segmented) {
             Ok(Some(cues)) => {
                 self.db.event(
                     Some(&job.id),
                     "info",
                     &format!("复用分句缓存: {} cues", cues.len()),
                 )?;
-                cues
+                Some(cues)
             }
-            Ok(None) => {
-                let Some(raw_sub) = self
-                    .download_subtitle(&job.id, &job.url, &meta.id, work)
-                    .await?
-                else {
-                    return Ok(None);
-                };
-                let source = subtitle::parse_vtt(&raw_sub)?;
-                let cues = self.segment(&job.id, &source).await?;
-                subtitle::save_json(&cues, &segmented)?;
-                cues
-            }
+            Ok(None) => None,
             Err(error) => {
                 self.db
                     .event(Some(&job.id), "warn", &format!("忽略无效分句缓存: {error}"))?;
-                let Some(raw_sub) = self
-                    .download_subtitle(&job.id, &job.url, &meta.id, work)
+                None
+            }
+        };
+        let mut cues = match cached {
+            Some(cues) => cues,
+            None => {
+                let Some(fresh) = self
+                    .segment_uncached(job, meta, work, &segmented)
                     .await?
                 else {
                     return Ok(None);
                 };
-                let source = subtitle::parse_vtt(&raw_sub)?;
-                let cues = self.segment(&job.id, &source).await?;
-                subtitle::save_json(&cues, &segmented)?;
-                cues
+                fresh
             }
         };
 
@@ -423,18 +415,15 @@ impl Pipeline {
                     &format!("续传翻译检查点: {completed}/{} cues", cached.len()),
                 )?;
                 cues = cached;
-                self.translate(&job.id, &mut cues, &translated).await?;
-                subtitle::save_json(&cues, &translated)?;
+                self.translate_and_save(&job.id, &mut cues, &translated)
+                    .await?;
             }
-            Ok(None) => {
-                self.translate(&job.id, &mut cues, &translated).await?;
-                subtitle::save_json(&cues, &translated)?;
-            }
+            Ok(None) => self.translate_and_save(&job.id, &mut cues, &translated).await?,
             Err(error) => {
                 self.db
                     .event(Some(&job.id), "warn", &format!("忽略无效翻译缓存: {error}"))?;
-                self.translate(&job.id, &mut cues, &translated).await?;
-                subtitle::save_json(&cues, &translated)?;
+                self.translate_and_save(&job.id, &mut cues, &translated)
+                    .await?;
             }
         }
         subtitle::write_ass(
@@ -448,6 +437,38 @@ impl Pipeline {
         self.db
             .set_job_paths(&job.id, None, Some(&ass.to_string_lossy()), None)?;
         Ok(Some(PreparedSubtitle { ass, cues }))
+    }
+
+    /// 无缓存时完整跑一遍：下载字幕 → 解析 VTT → 分句 → 落盘。
+    async fn segment_uncached(
+        &self,
+        job: &Job,
+        meta: &VideoMetadata,
+        work: &Path,
+        segmented: &Path,
+    ) -> Result<Option<Vec<Cue>>> {
+        let Some(raw_sub) = self
+            .download_subtitle(&job.id, &job.url, &meta.id, work)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let source = subtitle::parse_vtt(&raw_sub)?;
+        let cues = self.segment(&job.id, &source).await?;
+        subtitle::save_json(&cues, segmented)?;
+        Ok(Some(cues))
+    }
+
+    /// 翻译并原子写检查点，供翻译缓存缺省/续传后复用。
+    async fn translate_and_save(
+        &self,
+        job_id: &str,
+        cues: &mut [Cue],
+        checkpoint: &Path,
+    ) -> Result<()> {
+        self.translate(job_id, cues, checkpoint).await?;
+        subtitle::save_json(cues, checkpoint)?;
+        Ok(())
     }
 
     fn ensure_disk(&self) -> Result<()> {
@@ -475,10 +496,8 @@ impl Pipeline {
         let stage = self
             .db
             .start_stage(job_id, "subtitle_download", None, None, None)?;
-        let mut cmd = Command::new(&self.config.youtube.yt_dlp);
+        let mut cmd = ytdlp_command(&self.config.youtube);
         cmd.args([
-            "--js-runtimes",
-            "node",
             "--skip-download",
             "--write-subs",
             "--write-auto-subs",
@@ -491,9 +510,6 @@ impl Pipeline {
         ]);
         cmd.arg("-o")
             .arg(work.join(format!("{video_id}.%(language)s.%(ext)s")));
-        if self.config.youtube.cookies.exists() {
-            cmd.arg("--cookies").arg(&self.config.youtube.cookies);
-        }
         cmd.arg(url);
         let result = run_monitored(cmd, Duration::from_secs(180)).await;
         match result {
@@ -539,15 +555,13 @@ impl Pipeline {
         let stage = self
             .db
             .start_stage(job_id, "video_download", None, None, None)?;
-        let mut cmd = Command::new(&self.config.youtube.yt_dlp);
+        let mut cmd = ytdlp_command(&self.config.youtube);
         let format = download_format_selector(
             meta,
             self.config.youtube.max_pixels,
             self.config.youtube.max_fps,
         );
         cmd.args([
-            "--js-runtimes",
-            "node",
             "--no-playlist",
             "--concurrent-fragments",
             "1",
@@ -558,9 +572,6 @@ impl Pipeline {
         ]);
         cmd.arg("-o")
             .arg(work.join(format!("{video_id}.raw.%(ext)s")));
-        if self.config.youtube.cookies.exists() {
-            cmd.arg("--cookies").arg(&self.config.youtube.cookies);
-        }
         cmd.arg(url);
         let out = run_monitored(cmd, Duration::from_secs(7200)).await?;
         let path = find_video(work, video_id).context("yt-dlp 完成但未找到视频")?;
@@ -868,7 +879,42 @@ impl Pipeline {
                         Ok(translations) => {
                             return Ok((start, translations, aggregate_duration_ms, peak_rss_kib));
                         }
-                        Err(error) => last_error = Some(error),
+                        Err(error) => {
+                            last_error = Some(error);
+                            // 输出结构无效时原样重试大概率再次失败：直接减半拆分重试，
+                            // 既能定位问题批次，又避免整批 token 白烧。
+                            if chunk.len() > 1 {
+                                let mid = chunk.len() / 2;
+                                let (left, right) = chunk.split_at(mid);
+                                let (_, left_result, left_ms, left_peak) = Box::pin(
+                                    self.translate_batch_with_retry(job_id, stage, start, left),
+                                )
+                                .await?;
+                                let (_, right_result, right_ms, right_peak) = Box::pin(
+                                    self.translate_batch_with_retry(
+                                        job_id,
+                                        stage,
+                                        start + mid,
+                                        right,
+                                    ),
+                                )
+                                .await?;
+                                let merged = left_result
+                                    .into_iter()
+                                    .chain(
+                                        right_result
+                                            .into_iter()
+                                            .map(|(index, text)| (index + mid, text)),
+                                    )
+                                    .collect::<Vec<_>>();
+                                return Ok((
+                                    start,
+                                    merged,
+                                    aggregate_duration_ms + left_ms + right_ms,
+                                    peak_rss_kib.max(left_peak).max(right_peak),
+                                ));
+                            }
+                        }
                     }
                 }
                 Err(error) => last_error = Some(error),
@@ -887,7 +933,8 @@ impl Pipeline {
                 ),
             )?;
             if attempt < attempts {
-                sleep(Duration::from_secs(attempt.min(5) as u64)).await;
+                // 指数退避：1s, 2s, 4s, 8s… 对偶发故障收敛，同时限制上游 API 压力。
+                sleep(Duration::from_secs((1u64 << (attempt - 1)).min(30))).await;
             }
         }
 
