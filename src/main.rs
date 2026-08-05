@@ -47,6 +47,8 @@ enum Cmd {
     #[command(subcommand)]
     Jobs(JobCmd),
     #[command(subcommand)]
+    Subtitle(SubtitleCmd),
+    #[command(subcommand)]
     Model(ModelCmd),
     #[command(subcommand)]
     Login(LoginCmd),
@@ -91,9 +93,13 @@ enum JobCmd {
     Retry {
         id: String,
     },
-    RecheckSubtitle {
-        id: String,
-    },
+}
+#[derive(Subcommand)]
+enum SubtitleCmd {
+    /// 给指定 BVID 的已投稿视频补中文 CC 字幕
+    Add { bvid: String },
+    /// 给所有已投稿视频补中文 CC 字幕（已有中文字幕的自动跳过）
+    All,
 }
 #[derive(Subcommand)]
 enum ModelCmd {
@@ -246,19 +252,47 @@ async fn main() -> Result<()> {
                 let job = db
                     .get_job(&id)?
                     .with_context(|| format!("任务不存在: {id}"))?;
-                if job.status == JobStatus::UploadedOriginalPendingSubtitle
-                    || job.append_to_bvid.is_some()
-                {
-                    db.queue_subtitle_recheck(&id)?;
-                    println!("已排队补字幕并将追加到原稿 {id}");
-                } else {
-                    db.retry_job(&id)?;
-                    println!("已重新排队 {id}");
+                if job.status == JobStatus::UploadedOriginalPendingSubtitle {
+                    anyhow::bail!("该任务已直传原片，请用 `y2b subtitle add <bvid>` 补 CC 字幕")
                 }
+                db.retry_job(&id)?;
+                println!("已重新排队 {id}");
             }
-            JobCmd::RecheckSubtitle { id } => {
-                db.queue_subtitle_recheck(&id)?;
-                println!("已排队补字幕并将追加到原稿 {id}");
+        },
+        Cmd::Subtitle(c) => match c {
+            SubtitleCmd::Add { bvid } => {
+                let message = Pipeline::new(config, db)
+                    .backfill_cc_subtitle(&bvid)
+                    .await?;
+                println!("{message}");
+            }
+            SubtitleCmd::All => {
+                let pipeline = Pipeline::new(config, db);
+                let jobs = pipeline.db.jobs_awaiting_subtitle()?;
+                if jobs.is_empty() {
+                    println!("没有待补字幕的已投稿视频");
+                }
+                let mut failed = 0;
+                let mut skipped = 0;
+                let mut submitted = 0;
+                for job in jobs {
+                    let bvid = job.bvid.as_deref().unwrap_or_default();
+                    match pipeline.backfill_cc_subtitle(&bvid).await {
+                        Ok(message) => {
+                            println!("{message}");
+                            if message.contains("跳过") {
+                                skipped += 1;
+                            } else {
+                                submitted += 1;
+                            }
+                        }
+                        Err(error) => {
+                            failed += 1;
+                            println!("{bvid} 补字幕失败: {error:#}");
+                        }
+                    }
+                }
+                println!("完成: 提交 {submitted}，跳过 {skipped}，失败 {failed}");
             }
         },
         Cmd::Model(c) => match c {

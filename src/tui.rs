@@ -499,13 +499,12 @@ fn app(
                         && let Some(i) = state.selected()
                         && let Some(j) = jobs.get(i)
                     {
-                        if j.status == JobStatus::UploadedOriginalPendingSubtitle
-                            || j.append_to_bvid.is_some()
-                        {
-                            match db.queue_subtitle_recheck(&j.id) {
-                                Ok(()) => notice = format!("已排队补字幕并追加原稿 {}", j.video_id),
-                                Err(e) => notice = format!("补字幕排队失败: {e}"),
-                            }
+                        if j.status == JobStatus::UploadedOriginalPendingSubtitle {
+                            notice = format!(
+                                "{} 已直传原片，请用 y2b subtitle add {} 补 CC 字幕",
+                                j.video_id,
+                                j.bvid.as_deref().unwrap_or("<bvid>")
+                            );
                         } else {
                             db.retry_job(&j.id)?;
                             notice = format!("已重新排队 {}", j.video_id);
@@ -517,10 +516,11 @@ fn app(
                         && let Some(i) = state.selected()
                         && let Some(j) = jobs.get(i)
                     {
-                        match db.queue_subtitle_recheck(&j.id) {
-                            Ok(()) => notice = format!("已排队补字幕并追加原稿 {}", j.video_id),
-                            Err(e) => notice = format!("补字幕排队失败: {e}"),
-                        }
+                        notice = format!(
+                            "{} 请用 y2b subtitle add {} 补 CC 字幕",
+                            j.video_id,
+                            j.bvid.as_deref().unwrap_or("<bvid>")
+                        );
                     }
                 }
                 KeyCode::Char(' ') => {

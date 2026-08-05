@@ -1,3 +1,4 @@
+pub mod bilibili_api;
 pub mod check;
 pub mod config;
 pub mod db;

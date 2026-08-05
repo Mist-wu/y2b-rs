@@ -23,7 +23,7 @@ pub struct NewJob<'a> {
 }
 
 /// jobs 表业务列清单，供所有按 id/video_id/队列查询复用。
-const JOB_COLUMNS: &str = "id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,append_to_bvid,provider,ai_model,thinking,attempt,error";
+const JOB_COLUMNS: &str = "id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,provider,ai_model,thinking,attempt,error";
 /// ai_calls 用量聚合列，供全局/按任务/按频道汇总复用。
 const AI_USAGE_SELECT: &str = "COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(cache_read_tokens),0),COALESCE(SUM(cache_write_tokens),0),COALESCE(SUM(total_tokens),0),SUM(cost)";
 /// 原始调用与已归档汇总的统一用量数据源。
@@ -235,9 +235,7 @@ impl Database {
     pub fn channel_url(&self, id: i64) -> Result<String> {
         Ok(self
             .conn()
-            .query_row("SELECT url FROM channels WHERE id=?", [id], |r| {
-                r.get(0)
-            })?)
+            .query_row("SELECT url FROM channels WHERE id=?", [id], |r| r.get(0))?)
     }
     pub fn channel_transfer_mode(&self, id: i64) -> Result<TransferMode> {
         let value: String =
@@ -311,6 +309,21 @@ impl Database {
     pub fn get_job(&self, id: &str) -> Result<Option<Job>> {
         self.job_opt(&format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id=?"), [id])
     }
+    pub fn job_by_bvid(&self, bvid: &str) -> Result<Option<Job>> {
+        self.job_opt(
+            &format!("SELECT {JOB_COLUMNS} FROM jobs WHERE bvid=?"),
+            [bvid],
+        )
+    }
+    /// 已投稿且待补 CC 字幕的任务：完成或已直传待补字幕，且有 BVID。
+    pub fn jobs_awaiting_subtitle(&self) -> Result<Vec<Job>> {
+        let c = self.conn();
+        let mut q = c.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE bvid IS NOT NULL AND bvid<>'' AND status IN ('completed','uploaded_original_pending_subtitle') ORDER BY discovered_at"
+        ))?;
+        Ok(q.query_map([], job_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
     pub fn list_jobs(&self, limit: usize) -> Result<Vec<Job>> {
         let c = self.conn();
         let mut q = c.prepare(&format!(
@@ -343,7 +356,7 @@ impl Database {
         let c = self.conn();
         let now = Utc::now().to_rfc3339();
         let recovered=c.execute("UPDATE jobs SET status='queued',error='服务重启后自动恢复',updated_at=? WHERE status IN ('inspecting','processing','downloading','segmenting','translating','rendering')",[&now])?;
-        c.execute("UPDATE jobs SET status='paused',error='服务重启时上传或追加结果不确定，请确认 Bilibili 后手动重试',updated_at=? WHERE status IN ('uploading','appending')",[&now])?;
+        c.execute("UPDATE jobs SET status='paused',error='服务重启时上传结果不确定，请确认 Bilibili 后手动重试',updated_at=? WHERE status IN ('uploading')",[&now])?;
         c.execute(
             "UPDATE stage_runs SET status='failed',finished_at=?,duration_ms=COALESCE(duration_ms,CAST(MAX(0,(julianday(?) - julianday(started_at))*86400000) AS INTEGER)),detail=COALESCE(detail,'服务重启中断阶段') WHERE status='running'",
             params![&now, &now],
@@ -364,7 +377,7 @@ impl Database {
         Ok(())
     }
     pub fn claim_prepared_upload(&self, id: &str, status: JobStatus) -> Result<bool> {
-        if !matches!(status, JobStatus::Uploading | JobStatus::Appending) {
+        if status != JobStatus::Uploading {
             anyhow::bail!("无效的上传领取状态: {status}")
         }
         let changed = self.conn().execute(
@@ -451,22 +464,10 @@ impl Database {
             .map(|json| serde_json::from_str(&json).map_err(Into::into))
             .transpose()
     }
-    pub fn finish_prepared_upload(
-        &self,
-        id: &str,
-        bvid: &str,
-        status: JobStatus,
-        clear_append_target: bool,
-    ) -> Result<()> {
+    pub fn finish_prepared_upload(&self, id: &str, bvid: &str, status: JobStatus) -> Result<()> {
         let changed = self.conn().execute(
-            "UPDATE jobs SET bvid=?,status=?,error=NULL,prepared_upload_json=NULL,append_to_bvid=CASE WHEN ? THEN NULL ELSE append_to_bvid END,updated_at=? WHERE id=?",
-            params![
-                bvid,
-                status.to_string(),
-                clear_append_target,
-                Utc::now().to_rfc3339(),
-                id
-            ],
+            "UPDATE jobs SET bvid=?,status=?,error=NULL,prepared_upload_json=NULL,updated_at=? WHERE id=?",
+            params![bvid, status.to_string(), Utc::now().to_rfc3339(), id],
         )?;
         if changed == 0 {
             anyhow::bail!("任务不存在: {id}")
@@ -526,33 +527,6 @@ impl Database {
         self.conn().execute(
             "INSERT INTO publication_metadata(job_id,title,dynamic,tags_json,tid,raw_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET title=excluded.title,dynamic=excluded.dynamic,tags_json=excluded.tags_json,tid=excluded.tid,raw_json=excluded.raw_json,updated_at=excluded.updated_at",
             params![job_id, metadata.title, metadata.dynamic, tags_json, metadata.tid, metadata.raw_json, now, now],
-        )?;
-        Ok(())
-    }
-    pub fn queue_subtitle_recheck(&self, id: &str) -> Result<()> {
-        let c = self.conn();
-        let (bvid, existing): (Option<String>, Option<String>) = c
-            .query_row(
-                "SELECT bvid,append_to_bvid FROM jobs WHERE id=?",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?
-            .with_context(|| format!("任务不存在: {id}"))?;
-        let target = existing
-            .or(bvid)
-            .filter(|value| !value.trim().is_empty())
-            .with_context(|| format!("任务 {id} 没有可追加的原稿 BV"))?;
-        c.execute(
-            "UPDATE jobs SET status='queued',transfer_mode='translated',append_to_bvid=?,attempt=0,error=NULL,updated_at=? WHERE id=?",
-            params![target, Utc::now().to_rfc3339(), id],
-        )?;
-        Ok(())
-    }
-    pub fn clear_job_append_target(&self, id: &str) -> Result<()> {
-        self.conn().execute(
-            "UPDATE jobs SET append_to_bvid=NULL,updated_at=? WHERE id=?",
-            params![Utc::now().to_rfc3339(), id],
         )?;
         Ok(())
     }
@@ -767,12 +741,11 @@ fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         width: r.get(12)?,
         height: r.get(13)?,
         bvid: r.get(14)?,
-        append_to_bvid: r.get(15)?,
-        provider: r.get(16)?,
-        ai_model: r.get(17)?,
-        thinking: r.get(18)?,
-        attempt: r.get(19)?,
-        error: r.get(20)?,
+        provider: r.get(15)?,
+        ai_model: r.get(16)?,
+        thinking: r.get(17)?,
+        attempt: r.get(18)?,
+        error: r.get(19)?,
     })
 }
 fn usage_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AiUsage> {
@@ -909,42 +882,55 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_recheck_persists_append_target_across_recovery() {
+    fn jobs_awaiting_subtitle_lists_completed_with_bvid() {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
-        let id = db
-            .create_job(NewJob {
+        for (video_id, mode) in [
+            ("done-translated", TransferMode::Translated),
+            ("done-direct", TransferMode::Direct),
+            ("pending", TransferMode::Translated),
+            ("no-bvid", TransferMode::Translated),
+        ] {
+            db.create_job(NewJob {
                 channel_id: None,
-                video_id: "abc",
-                url: "https://youtu.be/abc",
+                video_id,
+                url: &format!("https://youtu.be/{video_id}"),
                 title: None,
                 published: None,
                 updated: None,
-                transfer_mode: TransferMode::Translated,
+                transfer_mode: mode,
             })
             .unwrap()
             .unwrap();
-
-        assert!(db.queue_subtitle_recheck(&id).is_err());
-        db.set_job_bvid(&id, "BV1test").unwrap();
-        db.update_job_status(&id, JobStatus::UploadedOriginalPendingSubtitle, None)
-            .unwrap();
-        db.queue_subtitle_recheck(&id).unwrap();
-
-        let queued = db.get_job(&id).unwrap().unwrap();
-        assert_eq!(queued.status, JobStatus::Queued);
-        assert_eq!(queued.append_to_bvid.as_deref(), Some("BV1test"));
-
-        db.update_job_status(&id, JobStatus::Rendering, None)
-            .unwrap();
-        assert_eq!(db.recover_incomplete_jobs().unwrap(), 1);
-        let recovered = db.get_job(&id).unwrap().unwrap();
-        assert_eq!(recovered.status, JobStatus::Queued);
-        assert_eq!(recovered.append_to_bvid.as_deref(), Some("BV1test"));
+        }
+        let ids = db.list_jobs(10).unwrap();
+        for (video_id, status, bvid) in [
+            ("done-translated", JobStatus::Completed, Some("BV1a")),
+            ("done-direct", JobStatus::Completed, Some("BV1b")),
+            (
+                "pending",
+                JobStatus::UploadedOriginalPendingSubtitle,
+                Some("BV1c"),
+            ),
+            ("no-bvid", JobStatus::Completed, None),
+        ] {
+            let job = ids.iter().find(|j| j.video_id == video_id).unwrap();
+            if let Some(bvid) = bvid {
+                db.set_job_bvid(&job.id, bvid).unwrap();
+            }
+            db.update_job_status(&job.id, status, None).unwrap();
+        }
+        let awaiting = db.jobs_awaiting_subtitle().unwrap();
+        let mut bvids: Vec<_> = awaiting
+            .iter()
+            .map(|j| j.bvid.as_deref().unwrap())
+            .collect();
+        bvids.sort_unstable();
+        assert_eq!(bvids, ["BV1a", "BV1b", "BV1c"]);
     }
 
     #[test]
-    fn completed_direct_job_can_be_queued_for_subtitle_append() {
+    fn completed_direct_job_is_not_listed_as_awaiting_until_has_bvid() {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         let id = db
@@ -959,16 +945,11 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-
-        db.set_job_bvid(&id, "BV1direct").unwrap();
         db.update_job_status(&id, JobStatus::Completed, None)
             .unwrap();
-        db.queue_subtitle_recheck(&id).unwrap();
-
-        let queued = db.get_job(&id).unwrap().unwrap();
-        assert_eq!(queued.status, JobStatus::Queued);
-        assert_eq!(queued.transfer_mode, TransferMode::Translated);
-        assert_eq!(queued.append_to_bvid.as_deref(), Some("BV1direct"));
+        assert!(db.jobs_awaiting_subtitle().unwrap().is_empty());
+        db.set_job_bvid(&id, "BV1direct").unwrap();
+        assert_eq!(db.jobs_awaiting_subtitle().unwrap().len(), 1);
     }
 
     #[test]
@@ -1193,8 +1174,8 @@ mod tests {
         let id = db
             .create_job(NewJob {
                 channel_id: None,
-                video_id: "append-ready",
-                url: "https://youtu.be/append-ready",
+                video_id: "upload-ready",
+                url: "https://youtu.be/upload-ready",
                 title: None,
                 published: None,
                 updated: None,
@@ -1203,21 +1184,21 @@ mod tests {
             .unwrap()
             .unwrap();
         db.set_job_bvid(&id, "BV1original").unwrap();
-        db.queue_subtitle_recheck(&id).unwrap();
         db.queue_prepared_upload(
             &id,
-            &PreparedUpload::Append {
-                video_path: "/tmp/append.mp4".into(),
-                bvid: "BV1original".into(),
+            &PreparedUpload::Submission {
+                video_path: "/tmp/upload.mp4".into(),
+                cover_path: "/tmp/cover.jpg".into(),
+                mode: TransferMode::Translated,
+                completion_status: JobStatus::Completed,
             },
         )
         .unwrap();
-        db.finish_prepared_upload(&id, "BV1original", JobStatus::Completed, true)
+        db.finish_prepared_upload(&id, "BV1original", JobStatus::Completed)
             .unwrap();
         let job = db.get_job(&id).unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Completed);
         assert_eq!(job.bvid.as_deref(), Some("BV1original"));
-        assert!(job.append_to_bvid.is_none());
         assert!(db.prepared_upload(&id).unwrap().is_none());
     }
 

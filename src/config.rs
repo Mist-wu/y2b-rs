@@ -54,7 +54,6 @@ pub struct BilibiliConfig {
     pub cookies: PathBuf,
     pub default_tid: i64,
     pub default_tags: Vec<String>,
-    pub max_parts: usize,
     pub submit_interval_seconds: u64,
     pub rate_limit_cooldown_seconds: u64,
 }
@@ -175,7 +174,6 @@ impl Default for BilibiliConfig {
             cookies: b.join("bilibili_cookies.json"),
             default_tid: 172,
             default_tags: vec!["荒野乱斗".into()],
-            max_parts: 199,
             submit_interval_seconds: 1800,
             rate_limit_cooldown_seconds: 21600,
         }

@@ -1,3 +1,4 @@
+use crate::bilibili_api::{self, CcCue};
 use crate::config::{BatchMode, Config};
 use crate::db::Database;
 use crate::model::{
@@ -110,7 +111,6 @@ impl Pipeline {
         {
             bail!("已达到每日 token 上限 {limit}")
         }
-        let append_to = job.append_to_bvid.clone();
         self.db.set_job_model(
             &job.id,
             &self.config.ai.provider,
@@ -154,15 +154,14 @@ impl Pipeline {
         fs::create_dir_all(&work)?;
         self.db
             .update_job_status(&job.id, JobStatus::Processing, None)?;
-        if !requires_translated_pipeline(job.transfer_mode, append_to.is_some()) {
+        if !requires_translated_pipeline(job.transfer_mode) {
             return self.run_direct(job, &meta, &work).await;
         }
 
         // A Bilibili submission can fail after the complete media upload (for
         // example, rate-limit code 21566).  Retrying that failure must reuse the
         // expensive rendered file instead of translating and encoding again.
-        if append_to.is_none()
-            && self.db.publication_metadata(&job.id)?.is_some()
+        if self.db.publication_metadata(&job.id)?.is_some()
             && let Some(rendered) = self.reusable_render(&meta.id).await?
         {
             self.db.event(
@@ -193,15 +192,7 @@ impl Pipeline {
         self.db
             .set_job_paths(&job.id, Some(&video.to_string_lossy()), None, None)?;
         let Some(subtitle) = subtitle else {
-            if append_to.is_some() {
-                self.cleanup_large(&job.id)?;
-                self.db.update_job_status(
-                    &job.id,
-                    JobStatus::UploadedOriginalPendingSubtitle,
-                    Some("仍无可用字幕"),
-                )?;
-                return Ok(());
-            }
+            // 无字幕时直传原片：之后用 `y2b subtitle` 命令补 CC 字幕。
             self.publish_metadata(&job.id, TransferMode::Direct, &meta, None)
                 .await?;
             return self
@@ -213,19 +204,13 @@ impl Pipeline {
                 )
                 .await;
         };
-        let publication = if append_to.is_none() {
-            Some(
-                self.publish_metadata(
-                    &job.id,
-                    TransferMode::Translated,
-                    &meta,
-                    Some(&subtitle.cues),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
+        self.publish_metadata(
+            &job.id,
+            TransferMode::Translated,
+            &meta,
+            Some(&subtitle.cues),
+        )
+        .await?;
         let rendered = self
             .render(&job.id, &video, &subtitle.ass, &meta.id)
             .await?;
@@ -233,13 +218,7 @@ impl Pipeline {
             .set_job_paths(&job.id, None, None, Some(&rendered.to_string_lossy()))?;
         self.probe_media(&job.id, &rendered, "rendered_probe")
             .await?;
-        let prepared = if let Some(bvid) = append_to {
-            PreparedUpload::Append {
-                video_path: rendered.to_string_lossy().into_owned(),
-                bvid,
-            }
-        } else {
-            publication.as_ref().context("投稿元数据未生成")?;
+        let prepared = {
             let cover = self.download_cover(&job.id, &meta, &work).await?;
             PreparedUpload::Submission {
                 video_path: rendered.to_string_lossy().into_owned(),
@@ -1037,10 +1016,7 @@ impl Pipeline {
                 "completed",
                 r.output.duration_ms,
                 r.output.peak_rss_kib,
-                Some(&format!(
-                    "{} 次尝试后通过校验",
-                    attempt + 1
-                )),
+                Some(&format!("{} 次尝试后通过校验", attempt + 1)),
             )?;
             return Ok(metadata);
         }
@@ -1242,7 +1218,7 @@ impl Pipeline {
             .db
             .prepared_upload(&job.id)?
             .with_context(|| format!("待上传任务 {} 缺少持久化上传计划", job.id))?;
-        let (bvid, completion_status, clear_append_target) = match prepared {
+        let (bvid, completion_status) = match prepared {
             PreparedUpload::Submission {
                 video_path,
                 cover_path,
@@ -1277,23 +1253,11 @@ impl Pipeline {
                 let bvid = self
                     .upload(&job.id, &video, &publication, &meta, Some(&cover))
                     .await?;
-                (bvid, completion_status, false)
-            }
-            PreparedUpload::Append { video_path, bvid } => {
-                let video = PathBuf::from(video_path);
-                ensure_prepared_file(&video, "追加视频")?;
-                if !self
-                    .db
-                    .claim_prepared_upload(&job.id, JobStatus::Appending)?
-                {
-                    return Ok(());
-                }
-                self.append(&job.id, &video, &bvid).await?;
-                (bvid, JobStatus::Completed, true)
+                (bvid, completion_status)
             }
         };
         self.db
-            .finish_prepared_upload(&job.id, &bvid, completion_status, clear_append_target)?;
+            .finish_prepared_upload(&job.id, &bvid, completion_status)?;
         let (raw, _, rendered) = self.db.job_paths(&job.id)?;
         let paths = [raw, rendered]
             .into_iter()
@@ -1364,6 +1328,64 @@ impl Pipeline {
         Ok(bvid)
     }
 
+    /// 给已投稿视频补中文 CC 字幕（B站软字幕，提交后走平台审核）。
+    ///
+    /// 素材优先复用下载目录里的翻译缓存；缺失时重新下载英文字幕、分句并调 Pi
+    /// 翻译。返回给人看的说明文字。
+    pub async fn backfill_cc_subtitle(&self, bvid: &str) -> Result<String> {
+        let job = self
+            .db
+            .job_by_bvid(bvid)?
+            .with_context(|| format!("数据库中找不到 bvid={bvid} 的任务"))?;
+        let meta = self
+            .db
+            .source_metadata(&job.id)?
+            .with_context(|| format!("任务 {} 缺少来源元数据", job.id))?;
+        let client =
+            bilibili_api::BiliSubtitleClient::from_cookies_file(&self.config.bilibili.cookies)?;
+        let view = client.view(bvid).await?;
+        if client.has_subtitle_lan(view.cid, "zh").await? {
+            return Ok(format!("{bvid} 已有中文字幕，跳过"));
+        }
+        let work = self.config.runtime.download_dir.join(&meta.id);
+        let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
+        let cues = if let Ok(cached) = subtitle::load_json(&translated) {
+            self.db.event(
+                Some(&job.id),
+                "info",
+                &format!("复用翻译缓存: {} cues", cached.len()),
+            )?;
+            cached
+        } else {
+            fs::create_dir_all(&work)?;
+            let segmented = work.join(format!("{}.en.segmented.json", meta.id));
+            let Some(cues) = self
+                .segment_uncached(&job, &meta, &work, &segmented)
+                .await?
+            else {
+                bail!("无法获取英文字幕，跳过 CC 字幕补交")
+            };
+            let mut cues = cues;
+            self.translate_and_save(&job.id, &mut cues, &translated)
+                .await?;
+            cues
+        };
+        let cc_cues = cc_cues_from(&cues);
+        if cc_cues.is_empty() {
+            bail!("翻译结果为空，没有可提交的中文字幕")
+        }
+        client.submit(&view, "zh", &cc_cues).await?;
+        self.db.event(
+            Some(&job.id),
+            "info",
+            &format!("已提交中文 CC 字幕（{} 条），等待 B站审核", cc_cues.len()),
+        )?;
+        Ok(format!(
+            "{bvid} 已提交中文 CC 字幕（{} 条），等待 B站审核",
+            cc_cues.len()
+        ))
+    }
+
     async fn wait_for_bilibili_submission(&self, job_id: &str) -> Result<bool> {
         self.wait_for_bilibili_submission_with_poll(job_id, Duration::from_secs(2))
             .await
@@ -1432,65 +1454,6 @@ impl Pipeline {
             .context("Bilibili 投稿冷却时间溢出")?;
         self.db
             .set_setting(NEXT_BILIBILI_SUBMIT_AT, &not_before.to_rfc3339())
-    }
-    async fn append(&self, job_id: &str, video: &Path, bvid: &str) -> Result<()> {
-        if let Some(parts) = self.bilibili_part_count(bvid).await?
-            && parts >= self.config.bilibili.max_parts
-        {
-            bail!(
-                "稿件 {bvid} 已有 {parts}P，达到安全上限 {}P",
-                self.config.bilibili.max_parts
-            )
-        }
-        let stage = self.db.start_stage(job_id, "append", None, None, None)?;
-        let mut cmd = Command::new(&self.config.bilibili.biliup);
-        cmd.arg("-u")
-            .arg(&self.config.bilibili.cookies)
-            .args(build_append_args(bvid))
-            .arg(video);
-        let out = match run_monitored(cmd, Duration::from_secs(14400)).await {
-            Ok(output) => output,
-            Err(error) => {
-                self.db
-                    .finish_stage(stage, "failed", 0, 0, Some(&error.to_string()))?;
-                return Err(error);
-            }
-        };
-        self.db.finish_stage(
-            stage,
-            "completed",
-            out.duration_ms,
-            out.peak_rss_kib,
-            Some(bvid),
-        )?;
-        Ok(())
-    }
-    async fn bilibili_part_count(&self, bvid: &str) -> Result<Option<usize>> {
-        let mut cmd = Command::new(&self.config.bilibili.biliup);
-        cmd.arg("-u")
-            .arg(&self.config.bilibili.cookies)
-            .arg("show")
-            .arg(bvid);
-        let out = match run_monitored(cmd, Duration::from_secs(120)).await {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::warn!(error=%e,"无法读取现有分P数量");
-                return Ok(None);
-            }
-        };
-        let merged = out.stdout + "\n" + &out.stderr;
-        let value = serde_json::from_str::<Value>(merged.trim())
-            .ok()
-            .or_else(|| {
-                merged
-                    .find('{')
-                    .and_then(|start| serde_json::from_str::<Value>(&merged[start..]).ok())
-            });
-        Ok(value
-            .as_ref()
-            .and_then(|v| v.get("videos").or_else(|| v.get("pages")))
-            .and_then(Value::as_array)
-            .map(Vec::len))
     }
     async fn probe_media(&self, job_id: &str, path: &Path, label: &str) -> Result<()> {
         let stage = self.db.start_stage(job_id, label, None, None, None)?;
@@ -1901,18 +1864,30 @@ fn build_upload_args(metadata: &PublicationMetadata, meta: &VideoMetadata) -> Ve
     ]
 }
 
-fn build_append_args(bvid: &str) -> Vec<String> {
-    vec![
-        "append".into(),
-        "--vid".into(),
-        bvid.into(),
-        "--limit".into(),
-        "1".into(),
-    ]
+fn requires_translated_pipeline(mode: TransferMode) -> bool {
+    mode == TransferMode::Translated
 }
 
-fn requires_translated_pipeline(mode: TransferMode, has_append_target: bool) -> bool {
-    mode == TransferMode::Translated || has_append_target
+/// 把双语 cue 转成 B站 CC 字幕条目：只保留有非空翻译且时间合法（end > start）的。
+fn cc_cues_from(cues: &[Cue]) -> Vec<CcCue> {
+    cues.iter()
+        .filter(|c| {
+            c.translation
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty())
+                && c.end > c.start
+        })
+        .map(|c| CcCue {
+            from: c.start,
+            to: c.end,
+            content: c
+                .translation
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        })
+        .collect()
 }
 
 async fn try_join_branches<A, B, FA, FB>(left: FA, right: FB) -> Result<(A, B)>
@@ -2642,21 +2617,44 @@ mod tests {
     }
 
     #[test]
-    fn append_args_only_target_existing_bvid() {
-        assert_eq!(
-            build_append_args("BV1test"),
-            ["append", "--vid", "BV1test", "--limit", "1"]
-        );
+    fn transfer_mode_routes_only_requested_jobs_through_subtitles() {
+        assert!(!requires_translated_pipeline(TransferMode::Direct));
+        assert!(requires_translated_pipeline(TransferMode::Translated));
     }
 
     #[test]
-    fn transfer_mode_routes_only_requested_jobs_through_subtitles() {
-        assert!(!requires_translated_pipeline(TransferMode::Direct, false));
-        assert!(requires_translated_pipeline(
-            TransferMode::Translated,
-            false
-        ));
-        assert!(requires_translated_pipeline(TransferMode::Direct, true));
+    fn cc_cues_keep_only_translated_in_order() {
+        let cues = vec![
+            Cue {
+                start: 0.0,
+                end: 1.5,
+                source: "hi".into(),
+                translation: Some(" 你好 ".into()),
+            },
+            Cue {
+                start: 1.5,
+                end: 3.0,
+                source: "empty translation".into(),
+                translation: Some("   ".into()),
+            },
+            Cue {
+                start: 3.0,
+                end: 2.0,
+                source: "inverted".into(),
+                translation: Some("倒序".into()),
+            },
+            Cue {
+                start: 4.0,
+                end: 5.0,
+                source: "none".into(),
+                translation: None,
+            },
+        ];
+        let cc = cc_cues_from(&cues);
+        assert_eq!(cc.len(), 1);
+        assert_eq!(cc[0].content, "你好");
+        assert_eq!(cc[0].from, 0.0);
+        assert_eq!(cc[0].to, 1.5);
     }
 
     #[tokio::test]

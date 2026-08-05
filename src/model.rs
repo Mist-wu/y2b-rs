@@ -95,7 +95,6 @@ pub struct Job {
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub bvid: Option<String>,
-    pub append_to_bvid: Option<String>,
     pub provider: Option<String>,
     pub ai_model: Option<String>,
     pub thinking: Option<String>,
@@ -147,10 +146,6 @@ pub enum PreparedUpload {
         cover_path: String,
         mode: TransferMode,
         completion_status: JobStatus,
-    },
-    Append {
-        video_path: String,
-        bvid: String,
     },
 }
 

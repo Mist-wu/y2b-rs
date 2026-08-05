@@ -8,7 +8,7 @@ Rust CLI/TUI 工具：监控 YouTube 频道更新，按频道选择原片直传�
 - 全局串行处理。单个 `translated` 任务内部并行下载视频和处理字幕。下载限制到 60fps、约 2,073,600 像素，优先 AVC/AAC。
 - `direct`：并行下载视频和调用 Pi 一次生成中文标题、动态文案和标签；不下载字幕、不分句、不压制。
 - `translated`：英文字幕 → Pi 分句 → Pi 翻译 → 双语 ASS → H.264/AAC 压制 → 投稿。
-- `translated` 无字幕时自动直传原片，状态设为 `uploaded_original_pending_subtitle`；之后重查字幕并以 `biliup append --vid` 追加双语分P。
+- `translated` 无字幕时自动直传原片，状态设为 `uploaded_original_pending_subtitle`；之后用 `y2b subtitle` 命令给已投稿视频补中文 CC 字幕（B站软字幕，提交后走平台审核）。
 - 普通投稿按每个视频一次无状态 `publish_metadata` Pi 请求生成中文标题、动态文案和标签。字幕模式在预算内传入完整双语字幕，超限时保留首尾并均匀采样；结果持久化后，任务重试或服务重启不会重复调用 Pi。标题或动态不合格会重试，不会用英文原标题或固定动态投稿。
 - 投稿固定为手机游戏分区 `tid=172`、自制 `copyright=1` 并允许转载；不使用 Bilibili 转载来源字段。标签始终以“荒野乱斗”开头，简介按清理 hashtag 后的原标题、YouTube 来源、原作者和工具地址确定性生成。
 - 所有新投稿都下载 yt-dlp 选定的 YouTube 原封面，转为 JPEG 后通过 biliup `--cover` 上传；封面失败时任务重试而不会无封面投稿。
@@ -39,7 +39,8 @@ y2b run 'https://www.youtube.com/watch?v=VIDEO_ID' --mode translated
 y2b jobs list 50
 y2b jobs show JOB_ID
 y2b jobs retry JOB_ID
-y2b jobs recheck-subtitle JOB_ID
+y2b subtitle add BV1xxxxx
+y2b subtitle --all
 y2b model list
 y2b model set gpt-5.6-sol
 y2b login youtube /path/to/cookies.txt
@@ -48,7 +49,9 @@ y2b backup
 y2b auth-check
 ```
 
-TUI：`Tab` 切换任务/频道列表，`↑/↓` 选择，`n` 输入单个 YouTube URL 并选择 `direct` 或 `translated`，`r` 重试或恢复 dead-letter，`p` 重查字幕，`Space` 暂停，`m` 在 Luna/Sol/Terra 间切换，`a` 重做认证检查，`y`/`b` 导入 YouTube/Bilibili cookies，`q` 退出。手动 URL 在后台解析并入队，重复 URL 会定位已有任务；频道增删、模式切换和启停仅由 CLI 管理。
+TUI：`Tab` 切换任务/频道列表，`↑/↓` 选择，`n` 输入单个 YouTube URL 并选择 `direct` 或 `translated`，`r` 重试或恢复 dead-letter，`p` 提示补 CC 字幕，`Space` 暂停，`m` 在 Luna/Sol/Terra 间切换，`a` 重做认证检查，`y`/`b` 导入 YouTube/Bilibili cookies，`q` 退出。手动 URL 在后台解析并入队，重复 URL 会定位已有任务；频道增删、模式切换和启停仅由 CLI 管理。
+
+`y2b subtitle add <bvid>` 给指定已投稿视频补中文 CC 字幕；`y2b subtitle --all` 遍历所有已投稿视频补字幕，已有中文字幕的自动跳过。字幕素材优先复用 `downloads/<video_id>/*.en-zh-CN.translated.json` 缓存，缺失时重新下载英文字幕、分句并调 Pi 翻译；提交走 B站审核（非即时生效）。
 
 频道模式只是新任务的默认值。任务入队后会固化当时的模式，后续 `channels set-mode` 不会改写旧任务。`video_id` 全局唯一，同一视频不会二次入队或二次投稿。`y2b run` 的 `--mode` 默认为 `translated`；`channels add` 和 `jobs add` 要求显式指定 `--mode`。
 
@@ -131,4 +134,4 @@ y2b run '用户提供的带英文字幕 URL' --mode translated
 y2b jobs show JOB_ID
 ```
 
-真实追加分P和投稿会改变 Bilibili 外部状态，只在提供测试 BV 和未搬运视频后执行。追加前程序尝试读取现有分P，达到配置的 `max_parts = 199` 时拒绝操作。
+真实投稿会改变 Bilibili 外部状态，只在提供测试 BV 和未搬运视频后执行。
