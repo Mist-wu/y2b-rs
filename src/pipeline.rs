@@ -589,7 +589,7 @@ impl Pipeline {
                     budget,
                     PI_MAX_PROMPT_ARGUMENT_BYTES,
                 )?;
-                let window_end = budget_end.min(window_start + self.config.ai.segment_max_cues);
+                let window_end = budget_end.min(window_start + self.config.ai.segment_max_cues - 1);
                 if window_end < cursor {
                     bail!("安全 token 阈值过小，无法容纳分句核心字幕")
                 }
@@ -1283,7 +1283,25 @@ impl Pipeline {
         let meta = self
             .db
             .source_metadata(&job.id)?
-            .with_context(|| format!("任务 {} 缺少来源元数据", job.id))?;
+            .unwrap_or_else(|| VideoMetadata {
+                // 个别早期任务未持久化来源元数据：用 job 自身的 video_id/url 兜底。
+                id: job.video_id.clone(),
+                url: job.url.clone(),
+                title: String::new(),
+                description: None,
+                uploader: None,
+                upload_date: None,
+                channel: None,
+                channel_id: None,
+                timestamp: None,
+                duration: None,
+                width: None,
+                height: None,
+                fps: None,
+                thumbnail_url: None,
+                webpage_url: None,
+                live_status: None,
+            });
         let client =
             bilibili_api::BiliSubtitleClient::from_cookies_file(&self.config.bilibili.cookies)?;
         let view = client.view(bvid).await?;
