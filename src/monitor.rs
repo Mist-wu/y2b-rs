@@ -18,6 +18,8 @@ pub struct Monitor {
     client: reqwest::Client,
     /// 已确认是直播/预约内容的视频，本进程内不再重复拉取元数据。
     skipped_live: Mutex<std::collections::HashSet<String>>,
+    /// 最近一次 yt-dlp 回退检查时间（按频道），防止 RSS 故障时高频拉取。
+    last_fallback_at: Mutex<std::collections::HashMap<i64, std::time::Instant>>,
 }
 
 /// 构造带公共参数（js 运行时、cookies）的 yt-dlp 命令，供各子命令复用。
@@ -132,6 +134,7 @@ impl Monitor {
                 .user_agent("y2b-rs/0.1")
                 .build()?,
             skipped_live: Mutex::new(std::collections::HashSet::new()),
+            last_fallback_at: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -314,14 +317,13 @@ impl Monitor {
         let url = self.db.channel_feed(id)?;
         let baseline = self.db.channel_baseline(id)?;
         let transfer_mode = self.db.channel_transfer_mode(id)?;
-        let bytes = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
+        let bytes = match self.client.get(&url).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => response.bytes().await?,
+                Err(error) => return self.fallback_poll_channel(id, error.into()).await,
+            },
+            Err(error) => return self.fallback_poll_channel(id, error.into()).await,
+        };
         let feed = parser::parse(bytes.as_ref()).context("YouTube RSS 格式无效")?;
         let mut added = 0;
         for e in feed.entries {
@@ -380,6 +382,27 @@ impl Monitor {
         }
         self.db.mark_channel_checked(id, None)?;
         Ok(added)
+    }
+
+    /// RSS 拉取失败时回退到 yt-dlp 频道列表（带每频道冷却，防止高频拉取）。
+    async fn fallback_poll_channel(&self, id: i64, error: anyhow::Error) -> Result<usize> {
+        const FALLBACK_COOLDOWN: Duration = Duration::from_secs(600);
+        let now = std::time::Instant::now();
+        let mut map = self.last_fallback_at.lock().unwrap();
+        if let Some(last) = map.get(&id)
+            && now.duration_since(*last) < FALLBACK_COOLDOWN
+        {
+            tracing::debug!(channel_id = id, "RSS 故障，回退冷却中，跳过本轮");
+            return Ok(0);
+        }
+        map.insert(id, now);
+        drop(map);
+        tracing::warn!(
+            channel_id = id,
+            error = %error,
+            "RSS 拉取失败，回退 yt-dlp 频道列表"
+        );
+        self.reconcile_channel(id, &self.db.channel_url(id)?).await
     }
 
     pub async fn fetch_metadata(&self, url: &str) -> Result<(VideoMetadata, u64, i64)> {

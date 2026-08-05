@@ -232,6 +232,13 @@ impl Database {
                 r.get(0)
             })?)
     }
+    pub fn channel_url(&self, id: i64) -> Result<String> {
+        Ok(self
+            .conn()
+            .query_row("SELECT url FROM channels WHERE id=?", [id], |r| {
+                r.get(0)
+            })?)
+    }
     pub fn channel_transfer_mode(&self, id: i64) -> Result<TransferMode> {
         let value: String =
             self.conn()
