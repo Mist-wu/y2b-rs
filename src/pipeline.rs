@@ -675,7 +675,9 @@ impl Pipeline {
             })).collect::<Vec<_>>()
         });
         let input_json = payload.to_string();
-        let r = self.call_pi(payload).await?;
+        let r = self
+            .call_pi(payload, &self.config.ai.translation_thinking)
+            .await?;
         let local = parse_ranges(&r.value)?;
         validate_ranges_cover(cues.len(), &local)?;
         self.db.record_ai_call(
@@ -805,7 +807,10 @@ impl Pipeline {
         let mut last_error = None;
 
         for attempt in 1..=attempts {
-            match self.call_pi(payload.clone()).await {
+            match self
+                .call_pi(payload.clone(), &self.config.ai.translation_thinking)
+                .await
+            {
                 Ok(result) => {
                     aggregate_duration_ms += result.output.duration_ms;
                     peak_rss_kib = peak_rss_kib.max(result.output.peak_rss_kib);
@@ -833,34 +838,16 @@ impl Pipeline {
                             // 输出结构无效时原样重试大概率再次失败：直接减半拆分重试，
                             // 既能定位问题批次，又避免整批 token 白烧。
                             if chunk.len() > 1 {
-                                let mid = chunk.len() / 2;
-                                let (left, right) = chunk.split_at(mid);
-                                let (_, left_result, left_ms, left_peak) = Box::pin(
-                                    self.translate_batch_with_retry(job_id, stage, start, left),
-                                )
-                                .await?;
-                                let (_, right_result, right_ms, right_peak) =
-                                    Box::pin(self.translate_batch_with_retry(
+                                return self
+                                    .split_translation_batch(
                                         job_id,
                                         stage,
-                                        start + mid,
-                                        right,
-                                    ))
-                                    .await?;
-                                let merged = left_result
-                                    .into_iter()
-                                    .chain(
-                                        right_result
-                                            .into_iter()
-                                            .map(|(index, text)| (index + mid, text)),
+                                        start,
+                                        chunk,
+                                        aggregate_duration_ms,
+                                        peak_rss_kib,
                                     )
-                                    .collect::<Vec<_>>();
-                                return Ok((
-                                    start,
-                                    merged,
-                                    aggregate_duration_ms + left_ms + right_ms,
-                                    peak_rss_kib.max(left_peak).max(right_peak),
-                                ));
+                                    .await;
                             }
                         }
                     }
@@ -881,9 +868,33 @@ impl Pipeline {
                 ),
             )?;
             if attempt < attempts {
-                // 指数退避：1s, 2s, 4s, 8s… 对偶发故障收敛，同时限制上游 API 压力。
+                // 指数退避：1s, 2s, 4s… 对偶发故障收敛，同时限制上游 API 压力。
                 sleep(Duration::from_secs((1u64 << (attempt - 1)).min(30))).await;
             }
+        }
+
+        // 重试耗尽仍失败：对可拆批次降半重试（缩小请求面定位问题），
+        // 而不是让整个批次（可能 50-100 条）白烧后直接失败。
+        if chunk.len() > 1 {
+            self.db.event(
+                Some(job_id),
+                "warn",
+                &format!(
+                    "翻译批次 {}..{} 重试耗尽，自动降半重试",
+                    start,
+                    start + chunk.len()
+                ),
+            )?;
+            return self
+                .split_translation_batch(
+                    job_id,
+                    stage,
+                    start,
+                    chunk,
+                    aggregate_duration_ms,
+                    peak_rss_kib,
+                )
+                .await;
         }
 
         Err(last_error
@@ -893,6 +904,38 @@ impl Pipeline {
                 start,
                 start + chunk.len()
             )))
+    }
+
+    /// 把翻译批次拆成左右两半分别重试，合并结果；用于结构无效或持续失败定位问题。
+    async fn split_translation_batch(
+        &self,
+        job_id: &str,
+        stage: i64,
+        start: usize,
+        chunk: &[Cue],
+        aggregate_duration_ms: i64,
+        peak_rss_kib: u64,
+    ) -> Result<(usize, Vec<(usize, String)>, i64, u64)> {
+        let mid = chunk.len() / 2;
+        let (left, right) = chunk.split_at(mid);
+        let (_, left_result, left_ms, left_peak) =
+            Box::pin(self.translate_batch_with_retry(job_id, stage, start, left)).await?;
+        let (_, right_result, right_ms, right_peak) =
+            Box::pin(self.translate_batch_with_retry(job_id, stage, start + mid, right)).await?;
+        let merged = left_result
+            .into_iter()
+            .chain(
+                right_result
+                    .into_iter()
+                    .map(|(index, text)| (index + mid, text)),
+            )
+            .collect::<Vec<_>>();
+        Ok((
+            start,
+            merged,
+            aggregate_duration_ms + left_ms + right_ms,
+            peak_rss_kib.max(left_peak).max(right_peak),
+        ))
     }
 
     fn ai_token_budget(&self) -> Result<usize> {
@@ -930,7 +973,7 @@ impl Pipeline {
                 payload["feedback"] = json!(message);
             }
             let input_json = payload.to_string();
-            let r = match self.call_pi(payload).await {
+            let r = match self.call_pi(payload, &self.config.ai.thinking).await {
                 Ok(result) => result,
                 Err(error) => {
                     self.db
@@ -1001,7 +1044,7 @@ impl Pipeline {
         unreachable!("publish_metadata 重试循环必须收敛")
     }
 
-    async fn call_pi(&self, payload: Value) -> Result<PiResult> {
+    async fn call_pi(&self, payload: Value, thinking: &str) -> Result<PiResult> {
         let mut cmd = Command::new(&self.config.ai.pi);
         cmd.args([
             "--mode",
@@ -1022,7 +1065,7 @@ impl Pipeline {
             "--model",
             &self.config.ai.model,
             "--thinking",
-            &self.config.ai.thinking,
+            thinking,
             "--no-approve",
         ]);
         cmd.env("Y2B_PI_POLICY_PATH", &self.config.ai.policy);
@@ -1390,7 +1433,9 @@ fn ensure_prepared_file(path: &Path, label: &str) -> Result<()> {
 
 const PI_PROMPT_OVERHEAD_TOKENS: usize = 2_048;
 const PI_METADATA_OUTPUT_RESERVE_TOKENS: usize = 1_024;
-const PI_MAX_PROMPT_ARGUMENT_BYTES: usize = 96 * 1024;
+/// 分句窗口的单次参数大小上限：Linux ARG_MAX 通常 2MB，512KB 足够容纳
+/// 绝大多数视频的完整字幕，避免中小视频被拆成多次分句调用。
+const PI_MAX_PROMPT_ARGUMENT_BYTES: usize = 512 * 1024;
 const BILIBILI_TID: i64 = 172;
 const CORE_TAG: &str = "荒野乱斗";
 const MAX_TITLE_WIDTH: usize = 70;
@@ -2239,7 +2284,8 @@ mod tests {
 
     #[test]
     fn adaptive_segmentation_respects_process_argument_byte_limit() {
-        let long_text = "x".repeat(1_000);
+        // 5.5KB 长句 × 100 条 ≈ 556KB，超过 512KB 窗口上限但不超过 token 预算。
+        let long_text = "x".repeat(5_500);
         let cues = (0..100)
             .map(|index| cue(index, &long_text))
             .collect::<Vec<_>>();
@@ -2406,7 +2452,9 @@ mod tests {
             build_publication_payload(TransferMode::Translated, &metadata(), Some(&large), 200_000)
                 .unwrap();
         assert!(bounded.to_string().len() <= PI_MAX_PROMPT_ARGUMENT_BYTES);
-        assert_eq!(bounded["subtitle_sampling"]["sampled"], true);
+        // 512KB 上限下 1075 条双语字幕（约 300KB）不再触发采样，全量传入。
+        assert_eq!(bounded["subtitle_sampling"]["sampled"], false);
+        assert_eq!(bounded["subtitles"].as_array().unwrap().len(), large.len());
     }
 
     #[test]

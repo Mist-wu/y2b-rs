@@ -66,7 +66,10 @@ pub struct AiConfig {
     pub policy: PathBuf,
     pub provider: String,
     pub model: String,
+    /// publish_metadata 等质量敏感任务的思考级别。
     pub thinking: String,
+    /// 分句/翻译这类确定性转换任务的思考级别（默认 low，比 high 快数倍）。
+    pub translation_thinking: String,
     pub allowed_models: Vec<ModelConfig>,
     pub timeout_seconds: u64,
     pub batch_mode: BatchMode,
@@ -183,6 +186,7 @@ impl Default for AiConfig {
             provider: "openai-codex".into(),
             model: "gpt-5.6-luna".into(),
             thinking: "high".into(),
+            translation_thinking: "low".into(),
             allowed_models: vec![
                 ModelConfig {
                     provider: "openai-codex".into(),
@@ -205,7 +209,7 @@ impl Default for AiConfig {
             context_window_tokens: 256_000,
             safe_context_tokens: 200_000,
             segment_overlap_cues: 12,
-            translation_batch_cues: 50,
+            translation_batch_cues: 100,
             translation_concurrency: 4,
             translation_batch_retries: 2,
             daily_token_limit: None,
@@ -281,7 +285,7 @@ mod tests {
         assert_eq!(adaptive.batch_mode, BatchMode::Adaptive);
         assert_eq!(adaptive.context_window_tokens, 256_000);
         assert_eq!(adaptive.safe_context_tokens, 200_000);
-        assert_eq!(adaptive.translation_batch_cues, 50);
+        assert_eq!(adaptive.translation_batch_cues, 100);
         assert_eq!(adaptive.translation_concurrency, 4);
         assert_eq!(adaptive.translation_batch_retries, 2);
 
