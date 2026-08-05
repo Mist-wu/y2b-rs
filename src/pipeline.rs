@@ -550,10 +550,10 @@ impl Pipeline {
         let mut duration = 0;
         let mut peak = 0;
         let mut calls = 0;
-        let full_payload_fits =
-            estimated <= budget && estimated_bytes <= PI_MAX_PROMPT_ARGUMENT_BYTES;
-        if self.config.ai.batch_mode == BatchMode::WholeVideo || full_payload_fits {
-            if !full_payload_fits {
+        let fits_tokens = estimated <= budget && estimated_bytes <= PI_MAX_PROMPT_ARGUMENT_BYTES;
+        let fits_window = fits_tokens && cues.len() <= self.config.ai.segment_max_cues;
+        if self.config.ai.batch_mode == BatchMode::WholeVideo || fits_window {
+            if !fits_tokens {
                 bail!(
                     "whole_video 分句超过安全输入阈值: estimated_tokens={estimated}/{budget}, bytes={estimated_bytes}/{PI_MAX_PROMPT_ARGUMENT_BYTES}；请改用 adaptive"
                 )
@@ -583,12 +583,13 @@ impl Pipeline {
             let mut cursor = 0;
             while cursor < cues.len() {
                 let window_start = cursor.saturating_sub(overlap);
-                let window_end = max_segment_window_end(
+                let budget_end = max_segment_window_end(
                     cues,
                     window_start,
                     budget,
                     PI_MAX_PROMPT_ARGUMENT_BYTES,
                 )?;
+                let window_end = budget_end.min(window_start + self.config.ai.segment_max_cues);
                 if window_end < cursor {
                     bail!("安全 token 阈值过小，无法容纳分句核心字幕")
                 }
@@ -805,10 +806,16 @@ impl Pipeline {
         let mut aggregate_duration_ms = 0;
         let mut peak_rss_kib = 0;
         let mut last_error = None;
+        let mut feedback: Option<String> = None;
 
         for attempt in 1..=attempts {
+            let mut call_payload = payload.clone();
+            if let Some(message) = &feedback {
+                call_payload["feedback"] = json!(message);
+            }
+            let input_json = call_payload.to_string();
             match self
-                .call_pi(payload.clone(), &self.config.ai.translation_thinking)
+                .call_pi(call_payload, &self.config.ai.translation_thinking)
                 .await
             {
                 Ok(result) => {
@@ -834,9 +841,25 @@ impl Pipeline {
                             return Ok((start, translations, aggregate_duration_ms, peak_rss_kib));
                         }
                         Err(error) => {
+                            let error_message = error.to_string();
                             last_error = Some(error);
-                            // 输出结构无效时原样重试大概率再次失败：直接减半拆分重试，
-                            // 既能定位问题批次，又避免整批 token 白烧。
+                            // 输出结构无效时原样重试大概率再次失败：先带反馈让 AI 修正格式；
+                            // 反馈仍无效则减半拆分重试，定位问题批次，避免整批 token 白烧。
+                            if attempt < attempts {
+                                feedback = Some(format!(
+                                    "上一轮输出未通过解析/校验：{error_message}。请只输出符合要求的 JSON，不要输出解释、Markdown 或额外字段。"
+                                ));
+                                self.db.event(
+                                    Some(job_id),
+                                    "warn",
+                                    &format!(
+                                        "翻译批次 {}..{} 输出无效，带反馈重试: {error_message}",
+                                        start,
+                                        start + chunk.len()
+                                    ),
+                                )?;
+                                continue;
+                            }
                             if chunk.len() > 1 {
                                 return self
                                     .split_translation_batch(
@@ -1433,9 +1456,10 @@ fn ensure_prepared_file(path: &Path, label: &str) -> Result<()> {
 
 const PI_PROMPT_OVERHEAD_TOKENS: usize = 2_048;
 const PI_METADATA_OUTPUT_RESERVE_TOKENS: usize = 1_024;
-/// 分句窗口的单次参数大小上限：Linux ARG_MAX 通常 2MB，512KB 足够容纳
-/// 绝大多数视频的完整字幕，避免中小视频被拆成多次分句调用。
-const PI_MAX_PROMPT_ARGUMENT_BYTES: usize = 512 * 1024;
+/// 分句窗口的单次参数大小上限：2GB 内存的服务器上 pi 处理超过 ~96KB
+/// 的输入会因内存/swap 拖慢甚至 OOM（实测 128KB 窗口触发 kill），
+/// 96KB（≈30k tokens）窗口单次约 160s，可稳定完成。
+const PI_MAX_PROMPT_ARGUMENT_BYTES: usize = 96 * 1024;
 const BILIBILI_TID: i64 = 172;
 const CORE_TAG: &str = "荒野乱斗";
 const MAX_TITLE_WIDTH: usize = 70;
@@ -2452,9 +2476,9 @@ mod tests {
             build_publication_payload(TransferMode::Translated, &metadata(), Some(&large), 200_000)
                 .unwrap();
         assert!(bounded.to_string().len() <= PI_MAX_PROMPT_ARGUMENT_BYTES);
-        // 512KB 上限下 1075 条双语字幕（约 300KB）不再触发采样，全量传入。
-        assert_eq!(bounded["subtitle_sampling"]["sampled"], false);
-        assert_eq!(bounded["subtitles"].as_array().unwrap().len(), large.len());
+        // 128KB 上限下 1075 条双语字幕（约 300KB）触发均匀采样。
+        assert_eq!(bounded["subtitle_sampling"]["sampled"], true);
+        assert!(bounded["subtitles"].as_array().unwrap().len() < large.len());
     }
 
     #[test]

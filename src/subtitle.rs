@@ -43,6 +43,7 @@ pub fn parse_vtt(path: &Path) -> Result<Vec<Cue>> {
         }
     }
     dedup_overlaps(&mut cues);
+    dedup_rolling(&mut cues);
     if cues.is_empty() {
         bail!("字幕文件没有有效 cue: {}", path.display())
     }
@@ -61,6 +62,59 @@ fn parse_ts(s: &str) -> Result<f64> {
 fn dedup_overlaps(c: &mut Vec<Cue>) {
     c.sort_by(|a, b| a.start.total_cmp(&b.start));
     c.dedup_by(|a, b| (a.start - b.start).abs() < 0.01 && a.source == b.source);
+}
+
+/// YouTube 自动字幕按“滚动窗口”生成：每条 cue 重复上一条的尾部文本再追加新词，
+/// 相邻 cue 间存在大量前缀/后缀重叠。这里把每条 cue 裁剪为“相对上一条新增的内容”，
+/// 使每个句子只出现一次，避免分句/翻译 token 浪费和译文重复结巴。
+fn dedup_rolling(c: &mut Vec<Cue>) {
+    const MIN_OVERLAP_CHARS: usize = 10;
+    if c.len() < 2 {
+        return;
+    }
+    let mut carry = String::new();
+    let mut out = Vec::with_capacity(c.len());
+    for cue in c.drain(..) {
+        let original = cue.source.trim().to_string();
+        let stripped = strip_rolling_overlap(&carry, &original, MIN_OVERLAP_CHARS);
+        // carry 始终取“原始滚动窗口”文本，而不是裁剪后的，保证后续重叠检测正确。
+        carry = original;
+        if stripped.is_empty() {
+            continue;
+        }
+        out.push(Cue {
+            source: stripped,
+            ..cue
+        });
+    }
+    *c = out;
+}
+
+/// 若 `text` 以 `carry` 的一个“词边界对齐”的后缀开头（即文本滚动重叠），
+/// 则裁掉该重叠前缀，只返回新增内容；无重叠时原样返回。
+fn strip_rolling_overlap(carry: &str, text: &str, min_chars: usize) -> String {
+    if carry.is_empty() || text.is_empty() {
+        return text.to_string();
+    }
+    let limit = text.len().min(carry.len());
+    if limit < min_chars {
+        return text.to_string();
+    }
+    // 从最长重叠往下找：carry 的尾部 == text 的头部，且剪切点位于词边界。
+    for overlap in (min_chars..=limit).rev() {
+        if &text[..overlap] != &carry[carry.len() - overlap..] {
+            continue;
+        }
+        if overlap < text.len() && !text.is_char_boundary(overlap) {
+            continue;
+        }
+        let rest = &text[overlap..];
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        return rest.trim_start().to_string();
+    }
+    text.to_string()
 }
 
 pub fn apply_ranges(cues: &[Cue], ranges: &[(usize, usize)]) -> Result<Vec<Cue>> {
@@ -134,6 +188,76 @@ pub fn load_json(path: &Path) -> Result<Vec<Cue>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rolling_dedup_keeps_only_new_words() {
+        let cues = vec![
+            Cue {
+                start: 0.0,
+                end: 1.0,
+                source: "bit. That's always just been a counter when these two brawlers weren't meta. So".into(),
+                translation: None,
+            },
+            Cue {
+                start: 1.1,
+                end: 2.0,
+                source: "when these two brawlers weren't meta. So".into(),
+                translation: None,
+            },
+            Cue {
+                start: 2.1,
+                end: 3.0,
+                source: "when these two brawlers weren't meta. So just bear that in mind. Crow is a good".into(),
+                translation: None,
+            },
+            Cue {
+                start: 3.1,
+                end: 4.0,
+                source: "just bear that in mind. Crow is a good".into(),
+                translation: None,
+            },
+            Cue {
+                start: 4.1,
+                end: 5.0,
+                source: "just bear that in mind. Crow is a good counter to me as well. Angel said".into(),
+                translation: None,
+            },
+        ];
+        let mut deduped = cues.clone();
+        dedup_rolling(&mut deduped);
+        let texts: Vec<&str> = deduped.iter().map(|c| c.source.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "bit. That's always just been a counter when these two brawlers weren't meta. So",
+                "just bear that in mind. Crow is a good",
+                "counter to me as well. Angel said",
+            ]
+        );
+    }
+
+    #[test]
+    fn rolling_dedup_keeps_unrelated_consecutive_cues() {
+        let cues = vec![
+            Cue {
+                start: 0.0,
+                end: 1.0,
+                source: "Hello everyone".into(),
+                translation: None,
+            },
+            Cue {
+                start: 1.1,
+                end: 2.0,
+                source: "Welcome back to the channel".into(),
+                translation: None,
+            },
+        ];
+        let mut deduped = cues.clone();
+        dedup_rolling(&mut deduped);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].source, "Hello everyone");
+        assert_eq!(deduped[1].source, "Welcome back to the channel");
+    }
     #[test]
     fn ranges() {
         let c = vec![

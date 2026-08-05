@@ -76,6 +76,8 @@ pub struct AiConfig {
     pub context_window_tokens: usize,
     pub safe_context_tokens: usize,
     pub segment_overlap_cues: usize,
+    /// 单次分句调用的最大 cue 数，防止超大调用超时/失败重来代价大。
+    pub segment_max_cues: usize,
     #[serde(alias = "batch_size")]
     pub translation_batch_cues: usize,
     pub translation_concurrency: usize,
@@ -209,7 +211,8 @@ impl Default for AiConfig {
             context_window_tokens: 256_000,
             safe_context_tokens: 200_000,
             segment_overlap_cues: 12,
-            translation_batch_cues: 100,
+            segment_max_cues: 400,
+            translation_batch_cues: 50,
             translation_concurrency: 4,
             translation_batch_retries: 2,
             daily_token_limit: None,
@@ -285,7 +288,7 @@ mod tests {
         assert_eq!(adaptive.batch_mode, BatchMode::Adaptive);
         assert_eq!(adaptive.context_window_tokens, 256_000);
         assert_eq!(adaptive.safe_context_tokens, 200_000);
-        assert_eq!(adaptive.translation_batch_cues, 100);
+        assert_eq!(adaptive.translation_batch_cues, 50);
         assert_eq!(adaptive.translation_concurrency, 4);
         assert_eq!(adaptive.translation_batch_retries, 2);
 

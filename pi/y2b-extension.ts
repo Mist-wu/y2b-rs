@@ -140,9 +140,11 @@ Task translate:
 - Output: {"translations":[{"i":0,"text":"译文"}]}
 - Return every i exactly once and in input order. Never merge or split items.
 - Use natural concise Simplified Chinese suitable for Bilibili, not documentary-style Chinese.
-- Keep each translation suitable for one visual line, targeting at most 32 Chinese-width characters when possible. Shorten syntax without dropping facts, jokes, names, numbers, or intent.
+- Keep each translation suitable for one visual line, targeting at most 32 Chinese-width characters when possible. 中文宽度计法：中文/全角字符计 2，ASCII 字母数字与空格计 1（32 宽度 ≈ 16 个汉字）。Shorten syntax without dropping facts, jokes, names, numbers, or intent.
+- Drop meaningless English filler words (uh, um, so, yeah, you know, I mean, like, right) when they add no meaning; never drop facts, jokes, names, numbers, or intent.
 - Preserve code, API names, numbers, usernames, game terminology, and proper nouns accurately.
 - Do not add notes or punctuation that is absent unless natural Chinese readability requires it.
+- If the input contains a "feedback" field: the previous output was rejected for the given reason (typically invalid JSON or index mismatch). Fix exactly that issue and re-output only the JSON.
 
 Task glossary_audit:
 - Input: {"task":"glossary_audit","source_lang":"en","target_lang":"zh-CN","items":["term 1","term 2"]}
