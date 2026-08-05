@@ -676,11 +676,45 @@ impl Pipeline {
             })).collect::<Vec<_>>()
         });
         let input_json = payload.to_string();
-        let r = self
-            .call_pi(payload, &self.config.ai.translation_thinking)
-            .await?;
-        let local = parse_ranges(&r.value)?;
-        validate_ranges_cover(cues.len(), &local)?;
+        // 分句输出偶发 JSON 截断（deepseek 输出限制），失败时复用翻译的重试次数退避重试。
+        let attempts = self.config.ai.translation_batch_retries.saturating_add(1);
+        let mut last_error = None;
+        let mut result = None;
+        for attempt in 1..=attempts {
+            let r = self
+                .call_pi(payload.clone(), &self.config.ai.translation_thinking)
+                .await;
+            match r {
+                Ok(r) => match parse_ranges(&r.value).and_then(|local| {
+                    validate_ranges_cover(cues.len(), &local)?;
+                    Ok(local)
+                }) {
+                    Ok(local) => {
+                        result = Some((r, local));
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                },
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < attempts {
+                self.db.event(
+                    Some(job_id),
+                    "warn",
+                    &format!(
+                        "分句窗口 {}..{} 第 {attempt}/{attempts} 次失败: {}",
+                        core_start,
+                        preferred_end,
+                        last_error.as_ref().expect("分句重试前必有错误")
+                    ),
+                )?;
+                sleep(Duration::from_secs((1u64 << (attempt - 1)).min(30))).await;
+            }
+        }
+        let (r, local) = result.ok_or_else(|| {
+            last_error
+                .unwrap_or_else(|| anyhow::anyhow!("分句窗口 {core_start}..{preferred_end} 失败"))
+        })?;
         self.db.record_ai_call(
             job_id,
             stage,
