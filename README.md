@@ -1,14 +1,14 @@
 # y2b-rs
 
-Rust CLI/TUI 工具：监控 YouTube 频道更新，按频道选择原片直传或 Pi 分句/翻译字幕后压制，并通过 biliup 投稿 Bilibili。
+Rust CLI/TUI 工具：监控 YouTube 频道更新，按频道选择原片直传或 Pi 分句/翻译后投稿，并通过 biliup 投稿 Bilibili，已投稿视频自动补中文 CC 字幕。
 
 ## 流程
 
 - RSS 每 60 秒发现更新，每 6 小时用 yt-dlp 校对最近 30 条。
 - 全局串行处理。单个 `translated` 任务内部并行下载视频和处理字幕。下载限制到 60fps、约 2,073,600 像素，优先 AVC/AAC。
-- `direct`：并行下载视频和调用 Pi 一次生成中文标题、动态文案和标签；不下载字幕、不分句、不压制。
-- `translated`：英文字幕 → Pi 分句 → Pi 翻译 → 双语 ASS → H.264/AAC 压制 → 投稿。
-- `translated` 无字幕时自动直传原片，状态设为 `uploaded_original_pending_subtitle`；之后用 `y2b subtitle` 命令给已投稿视频补中文 CC 字幕（B站软字幕，提交后走平台审核）。
+- `direct`：并行下载视频和调用 Pi 一次生成中文标题、动态文案和标签；不下载字幕、不分句。
+- `translated`：英文字幕 → Pi 分句 → Pi 翻译 → 上传原片 → 自动提交中文 CC 字幕（B站软字幕，观众可开关，不走压制）。
+- `translated` 无字幕时自动直传原片，状态设为 `uploaded_original_pending_subtitle`；之后用 `y2b subtitle` 命令补中文 CC 字幕。
 - 普通投稿按每个视频一次无状态 `publish_metadata` Pi 请求生成中文标题、动态文案和标签。字幕模式在预算内传入完整双语字幕，超限时保留首尾并均匀采样；结果持久化后，任务重试或服务重启不会重复调用 Pi。标题或动态不合格会重试，不会用英文原标题或固定动态投稿。
 - 投稿固定为手机游戏分区 `tid=172`、自制 `copyright=1` 并允许转载；不使用 Bilibili 转载来源字段。标签始终以“荒野乱斗”开头，简介按清理 hashtag 后的原标题、YouTube 来源、原作者和工具地址确定性生成。
 - 所有新投稿都下载 yt-dlp 选定的 YouTube 原封面，转为 JPEG 后通过 biliup `--cover` 上传；封面失败时任务重试而不会无封面投稿。
@@ -16,7 +16,7 @@ Rust CLI/TUI 工具：监控 YouTube 频道更新，按频道选择原片直传�
 - `pi/brawl-stars-glossary.json` 来自国际服客户端英文/简中本地化资源。审计脚本从游戏逻辑 TID 中提取无歧义术语并依次测试 Terra、Luna、Sol，只把至少一个模型译错的官译加入词库；extension 每次仅注入当前输入实际出现的词条，避免全量词库占用上下文。
 - Pi 批处理支持 `adaptive` 和 `whole_video`。默认按 256k 上下文、200k 安全阈值估算输入与输出；阈值内整条视频只调用一次分句和一次翻译，超限时按 token 拆批。自适应分句携带前后 12 条上下文，并在 Pi 返回的自然分句边界衔接批次。
 - SQLite 持久化频道、任务、阶段、峰值 RSS、Pi token/cost 和认证状态。连续失败 5 次进入 `dead_letter` 并删除大型视频。
-- `watch` 分别使用单个准备 worker 和单个上传 worker；任务准备完成后持久化为 `ready_to_upload`，投稿冷却期间仍可继续下载、翻译和压制后续任务，实际上传保持严格串行。
+- `watch` 分别使用单个准备 worker 和单个上传 worker；任务准备完成后持久化为 `ready_to_upload`，投稿冷却期间仍可继续下载和翻译后续任务，实际上传保持严格串行。
 - 新投稿默认至少间隔 30 分钟；B站返回 `21566` 时全局冷却 6 小时并自动等待后重试，避免积压任务集中撞风控。
 
 ## CLI

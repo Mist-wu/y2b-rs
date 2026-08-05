@@ -85,27 +85,6 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
             }),
         }
     }
-    let mut c = Command::new(&config.render.ffmpeg);
-    c.args(["-hide_banner", "-filters"]);
-    match run_monitored(c, Duration::from_secs(20)).await {
-        Ok(r) => {
-            let ok = r.stdout.contains(" ass ") && r.stdout.contains(" subtitles ");
-            out.push(CheckItem {
-                name: "ffmpeg filters".into(),
-                ok,
-                detail: if ok {
-                    "ass/subtitles 可用".into()
-                } else {
-                    "缺少 ass 或 subtitles".into()
-                },
-            })
-        }
-        Err(e) => out.push(CheckItem {
-            name: "ffmpeg filters".into(),
-            ok: false,
-            detail: e.to_string(),
-        }),
-    }
     let swap = fs::read_to_string("/proc/swaps")
         .map(|x| x.lines().count() > 1)
         .unwrap_or(false);
@@ -145,7 +124,6 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
         ("Pi policy", &config.ai.policy),
         ("Pi audit policy", &audit_policy_path),
         ("Brawl Stars glossary", &glossary_path),
-        ("fonts", &config.render.fonts_dir),
     ] {
         out.push(CheckItem {
             name: name.into(),
@@ -189,12 +167,6 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
             }),
         }
     }
-    let smoke = config.runtime.data_dir.join("checks/ass-smoke.mp4");
-    out.push(CheckItem {
-        name: "ASS smoke".into(),
-        ok: smoke.exists(),
-        detail: smoke.display().to_string(),
-    });
     for (key, label) in [
         ("auth.youtube", "YouTube auth"),
         ("auth.bilibili", "Bilibili auth"),
@@ -252,25 +224,6 @@ pub async fn write_baseline(config: &Config, dest: &Path) -> Result<Baseline> {
                 path: path.display().to_string(),
                 version: String::new(),
                 sha256: Some(hash_file(path)?),
-            });
-        }
-    }
-    for entry in fs::read_dir(&config.render.fonts_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let path = entry.path();
-        let is_font = path
-            .extension()
-            .and_then(|x| x.to_str())
-            .is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc"));
-        if path.is_file() && is_font {
-            items.push(BaselineItem {
-                name: format!("font:{}", entry.file_name().to_string_lossy()),
-                path: path.display().to_string(),
-                version: String::new(),
-                sha256: Some(hash_file(&path)?),
             });
         }
     }

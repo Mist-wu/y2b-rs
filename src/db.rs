@@ -474,14 +474,11 @@ impl Database {
         }
         Ok(())
     }
-    pub fn set_job_paths(
-        &self,
-        id: &str,
-        raw: Option<&str>,
-        subtitle: Option<&str>,
-        rendered: Option<&str>,
-    ) -> Result<()> {
-        self.conn().execute("UPDATE jobs SET raw_video_path=COALESCE(?,raw_video_path),subtitle_path=COALESCE(?,subtitle_path),rendered_path=COALESCE(?,rendered_path),updated_at=? WHERE id=?",params![raw,subtitle,rendered,Utc::now().to_rfc3339(),id])?;
+    pub fn set_job_paths(&self, id: &str, raw: Option<&str>) -> Result<()> {
+        self.conn().execute(
+            "UPDATE jobs SET raw_video_path=COALESCE(?,raw_video_path),updated_at=? WHERE id=?",
+            params![raw, Utc::now().to_rfc3339(), id],
+        )?;
         Ok(())
     }
     pub fn set_job_bvid(&self, id: &str, bvid: &str) -> Result<()> {

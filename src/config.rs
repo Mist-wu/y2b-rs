@@ -100,11 +100,6 @@ pub struct ModelConfig {
 pub struct RenderConfig {
     pub ffmpeg: String,
     pub ffprobe: String,
-    pub fonts_dir: PathBuf,
-    pub font_cn: String,
-    pub font_en: String,
-    pub crf: i64,
-    pub preset: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,11 +217,6 @@ impl Default for RenderConfig {
         Self {
             ffmpeg: "/usr/local/bin/ffmpeg".into(),
             ffprobe: "/usr/local/bin/ffprobe".into(),
-            fonts_dir: "/opt/y2b/fonts".into(),
-            font_cn: "Source Han Sans CN Medium".into(),
-            font_en: "Inter SemiBold".into(),
-            crf: 18,
-            preset: "ultrafast".into(),
         }
     }
 }

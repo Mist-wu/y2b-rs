@@ -35,7 +35,6 @@ struct PiResult {
 
 #[derive(Debug)]
 struct PreparedSubtitle {
-    ass: PathBuf,
     cues: Vec<Cue>,
 }
 
@@ -158,26 +157,23 @@ impl Pipeline {
             return self.run_direct(job, &meta, &work).await;
         }
 
-        // A Bilibili submission can fail after the complete media upload (for
-        // example, rate-limit code 21566).  Retrying that failure must reuse the
-        // expensive rendered file instead of translating and encoding again.
+        // 投稿失败重试（如 21566 冷却）：发布元数据已存在时直接复用下载好的
+        // 原片和翻译缓存，跳过重复翻译。
         if self.db.publication_metadata(&job.id)?.is_some()
-            && let Some(rendered) = self.reusable_render(&meta.id).await?
+            && let Some(video) = find_video(&work, &meta.id)
         {
             self.db.event(
                 Some(&job.id),
                 "info",
-                "检测到有效成片，跳过字幕翻译和压制并重试投稿",
+                "检测到已下载原片，跳过字幕翻译并重试投稿",
             )?;
             self.db
-                .set_job_paths(&job.id, None, None, Some(&rendered.to_string_lossy()))?;
-            self.probe_media(&job.id, &rendered, "rendered_probe")
-                .await?;
+                .set_job_paths(&job.id, Some(&video.to_string_lossy()))?;
             let cover = self.download_cover(&job.id, &meta, &work).await?;
             self.db.queue_prepared_upload(
                 &job.id,
                 &PreparedUpload::Submission {
-                    video_path: rendered.to_string_lossy().into_owned(),
+                    video_path: video.to_string_lossy().into_owned(),
                     cover_path: cover.to_string_lossy().into_owned(),
                     mode: TransferMode::Translated,
                     completion_status: JobStatus::Completed,
@@ -190,7 +186,7 @@ impl Pipeline {
         let subtitle_fut = self.prepare_translated_subtitle(job, &meta, &work);
         let (video, subtitle) = try_join_branches(video_fut, subtitle_fut).await?;
         self.db
-            .set_job_paths(&job.id, Some(&video.to_string_lossy()), None, None)?;
+            .set_job_paths(&job.id, Some(&video.to_string_lossy()))?;
         let Some(subtitle) = subtitle else {
             // 无字幕时直传原片：之后用 `y2b subtitle` 命令补 CC 字幕。
             self.publish_metadata(&job.id, TransferMode::Direct, &meta, None)
@@ -211,17 +207,10 @@ impl Pipeline {
             Some(&subtitle.cues),
         )
         .await?;
-        let rendered = self
-            .render(&job.id, &video, &subtitle.ass, &meta.id)
-            .await?;
-        self.db
-            .set_job_paths(&job.id, None, None, Some(&rendered.to_string_lossy()))?;
-        self.probe_media(&job.id, &rendered, "rendered_probe")
-            .await?;
         let prepared = {
             let cover = self.download_cover(&job.id, &meta, &work).await?;
             PreparedUpload::Submission {
-                video_path: rendered.to_string_lossy().into_owned(),
+                video_path: video.to_string_lossy().into_owned(),
                 cover_path: cover.to_string_lossy().into_owned(),
                 mode: TransferMode::Translated,
                 completion_status: JobStatus::Completed,
@@ -236,7 +225,7 @@ impl Pipeline {
         let metadata_fut = self.publish_metadata(&job.id, TransferMode::Direct, meta, None);
         let (video, _) = try_join_branches(video_fut, metadata_fut).await?;
         self.db
-            .set_job_paths(&job.id, Some(&video.to_string_lossy()), None, None)?;
+            .set_job_paths(&job.id, Some(&video.to_string_lossy()))?;
         self.prepare_direct_upload(job, meta, &video, JobStatus::Completed)
             .await
     }
@@ -335,7 +324,6 @@ impl Pipeline {
     ) -> Result<Option<PreparedSubtitle>> {
         let segmented = work.join(format!("{}.en.segmented.json", meta.id));
         let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
-        let ass = work.join(format!("{}.bilingual.ass", meta.id));
 
         let cached = match load_segmented_cache(&segmented) {
             Ok(Some(cues)) => {
@@ -397,17 +385,7 @@ impl Pipeline {
                     .await?;
             }
         }
-        subtitle::write_ass(
-            &cues,
-            &ass,
-            meta.width.unwrap_or(1920),
-            meta.height.unwrap_or(1080),
-            &self.config.render.font_cn,
-            &self.config.render.font_en,
-        )?;
-        self.db
-            .set_job_paths(&job.id, None, Some(&ass.to_string_lossy()), None)?;
-        Ok(Some(PreparedSubtitle { ass, cues }))
+        Ok(Some(PreparedSubtitle { cues }))
     }
 
     /// 无缓存时完整跑一遍：下载字幕 → 解析 VTT → 分句 → 落盘。
@@ -1058,148 +1036,6 @@ impl Pipeline {
         })
     }
 
-    async fn render(
-        &self,
-        job_id: &str,
-        video: &Path,
-        ass: &Path,
-        video_id: &str,
-    ) -> Result<PathBuf> {
-        self.db
-            .update_job_status(job_id, JobStatus::Rendering, None)?;
-        let stage = self.db.start_stage(job_id, "render", None, None, None)?;
-        fs::create_dir_all(&self.config.runtime.output_dir)?;
-        let output = self
-            .config
-            .runtime
-            .output_dir
-            .join(format!("{video_id}.bilingual.mp4"));
-        if self.render_file_is_valid(&output).await {
-            self.db.finish_stage(
-                stage,
-                "completed",
-                0,
-                0,
-                Some(&format!("reused {}", output.display())),
-            )?;
-            return Ok(output);
-        }
-        let temporary = self
-            .config
-            .runtime
-            .output_dir
-            .join(format!("{video_id}.bilingual.tmp.mp4"));
-        if temporary.exists() {
-            fs::remove_file(&temporary)?;
-        }
-        let filter = format!(
-            "ass=filename='{}':fontsdir='{}'",
-            escape_filter(ass),
-            escape_filter(&self.config.render.fonts_dir)
-        );
-        let mut cmd = Command::new(&self.config.render.ffmpeg);
-        cmd.args(["-nostdin", "-y", "-loglevel", "warning"])
-            .arg("-i")
-            .arg(video)
-            .args([
-                "-vf",
-                &filter,
-                "-threads",
-                "1",
-                "-c:v",
-                "libx264",
-                "-preset",
-                &self.config.render.preset,
-                "-crf",
-                &self.config.render.crf.to_string(),
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-movflags",
-                "+faststart",
-            ])
-            .arg(&temporary);
-        let out = match run_monitored(cmd, Duration::from_secs(14400)).await {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                self.db
-                    .finish_stage(stage, "failed", 0, 0, Some(&error.to_string()))?;
-                return Err(error);
-            }
-        };
-        if !self.render_file_is_valid(&temporary).await {
-            let _ = fs::remove_file(&temporary);
-            let error = anyhow::anyhow!("FFmpeg 生成的临时成片未通过 ffprobe 校验");
-            self.db.finish_stage(
-                stage,
-                "failed",
-                out.duration_ms,
-                out.peak_rss_kib,
-                Some(&error.to_string()),
-            )?;
-            return Err(error);
-        }
-        fs::rename(&temporary, &output)?;
-        self.db.finish_stage(
-            stage,
-            "completed",
-            out.duration_ms,
-            out.peak_rss_kib,
-            Some(&output.to_string_lossy()),
-        )?;
-        Ok(output)
-    }
-
-    async fn reusable_render(&self, video_id: &str) -> Result<Option<PathBuf>> {
-        let output = self
-            .config
-            .runtime
-            .output_dir
-            .join(format!("{video_id}.bilingual.mp4"));
-        Ok(self.render_file_is_valid(&output).await.then_some(output))
-    }
-
-    async fn render_file_is_valid(&self, path: &Path) -> bool {
-        if !path.metadata().is_ok_and(|metadata| metadata.len() > 0) {
-            return false;
-        }
-        let mut cmd = Command::new(&self.config.render.ffprobe);
-        cmd.args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name,width,height,pix_fmt:format=duration",
-            "-of",
-            "json",
-        ])
-        .arg(path);
-        let Ok(output) = run_monitored(cmd, Duration::from_secs(120)).await else {
-            return false;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(&output.stdout) else {
-            return false;
-        };
-        let Some(stream) = value["streams"]
-            .as_array()
-            .and_then(|streams| streams.first())
-        else {
-            return false;
-        };
-        stream["codec_name"] == "h264"
-            && stream["width"].as_u64().is_some_and(|width| width > 0)
-            && stream["height"].as_u64().is_some_and(|height| height > 0)
-            && value["format"]["duration"]
-                .as_str()
-                .and_then(|duration| duration.parse::<f64>().ok())
-                .is_some_and(|duration| duration > 0.0)
-    }
-
     async fn upload_prepared_job_inner(&self, job: &Job) -> Result<()> {
         if !matches!(
             job.status,
@@ -1258,8 +1094,32 @@ impl Pipeline {
         };
         self.db
             .finish_prepared_upload(&job.id, &bvid, completion_status)?;
-        let (raw, _, rendered) = self.db.job_paths(&job.id)?;
-        let paths = [raw, rendered]
+        // 上传成功后自动补中文 CC 字幕（只复用刚生成的翻译缓存）。
+        // 失败不阻塞任务：标记待补字幕状态，`y2b subtitle --all` 会捞起重试。
+        if completion_status == JobStatus::Completed {
+            let fresh = self
+                .db
+                .get_job(&job.id)?
+                .with_context(|| format!("自动补字幕时任务不存在: {}", job.id))?;
+            match self.auto_submit_cc_subtitle(&fresh).await {
+                Ok(message) => tracing::info!(job_id = %job.id, "{message}"),
+                Err(error) => {
+                    tracing::warn!(job_id = %job.id, error = %error, "CC 字幕自动提交失败");
+                    self.db.event(
+                        Some(&job.id),
+                        "warn",
+                        &format!("CC 字幕自动提交失败: {error:#}"),
+                    )?;
+                    self.db.update_job_status(
+                        &job.id,
+                        JobStatus::UploadedOriginalPendingSubtitle,
+                        Some(&format!("CC 字幕提交失败: {error:#}")),
+                    )?;
+                }
+            }
+        }
+        let (raw, _, _) = self.db.job_paths(&job.id)?;
+        let paths = [raw]
             .into_iter()
             .flatten()
             .map(PathBuf::from)
@@ -1337,6 +1197,23 @@ impl Pipeline {
             .db
             .job_by_bvid(bvid)?
             .with_context(|| format!("数据库中找不到 bvid={bvid} 的任务"))?;
+        self.backfill_cc_subtitle_for_job(&job, true).await
+    }
+
+    /// 上传成功后的自动 CC 提交：只复用刚生成的翻译缓存，素材缺失时不重新下载。
+    async fn auto_submit_cc_subtitle(&self, job: &Job) -> Result<String> {
+        self.backfill_cc_subtitle_for_job(job, false).await
+    }
+
+    async fn backfill_cc_subtitle_for_job(
+        &self,
+        job: &Job,
+        redownload_if_missing: bool,
+    ) -> Result<String> {
+        let bvid = job.bvid.as_deref().unwrap_or_default();
+        if bvid.is_empty() {
+            bail!("任务 {} 没有 BVID", job.id)
+        }
         let meta = self
             .db
             .source_metadata(&job.id)?
@@ -1356,7 +1233,7 @@ impl Pipeline {
                 &format!("复用翻译缓存: {} cues", cached.len()),
             )?;
             cached
-        } else {
+        } else if redownload_if_missing {
             fs::create_dir_all(&work)?;
             let segmented = work.join(format!("{}.en.segmented.json", meta.id));
             let Some(cues) = self
@@ -1369,6 +1246,8 @@ impl Pipeline {
             self.translate_and_save(&job.id, &mut cues, &translated)
                 .await?;
             cues
+        } else {
+            bail!("缺少翻译素材，跳过自动 CC 提交（可手动执行 y2b subtitle add {bvid}）")
         };
         let cc_cues = cc_cues_from(&cues, Some(view.duration));
         if cc_cues.is_empty() {
@@ -1491,9 +1370,9 @@ impl Pipeline {
         Ok(())
     }
     fn cleanup_large(&self, job_id: &str) -> Result<()> {
-        let (raw, _, rendered) = self.db.job_paths(job_id)?;
-        for p in [raw, rendered].into_iter().flatten() {
-            let path = PathBuf::from(p);
+        let (raw, _, _) = self.db.job_paths(job_id)?;
+        if let Some(raw) = raw {
+            let path = PathBuf::from(raw);
             if path.exists() {
                 fs::remove_file(path)?;
             }
@@ -2195,13 +2074,6 @@ fn find_video(work: &Path, video_id: &str) -> Option<PathBuf> {
                 .is_some_and(|n| n.to_string_lossy().starts_with(&format!("{video_id}.raw.")))
                 && p.metadata().is_ok_and(|m| m.len() > 1024)
         })
-}
-fn escape_filter(p: &Path) -> String {
-    p.to_string_lossy()
-        .replace('\\', "/")
-        .replace('\'', "\\'")
-        .replace(':', "\\:")
-        .replace(',', "\\,")
 }
 fn parse_pi_stream(stream: &str) -> Result<(Value, AiUsage)> {
     let mut text = None;
