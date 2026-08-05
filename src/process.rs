@@ -6,6 +6,34 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+/// 读取子进程输出并限制捕获大小：超过上限时只保留尾部。
+///
+/// pi 的 JSONL 事件流可能输出数百 MB（deepseek 的 thinking 全量流式），
+/// 无限收集会撑爆低配服务器内存；关键信息（agent_end 事件、biliup 的 BV
+/// 号、错误尾部）都位于输出末尾，保留尾部即可。
+const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
+
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = r.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_CAPTURE_BYTES * 2 {
+            let drop = buf.len() - MAX_CAPTURE_BYTES;
+            buf.drain(..drop);
+        }
+    }
+    if buf.len() > MAX_CAPTURE_BYTES {
+        let drop = buf.len() - MAX_CAPTURE_BYTES;
+        buf.drain(..drop);
+    }
+    Ok(buf)
+}
+
 #[derive(Debug, Clone)]
 pub struct ProcessOutput {
     pub stdout: String,
@@ -23,14 +51,8 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
     let pid = child.id().context("子进程没有 PID")?;
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-    let stdout_task = tokio::spawn(async move {
-        let mut b = Vec::new();
-        stdout.read_to_end(&mut b).await.map(|_| b)
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut b = Vec::new();
-        stderr.read_to_end(&mut b).await.map(|_| b)
-    });
+    let stdout_task = tokio::spawn(async move { read_capped(&mut stdout).await });
+    let stderr_task = tokio::spawn(async move { read_capped(&mut stderr).await });
     let started = Instant::now();
     let mut sys = System::new();
     let (status, peak) = match tokio::time::timeout(timeout, async {

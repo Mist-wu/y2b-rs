@@ -68,7 +68,9 @@ pub struct AiConfig {
     pub model: String,
     /// publish_metadata 等质量敏感任务的思考级别。
     pub thinking: String,
-    /// 分句/翻译这类确定性转换任务的思考级别（默认 low，比 high 快数倍）。
+    /// 分句/翻译这类确定性转换任务的思考级别。实测 deepseek 下 `off` 的
+    /// 流式输出约 1.5MB/批，`low` 涨到 14MB，`medium` 177MB——
+    /// 大 thinking 会撑爆 2GB 服务器内存，必须用 `off`。
     pub translation_thinking: String,
     pub allowed_models: Vec<ModelConfig>,
     pub timeout_seconds: u64,
@@ -188,7 +190,7 @@ impl Default for AiConfig {
             provider: "openai-codex".into(),
             model: "gpt-5.6-luna".into(),
             thinking: "high".into(),
-            translation_thinking: "low".into(),
+            translation_thinking: "off".into(),
             allowed_models: vec![
                 ModelConfig {
                     provider: "openai-codex".into(),
