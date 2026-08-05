@@ -22,6 +22,8 @@ pub struct VideoView {
     pub aid: i64,
     pub cid: i64,
     pub title: String,
+    /// 视频时长（秒），用于把字幕时间裁剪到视频长度内。
+    pub duration: f64,
 }
 
 /// 一条可提交的 CC 字幕 cue（转成 {"body":[...]} 后提交）。
@@ -103,6 +105,9 @@ impl BiliSubtitleClient {
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
+            duration: value["data"]["duration"]
+                .as_f64()
+                .context("响应缺少 duration")?,
         })
     }
 
@@ -113,6 +118,7 @@ impl BiliSubtitleClient {
             .get(LAN_API)
             .query(&[("type", "1"), ("oid", &cid.to_string())])
             .header("Referer", "https://member.bilibili.com/")
+            .header("Cookie", &self.cookie_header)
             .send()
             .await?;
         let value: serde_json::Value = resp.json().await?;
@@ -162,10 +168,26 @@ impl BiliSubtitleClient {
         let value: serde_json::Value = resp.json().await?;
         match value["code"].as_i64() {
             Some(0) => Ok(()),
-            Some(code) => bail!(
-                "提交字幕失败: code={code} {}",
-                value["message"].as_str().unwrap_or("")
-            ),
+            Some(code) => {
+                let detail = value["data"]
+                    .as_array()
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|r| {
+                                r["error_msg"]
+                                    .as_str()
+                                    .map(|m| format!("line {}: {m}", r["line"]))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                    .unwrap_or_default();
+                let base = value["message"].as_str().unwrap_or("");
+                if detail.is_empty() {
+                    bail!("提交字幕失败: code={code} {base}")
+                }
+                bail!("提交字幕失败: code={code} {base}（{detail}）")
+            }
             None => bail!("提交字幕失败: 响应缺少 code"),
         }
     }

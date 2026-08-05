@@ -1370,7 +1370,7 @@ impl Pipeline {
                 .await?;
             cues
         };
-        let cc_cues = cc_cues_from(&cues);
+        let cc_cues = cc_cues_from(&cues, Some(view.duration));
         if cc_cues.is_empty() {
             bail!("翻译结果为空，没有可提交的中文字幕")
         }
@@ -1869,7 +1869,7 @@ fn requires_translated_pipeline(mode: TransferMode) -> bool {
 }
 
 /// 把双语 cue 转成 B站 CC 字幕条目：只保留有非空翻译且时间合法（end > start）的。
-fn cc_cues_from(cues: &[Cue]) -> Vec<CcCue> {
+fn cc_cues_from(cues: &[Cue], max_to: Option<f64>) -> Vec<CcCue> {
     cues.iter()
         .filter(|c| {
             c.translation
@@ -1877,15 +1877,28 @@ fn cc_cues_from(cues: &[Cue]) -> Vec<CcCue> {
                 .is_some_and(|t| !t.trim().is_empty())
                 && c.end > c.start
         })
-        .map(|c| CcCue {
-            from: c.start,
-            to: c.end,
-            content: c
-                .translation
-                .as_deref()
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
+        .filter_map(|c| {
+            let from = c.start;
+            let mut to = c.end;
+            if let Some(max) = max_to {
+                if from >= max {
+                    return None;
+                }
+                to = to.min(max);
+            }
+            if to <= from {
+                return None;
+            }
+            Some(CcCue {
+                from,
+                to,
+                content: c
+                    .translation
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            })
         })
         .collect()
 }
@@ -2650,11 +2663,39 @@ mod tests {
                 translation: None,
             },
         ];
-        let cc = cc_cues_from(&cues);
+        let cc = cc_cues_from(&cues, None);
         assert_eq!(cc.len(), 1);
         assert_eq!(cc[0].content, "你好");
         assert_eq!(cc[0].from, 0.0);
         assert_eq!(cc[0].to, 1.5);
+    }
+
+    #[test]
+    fn cc_cues_clip_beyond_video_duration() {
+        let cues = vec![
+            Cue {
+                start: 0.0,
+                end: 5.0,
+                source: "a".into(),
+                translation: Some("正常".into()),
+            },
+            Cue {
+                start: 4.0,
+                end: 9.0,
+                source: "b".into(),
+                translation: Some("跨越结尾".into()),
+            },
+            Cue {
+                start: 7.0,
+                end: 8.0,
+                source: "c".into(),
+                translation: Some("整体超出".into()),
+            },
+        ];
+        let cc = cc_cues_from(&cues, Some(6.5));
+        assert_eq!(cc.len(), 2);
+        assert_eq!(cc[0].to, 5.0);
+        assert_eq!(cc[1].to, 6.5);
     }
 
     #[tokio::test]
