@@ -62,10 +62,15 @@ pub fn is_live_content_pending(error: &anyhow::Error) -> bool {
         if message.starts_with(LIVE_CONTENT_PENDING_PREFIX) {
             return true;
         }
-        LIVE_EVENT_NOT_STARTED_MARKERS
-            .iter()
-            .any(|marker| message.contains(marker))
+        contains_live_markers(&message)
     })
+}
+
+/// 检测输出文本里是否有直播/预约特征（yt-dlp 的英文错误消息或元数据字段）。
+pub fn contains_live_markers(text: &str) -> bool {
+    LIVE_EVENT_NOT_STARTED_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
 }
 
 fn validate_single_video(v: &Value) -> Result<()> {
@@ -414,7 +419,18 @@ impl Monitor {
             url,
         ]);
         let out = run_monitored(cmd, Duration::from_secs(120)).await?;
-        let v: Value = serde_json::from_str(out.stdout.trim())?;
+        let v: Value = match serde_json::from_str(out.stdout.trim()) {
+            Ok(v) => v,
+            Err(error) => {
+                // yt-dlp 对直播/预约内容可能不输出 JSON（原因在 stderr）；
+                // 解析失败时合并 stderr 检查直播特征，避免漏检导致反复重试。
+                let merged = format!("{}\n{}", out.stdout, out.stderr);
+                if contains_live_markers(&merged) {
+                    bail!("{LIVE_CONTENT_PENDING_PREFIX}: yt-dlp 无 JSON 输出")
+                }
+                return Err(error).context("yt-dlp 输出不是 JSON");
+            }
+        };
         validate_single_video(&v)?;
         let live = v
             .get("live_status")
@@ -503,6 +519,10 @@ mod tests {
         assert!(!is_live_content_pending(&anyhow::anyhow!(
             "network timeout"
         )));
+        // yt-dlp 对直播可能不输出 JSON（stdout 为空、原因在 stderr）：
+        // 合并输出里出现直播特征时应归类为直播内容。
+        assert!(contains_live_markers("ERROR: This live event has ended"));
+        assert!(!contains_live_markers("ERROR: network timeout"));
     }
 
     #[test]
