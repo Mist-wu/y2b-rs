@@ -1340,6 +1340,11 @@ impl Pipeline {
             bilibili_api::BiliSubtitleClient::from_cookies_file(&self.config.bilibili.cookies)?;
         let view = client.view(bvid).await?;
         if client.has_subtitle_lan(view.cid, "zh").await? {
+            // 已有中文字幕：待补状态的任务标记完成。
+            if job.status == JobStatus::UploadedOriginalPendingSubtitle {
+                self.db
+                    .update_job_status(&job.id, JobStatus::Completed, None)?;
+            }
             return Ok(format!("{bvid} 已有中文字幕，跳过"));
         }
         let work = self.config.runtime.download_dir.join(&meta.id);
@@ -1377,6 +1382,11 @@ impl Pipeline {
             "info",
             &format!("已提交中文 CC 字幕（{} 条），等待 B站审核", cc_cues.len()),
         )?;
+        // 提交成功后，把待补字幕状态的任务标记为完成（自动提交失败时才会挂起）。
+        if job.status == JobStatus::UploadedOriginalPendingSubtitle {
+            self.db
+                .update_job_status(&job.id, JobStatus::Completed, None)?;
+        }
         Ok(format!(
             "{bvid} 已提交中文 CC 字幕（{} 条），等待 B站审核",
             cc_cues.len()
