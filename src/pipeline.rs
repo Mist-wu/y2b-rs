@@ -1728,7 +1728,8 @@ fn parse_publication_metadata(value: &Value) -> Result<PublicationMetadata> {
         tid: BILIBILI_TID,
         raw_json: value.to_string(),
     };
-    validate_publication_metadata(&metadata)?;
+    // 注意：这里只负责解析，不做内容校验——校验统一由调用方（publish_metadata
+    // 重试循环）执行，否则校验错误会走“解析失败”分支而跳过反馈重试。
     Ok(metadata)
 }
 
@@ -2503,22 +2504,23 @@ mod tests {
 
     #[test]
     fn publication_metadata_rejects_invalid_title_or_dynamic() {
-        assert!(
-            parse_publication_metadata(&json!({
-                "title": "",
-                "dynamic": "精彩对局。",
-                "tags": ["荒野乱斗"]
-            }))
-            .is_err()
-        );
-        assert!(
-            parse_publication_metadata(&json!({
-                "title": "精彩对局",
-                "dynamic": "欢迎点赞投币关注我！",
-                "tags": ["荒野乱斗"]
-            }))
-            .is_err()
-        );
+        // 解析只负责结构；内容校验由 validate_publication_metadata 负责，
+        // 调用方（publish_metadata 反馈重试循环）对校验失败带反馈重试。
+        let parsed = parse_publication_metadata(&json!({
+            "title": "",
+            "dynamic": "精彩对局。",
+            "tags": ["荒野乱斗"]
+        }))
+        .unwrap();
+        assert!(validate_publication_metadata(&parsed).is_err());
+
+        let parsed = parse_publication_metadata(&json!({
+            "title": "精彩对局",
+            "dynamic": "欢迎点赞投币关注我！",
+            "tags": ["荒野乱斗"]
+        }))
+        .unwrap();
+        assert!(validate_publication_metadata(&parsed).is_err());
     }
 
     #[test]
