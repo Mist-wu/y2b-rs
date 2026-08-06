@@ -1154,11 +1154,11 @@ impl Pipeline {
             .db
             .prepared_upload(&job.id)?
             .with_context(|| format!("待上传任务 {} 缺少持久化上传计划", job.id))?;
-        let (bvid, completion_status) = match prepared {
+        let (bvid, completion_status, mode) = match prepared {
             PreparedUpload::Submission {
                 video_path,
                 cover_path,
-                mode: _,
+                mode,
                 completion_status,
             } => {
                 if !matches!(
@@ -1189,14 +1189,15 @@ impl Pipeline {
                 let bvid = self
                     .upload(&job.id, &video, &publication, &meta, Some(&cover))
                     .await?;
-                (bvid, completion_status)
+                (bvid, completion_status, mode)
             }
         };
         self.db
             .finish_prepared_upload(&job.id, &bvid, completion_status)?;
         // 上传成功后自动补中文 CC 字幕（只复用刚生成的翻译缓存）。
+        // 只对 translated 任务触发；direct 任务不下载字幕，误触发会白跑。
         // 失败不阻塞任务：标记待补字幕状态，`y2b subtitle --all` 会捞起重试。
-        if completion_status == JobStatus::Completed {
+        if completion_status == JobStatus::Completed && mode == TransferMode::Translated {
             let fresh = self
                 .db
                 .get_job(&job.id)?
