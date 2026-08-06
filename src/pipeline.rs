@@ -1302,8 +1302,38 @@ impl Pipeline {
     }
 
     /// 上传成功后的自动 CC 提交：只复用刚生成的翻译缓存，素材缺失时不重新下载。
+    ///
+    /// B 站稿件上传后需要时间处理，bvid 查询可能短暂返回 -404：先等待再提交，
+    /// 仍 -404 按固定间隔重试，重试耗尽后返回错误交给调用方标记待补字幕。
     async fn auto_submit_cc_subtitle(&self, job: &Job) -> Result<String> {
-        self.backfill_cc_subtitle_for_job(job, false).await
+        const INITIAL_DELAY: Duration = Duration::from_secs(90);
+        const RETRY_INTERVAL: Duration = Duration::from_secs(60);
+        const MAX_RETRIES: u32 = 8;
+        sleep(INITIAL_DELAY).await;
+        let mut retries = 0;
+        loop {
+            match self.backfill_cc_subtitle_for_job(job, false).await {
+                Ok(message) => return Ok(message),
+                Err(error) if is_bilibili_video_not_ready(&error) && retries < MAX_RETRIES => {
+                    retries += 1;
+                    tracing::warn!(
+                        job_id = %job.id,
+                        retries,
+                        error = %error,
+                        "CC 字幕提交时稿件未就绪，稍后重试"
+                    );
+                    self.db.event(
+                        Some(&job.id),
+                        "warn",
+                        &format!(
+                            "CC 字幕提交时稿件未就绪（第 {retries} 次重试）: {error}"
+                        ),
+                    )?;
+                    sleep(RETRY_INTERVAL).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn backfill_cc_subtitle_for_job(
@@ -2273,6 +2303,14 @@ fn parse_ranges(v: &Value) -> Result<Vec<(usize, usize)>> {
         })
         .collect()
 }
+/// B 站稿件上传后尚未处理完成时，view 接口返回 code=-404（“啥都木有”）。
+/// 该错误是瞬时的，应在稍后重试；其余错误（字幕源缺失、认证等）重试无益。
+fn is_bilibili_video_not_ready(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("code=-404"))
+}
+
 fn parse_translations(v: &Value) -> Result<Vec<(usize, String)>> {
     v.get("translations")
         .and_then(Value::as_array)
@@ -2611,6 +2649,22 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn bilibili_not_ready_error_is_classified_for_cc_retry() {
+        assert!(is_bilibili_video_not_ready(&anyhow::anyhow!(
+            "查询稿件 BV1qQMm6HEi3 失败: code=-404 啥都木有"
+        )));
+        assert!(is_bilibili_video_not_ready(&anyhow::anyhow!(
+            "sub process failed: 查询稿件 BV1bQMU63Eam 失败: code=-404"
+        )));
+        assert!(!is_bilibili_video_not_ready(&anyhow::anyhow!(
+            "缺少翻译素材，跳过自动 CC 提交"
+        )));
+        assert!(!is_bilibili_video_not_ready(&anyhow::anyhow!(
+            "Bilibili 认证失效"
+        )));
+    }
+
     fn description_removes_hashtags_and_includes_publication_date() {
         let mut meta = metadata();
         meta.title = "Poor   Alli #bs #brawlstars ＃keepbrawlalive".into();
