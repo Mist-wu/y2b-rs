@@ -336,65 +336,128 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// `watch` 的三条循环各自独立成任务。
+///
+/// 此前发现（RSS 轮询、yt-dlp 校对）、维护（备份、认证）和队列调度共用一个
+/// `select!`：`select!` 选中某个分支后，该分支 `await` 期间其他分支不会被轮询，
+/// 于是一次几分钟的 `poll_all`（每条新条目都要跑一次 yt-dlp）会让调度分支完全
+/// 停摆，准备/上传 worker 拉不起来。拆开后调度循环只做轻量 DB 查询，可以稳定
+/// 保持 1 秒节奏。
 async fn watch(config_path: PathBuf, config: Config, db: Database) -> Result<()> {
     let recovered = db.recover_incomplete_jobs()?;
     if recovered > 0 {
         tracing::warn!(count = recovered, "已恢复服务重启前的未完成任务");
     }
     let monitor = Monitor::new(config.clone(), db.clone())?;
-    let mut poll = tokio::time::interval(Duration::from_secs(config.monitor.poll_seconds));
-    let reconcile_period = Duration::from_secs(config.monitor.reconcile_hours * 3600);
-    let mut reconcile = tokio::time::interval_at(
-        tokio::time::Instant::now() + reconcile_period,
-        reconcile_period,
-    );
-    let mut backup_tick = tokio::time::interval(Duration::from_secs(6 * 3600));
-    let mut auth_tick = tokio::time::interval(Duration::from_secs(24 * 3600));
+    let discovery = tokio::spawn(discovery_loop(
+        monitor,
+        config.monitor.poll_seconds,
+        config.monitor.reconcile_hours,
+    ));
+    let maintenance = tokio::spawn(maintenance_loop(config.clone(), db.clone()));
+    let result = schedule_loop(&config_path, &config, &db).await;
+    for task in [discovery, maintenance] {
+        task.abort();
+        let _ = task.await;
+    }
+    result
+}
+
+/// 每秒推进准备/上传队列，并在 Ctrl-C 时收尾。
+async fn schedule_loop(config_path: &std::path::Path, config: &Config, db: &Database) -> Result<()> {
     let mut scheduler_tick = tokio::time::interval(Duration::from_secs(1));
     scheduler_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut prepare_worker: Option<tokio::task::JoinHandle<()>> = None;
     let mut upload_worker: Option<tokio::task::JoinHandle<()>> = None;
-    loop {
+    let outcome = loop {
         tokio::select! {
-         _=tokio::signal::ctrl_c()=>break,
-         _=poll.tick()=>{
-             match monitor.poll_all().await{Ok(_)=>{},Err(e)=>tracing::error!(error=%e,"轮询失败")}
-         },
-         _=scheduler_tick.tick()=>{
-             reap_worker(&mut prepare_worker, "准备工作线程").await;
-             reap_worker(&mut upload_worker, "上传工作线程").await;
-             if prepare_worker.is_none() && let Some(job)=db.next_queued_job()? {
-                 let fresh=Config::load(&config_path).unwrap_or_else(|_|config.clone());
-                 let worker_db=db.clone();
-                 prepare_worker=Some(tokio::spawn(async move{
-                     if let Err(e)=Pipeline::new(fresh,worker_db).prepare_job(job).await {
-                         tracing::error!(error=%e,"任务准备失败");
-                     }
-                 }));
-             }
-             if upload_worker.is_none() && let Some(job)=db.next_ready_to_upload_job()? {
-                 let fresh=Config::load(&config_path).unwrap_or_else(|_|config.clone());
-                 let worker_db=db.clone();
-                 upload_worker=Some(tokio::spawn(async move{
-                     if let Err(e)=Pipeline::new(fresh,worker_db).upload_prepared_job(job).await {
-                         tracing::error!(error=%e,"待上传任务失败");
-                     }
-                 }));
-             }
-         },
-         _=reconcile.tick()=>match monitor.reconcile_all().await{Ok(n)=>tracing::info!(added=n,"yt-dlp 校对完成"),Err(e)=>tracing::error!(error=%e,"yt-dlp 校对失败")},
-         _=backup_tick.tick()=>{
-             if let Err(e)=backup(&config,&db){tracing::error!(error=%e,"备份失败");}
-             if let Err(e)=db.prune_history(HISTORY_RETENTION_DAYS){tracing::error!(error=%e,"历史清理失败");}
-         },
-         _=auth_tick.tick()=>if let Err(e)=check_auth(&config,&db).await{tracing::error!(error=%e,"认证检查失败");},
+            _ = tokio::signal::ctrl_c() => break Ok(()),
+            _ = scheduler_tick.tick() => {
+                reap_worker(&mut prepare_worker, "准备工作线程").await;
+                reap_worker(&mut upload_worker, "上传工作线程").await;
+                if prepare_worker.is_none()
+                    && let Some(job) = db.next_queued_job()?
+                {
+                    let fresh = Config::load(config_path).unwrap_or_else(|_| config.clone());
+                    let worker_db = db.clone();
+                    prepare_worker = Some(tokio::spawn(async move {
+                        if let Err(e) = Pipeline::new(fresh, worker_db).prepare_job(job).await {
+                            tracing::error!(error = %e, "任务准备失败");
+                        }
+                    }));
+                }
+                if upload_worker.is_none()
+                    && let Some(job) = db.next_ready_to_upload_job()?
+                {
+                    let fresh = Config::load(config_path).unwrap_or_else(|_| config.clone());
+                    let worker_db = db.clone();
+                    upload_worker = Some(tokio::spawn(async move {
+                        if let Err(e) = Pipeline::new(fresh, worker_db).upload_prepared_job(job).await {
+                            tracing::error!(error = %e, "待上传任务失败");
+                        }
+                    }));
+                }
+            }
         }
-    }
+    };
     for worker in [prepare_worker, upload_worker].into_iter().flatten() {
         worker.abort();
         let _ = worker.await;
     }
-    Ok(())
+    outcome
+}
+
+/// RSS 轮询与 yt-dlp 校对。
+///
+/// 两者共用一个任务而不是各占一个：它们都会拉起 yt-dlp，并发执行会在 2 GiB
+/// 服务器上叠加内存压力。串行执行保持了原有的资源占用特征，同时不再阻塞调度。
+async fn discovery_loop(monitor: Monitor, poll_seconds: u64, reconcile_hours: u64) {
+    let mut poll = tokio::time::interval(Duration::from_secs(poll_seconds));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let reconcile_period = Duration::from_secs(reconcile_hours * 3600);
+    let mut reconcile = tokio::time::interval_at(
+        tokio::time::Instant::now() + reconcile_period,
+        reconcile_period,
+    );
+    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = poll.tick() => {
+                if let Err(e) = monitor.poll_all().await {
+                    tracing::error!(error = %e, "轮询失败");
+                }
+            }
+            _ = reconcile.tick() => match monitor.reconcile_all().await {
+                Ok(n) => tracing::info!(added = n, "yt-dlp 校对完成"),
+                Err(e) => tracing::error!(error = %e, "yt-dlp 校对失败"),
+            },
+        }
+    }
+}
+
+/// 数据库备份、历史清理和认证续期。
+async fn maintenance_loop(config: Config, db: Database) {
+    let mut backup_tick = tokio::time::interval(Duration::from_secs(6 * 3600));
+    backup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut auth_tick = tokio::time::interval(Duration::from_secs(24 * 3600));
+    auth_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = backup_tick.tick() => {
+                if let Err(e) = backup(&config, &db) {
+                    tracing::error!(error = %e, "备份失败");
+                }
+                if let Err(e) = db.prune_history(HISTORY_RETENTION_DAYS) {
+                    tracing::error!(error = %e, "历史清理失败");
+                }
+            }
+            _ = auth_tick.tick() => {
+                if let Err(e) = check_auth(&config, &db).await {
+                    tracing::error!(error = %e, "认证检查失败");
+                }
+            }
+        }
+    }
 }
 
 async fn reap_worker(worker: &mut Option<tokio::task::JoinHandle<()>>, name: &str) {

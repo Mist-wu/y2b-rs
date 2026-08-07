@@ -389,19 +389,30 @@ impl Monitor {
         Ok(added)
     }
 
-    /// RSS 拉取失败时回退到 yt-dlp 频道列表（带每频道冷却，防止高频拉取）。
-    async fn fallback_poll_channel(&self, id: i64, error: anyhow::Error) -> Result<usize> {
+    /// 领取本频道的回退名额：冷却期内返回 false。
+    ///
+    /// 单独成函数是为了把 `MutexGuard` 的生存期限制在同步作用域内——回退本身要
+    /// `await` 一个分钟级的 yt-dlp 调用，跨 await 持有 `std::sync::Mutex` 在多个
+    /// 任务并发访问同一个 Monitor 时会死锁。
+    fn claim_fallback_slot(&self, id: i64) -> bool {
         const FALLBACK_COOLDOWN: Duration = Duration::from_secs(600);
         let now = std::time::Instant::now();
         let mut map = self.last_fallback_at.lock().unwrap();
         if let Some(last) = map.get(&id)
             && now.duration_since(*last) < FALLBACK_COOLDOWN
         {
+            return false;
+        }
+        map.insert(id, now);
+        true
+    }
+
+    /// RSS 拉取失败时回退到 yt-dlp 频道列表（带每频道冷却，防止高频拉取）。
+    async fn fallback_poll_channel(&self, id: i64, error: anyhow::Error) -> Result<usize> {
+        if !self.claim_fallback_slot(id) {
             tracing::debug!(channel_id = id, "RSS 故障，回退冷却中，跳过本轮");
             return Ok(0);
         }
-        map.insert(id, now);
-        drop(map);
         tracing::warn!(
             channel_id = id,
             error = %error,
