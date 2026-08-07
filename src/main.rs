@@ -368,7 +368,11 @@ async fn watch(config_path: PathBuf, config: Config, db: Database) -> Result<()>
 }
 
 /// 每秒推进准备/上传队列，并在 Ctrl-C 时收尾。
-async fn schedule_loop(config_path: &std::path::Path, config: &Config, db: &Database) -> Result<()> {
+async fn schedule_loop(
+    config_path: &std::path::Path,
+    config: &Config,
+    db: &Database,
+) -> Result<()> {
     let mut scheduler_tick = tokio::time::interval(Duration::from_secs(1));
     scheduler_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut prepare_worker: Option<tokio::task::JoinHandle<()>> = None;

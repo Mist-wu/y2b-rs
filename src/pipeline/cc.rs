@@ -1,0 +1,357 @@
+//! B站中文 CC 字幕补交（软字幕，提交后走平台审核）。
+use super::Pipeline;
+use crate::bilibili_api::{self, CcCue};
+use crate::model::{Job, JobStatus, VideoMetadata};
+use crate::subtitle::{self, Cue};
+use anyhow::{Context, Result, bail};
+use std::fs;
+
+/// 投稿后到首次尝试补 CC 字幕的等待：B站稿件刚上传时查询 bvid 会返回 -404。
+pub const CC_INITIAL_DELAY_SECONDS: i64 = 90;
+
+/// CC 补交的最大自动尝试次数，耗尽后留给 `y2b subtitle add/--all` 手动处理。
+pub const CC_MAX_ATTEMPTS: i64 = 8;
+
+/// 稿件仍在 B站处理中（-404）时的固定重试间隔：这是预期内的短暂状态，
+/// 用指数退避会把首次成功推得过晚。
+pub(super) const CC_NOT_READY_RETRY_SECONDS: i64 = 60;
+
+/// 其余失败的退避基数与上限：第 n 次失败后等待 `min(90 × 2^n, 1h)`。
+pub(super) const CC_RETRY_BASE_SECONDS: i64 = 90;
+
+pub(super) const CC_RETRY_CAP_SECONDS: i64 = 3600;
+
+/// CC 补交第 `attempt` 次失败后到下次可领取的秒数。
+pub(super) fn cc_retry_delay_seconds(attempt: i64, video_not_ready: bool) -> i64 {
+    if video_not_ready {
+        return CC_NOT_READY_RETRY_SECONDS;
+    }
+    CC_RETRY_BASE_SECONDS
+        .saturating_mul(1i64 << attempt.clamp(0, 16))
+        .min(CC_RETRY_CAP_SECONDS)
+}
+
+/// 归类 CC 补交失败原因用的错误前缀（`is_missing_subtitle_material` 依赖它们）。
+pub(super) const MISSING_SUBTITLE_MATERIAL_PREFIX: &str = "缺少翻译素材，跳过自动 CC 提交";
+
+pub(super) const EMPTY_TRANSLATION_PREFIX: &str = "翻译结果为空";
+
+/// 把双语 cue 转成 B站 CC 字幕条目：只保留有非空翻译且时间合法（end > start）的。
+pub(super) fn cc_cues_from(cues: &[Cue], max_to: Option<f64>) -> Vec<CcCue> {
+    cues.iter()
+        .filter(|c| {
+            c.translation
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty())
+                && c.end > c.start
+        })
+        .filter_map(|c| {
+            let from = c.start;
+            let mut to = c.end;
+            if let Some(max) = max_to {
+                if from >= max {
+                    return None;
+                }
+                to = to.min(max);
+            }
+            if to <= from {
+                return None;
+            }
+            Some(CcCue {
+                from,
+                to,
+                content: c
+                    .translation
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// B 站稿件上传后尚未处理完成时，view 接口返回 code=-404（“啥都木有”）。
+/// 该错误是瞬时的，应在稍后重试；其余错误（字幕源缺失、认证等）重试无益。
+/// 稿件刚上传、B站还在处理：查询会短暂返回 -404，值得退避重试。
+pub(super) fn is_bilibili_video_not_ready(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("code=-404"))
+}
+
+/// 本地根本没有可提交的中文字幕素材：重试多少次都不会变好，直接放弃自动补交。
+pub(super) fn is_missing_subtitle_material(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.starts_with(MISSING_SUBTITLE_MATERIAL_PREFIX)
+            || message.starts_with(EMPTY_TRANSLATION_PREFIX)
+    })
+}
+
+impl Pipeline {
+    /// 给已投稿视频补中文 CC 字幕（B站软字幕，提交后走平台审核）。
+    ///
+    /// 素材优先复用下载目录里的翻译缓存；缺失时重新下载英文字幕、分句并调 Pi
+    /// 翻译。返回给人看的说明文字。
+    pub async fn backfill_cc_subtitle(&self, bvid: &str) -> Result<String> {
+        let job = self
+            .db
+            .job_by_bvid(bvid)?
+            .with_context(|| format!("数据库中找不到 bvid={bvid} 的任务"))?;
+        self.backfill_cc_subtitle_for_job(&job, true).await
+    }
+
+    /// CC 字幕队列的一次尝试：只复用已有的翻译缓存，素材缺失时不重新下载。
+    ///
+    /// 由 `watch` 的字幕 worker 驱动，成功时 `backfill_cc_subtitle_for_job`
+    /// 会把任务置为 `completed`；失败时按错误类型决定退避重试还是直接耗尽。
+    pub async fn submit_pending_subtitle(&self, job: Job) -> Result<()> {
+        match self.backfill_cc_subtitle_for_job(&job, false).await {
+            Ok(message) => {
+                tracing::info!(job_id = %job.id, "{message}");
+                Ok(())
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                // 素材本就不存在（例如原视频没有英文字幕）：重试多少次都不会成功，
+                // 直接耗尽计数，留给 `y2b subtitle add/--all` 手动补。
+                if is_missing_subtitle_material(&error) {
+                    self.db.exhaust_pending_subtitle(
+                        &job.id,
+                        CC_MAX_ATTEMPTS,
+                        &format!("CC 字幕缺少素材，需手动补交: {detail}"),
+                    )?;
+                    self.db.event(
+                        Some(&job.id),
+                        "warn",
+                        &format!("CC 字幕自动提交放弃（缺少素材）: {detail}"),
+                    )?;
+                    return Err(error);
+                }
+                let attempt = job.subtitle_attempt + 1;
+                let delay = cc_retry_delay_seconds(attempt, is_bilibili_video_not_ready(&error));
+                self.db.defer_pending_subtitle(
+                    &job.id,
+                    &format!("CC 字幕提交失败: {detail}"),
+                    delay,
+                )?;
+                tracing::warn!(
+                    job_id = %job.id,
+                    attempt,
+                    delay,
+                    error = %error,
+                    "CC 字幕提交失败，稍后重试"
+                );
+                self.db.event(
+                    Some(&job.id),
+                    "warn",
+                    &format!("CC 字幕提交失败（第 {attempt}/{CC_MAX_ATTEMPTS} 次）: {detail}"),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) async fn backfill_cc_subtitle_for_job(
+        &self,
+        job: &Job,
+        redownload_if_missing: bool,
+    ) -> Result<String> {
+        let bvid = job.bvid.as_deref().unwrap_or_default();
+        if bvid.is_empty() {
+            bail!("任务 {} 没有 BVID", job.id)
+        }
+        let meta = self
+            .db
+            .source_metadata(&job.id)?
+            .unwrap_or_else(|| VideoMetadata {
+                // 个别早期任务未持久化来源元数据：用 job 自身的 video_id/url 兜底。
+                id: job.video_id.clone(),
+                url: job.url.clone(),
+                title: String::new(),
+                description: None,
+                uploader: None,
+                upload_date: None,
+                channel: None,
+                channel_id: None,
+                timestamp: None,
+                duration: None,
+                width: None,
+                height: None,
+                fps: None,
+                thumbnail_url: None,
+                webpage_url: None,
+                live_status: None,
+            });
+        let client =
+            bilibili_api::BiliSubtitleClient::from_cookies_file(&self.config.bilibili.cookies)?;
+        let view = client.view(bvid).await?;
+        if client.has_subtitle_lan(view.cid, "zh").await? {
+            // 已有中文字幕：待补状态的任务标记完成。
+            if job.status == JobStatus::UploadedOriginalPendingSubtitle {
+                self.db
+                    .update_job_status(&job.id, JobStatus::Completed, None)?;
+            }
+            return Ok(format!("{bvid} 已有中文字幕，跳过"));
+        }
+        let work = self.config.runtime.download_dir.join(&meta.id);
+        let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
+        let cues = if let Ok(cached) = subtitle::load_json(&translated) {
+            self.db.event(
+                Some(&job.id),
+                "info",
+                &format!("复用翻译缓存: {} cues", cached.len()),
+            )?;
+            cached
+        } else if redownload_if_missing {
+            fs::create_dir_all(&work)?;
+            let segmented = work.join(format!("{}.en.segmented.json", meta.id));
+            let Some(cues) = self.segment_uncached(job, &meta, &work, &segmented).await? else {
+                bail!("无法获取英文字幕，跳过 CC 字幕补交")
+            };
+            let mut cues = cues;
+            self.translate_and_save(&job.id, &mut cues, &translated)
+                .await?;
+            cues
+        } else {
+            bail!("{MISSING_SUBTITLE_MATERIAL_PREFIX}（可手动执行 y2b subtitle add {bvid}）")
+        };
+        let cc_cues = cc_cues_from(&cues, Some(view.duration));
+        if cc_cues.is_empty() {
+            bail!("{EMPTY_TRANSLATION_PREFIX}，没有可提交的中文字幕")
+        }
+        client.submit(&view, "zh", &cc_cues).await?;
+        self.db.event(
+            Some(&job.id),
+            "info",
+            &format!("已提交中文 CC 字幕（{} 条），等待 B站审核", cc_cues.len()),
+        )?;
+        // 提交成功后，把待补字幕状态的任务标记为完成（自动提交失败时才会挂起）。
+        if job.status == JobStatus::UploadedOriginalPendingSubtitle {
+            self.db
+                .update_job_status(&job.id, JobStatus::Completed, None)?;
+        }
+        Ok(format!(
+            "{bvid} 已提交中文 CC 字幕（{} 条），等待 B站审核",
+            cc_cues.len()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cc_failures_are_classified_into_retry_or_give_up() {
+        // 素材缺失是终局错误：重试多少次都不会变好。
+        for message in [
+            "缺少翻译素材，跳过自动 CC 提交（可手动执行 y2b subtitle add BV1x）",
+            "翻译结果为空，没有可提交的中文字幕",
+        ] {
+            let error = anyhow::anyhow!(message.to_string()).context("submit failed");
+            assert!(is_missing_subtitle_material(&error), "{message}");
+            assert!(!is_bilibili_video_not_ready(&error), "{message}");
+        }
+        // 稿件处理中和网络故障都该重试。
+        let not_ready = anyhow::anyhow!("查询稿件 BV1x 失败: code=-404 啥都木有");
+        assert!(!is_missing_subtitle_material(&not_ready));
+        assert!(is_bilibili_video_not_ready(&not_ready));
+        assert!(!is_missing_subtitle_material(&anyhow::anyhow!(
+            "network timeout"
+        )));
+    }
+
+    #[test]
+    fn cc_retry_delay_is_fixed_for_not_ready_and_capped_otherwise() {
+        // -404 是预期内的短暂状态，用固定短间隔而不是指数退避。
+        assert_eq!(cc_retry_delay_seconds(1, true), 60);
+        assert_eq!(cc_retry_delay_seconds(7, true), 60);
+        // 其余失败按 90 × 2^n 退避，封顶 1 小时。
+        assert_eq!(cc_retry_delay_seconds(1, false), 180);
+        assert_eq!(cc_retry_delay_seconds(2, false), 360);
+        assert_eq!(cc_retry_delay_seconds(5, false), 2880);
+        assert_eq!(cc_retry_delay_seconds(6, false), 3600);
+        assert_eq!(cc_retry_delay_seconds(64, false), 3600);
+    }
+
+    #[test]
+    fn bilibili_not_ready_error_is_classified_for_cc_retry() {
+        assert!(is_bilibili_video_not_ready(&anyhow::anyhow!(
+            "查询稿件 BV1qQMm6HEi3 失败: code=-404 啥都木有"
+        )));
+        assert!(is_bilibili_video_not_ready(&anyhow::anyhow!(
+            "sub process failed: 查询稿件 BV1bQMU63Eam 失败: code=-404"
+        )));
+        assert!(!is_bilibili_video_not_ready(&anyhow::anyhow!(
+            "缺少翻译素材，跳过自动 CC 提交"
+        )));
+        assert!(!is_bilibili_video_not_ready(&anyhow::anyhow!(
+            "Bilibili 认证失效"
+        )));
+    }
+
+    #[test]
+    fn cc_cues_keep_only_translated_in_order() {
+        let cues = vec![
+            Cue {
+                start: 0.0,
+                end: 1.5,
+                source: "hi".into(),
+                translation: Some(" 你好 ".into()),
+            },
+            Cue {
+                start: 1.5,
+                end: 3.0,
+                source: "empty translation".into(),
+                translation: Some("   ".into()),
+            },
+            Cue {
+                start: 3.0,
+                end: 2.0,
+                source: "inverted".into(),
+                translation: Some("倒序".into()),
+            },
+            Cue {
+                start: 4.0,
+                end: 5.0,
+                source: "none".into(),
+                translation: None,
+            },
+        ];
+        let cc = cc_cues_from(&cues, None);
+        assert_eq!(cc.len(), 1);
+        assert_eq!(cc[0].content, "你好");
+        assert_eq!(cc[0].from, 0.0);
+        assert_eq!(cc[0].to, 1.5);
+    }
+
+    #[test]
+    fn cc_cues_clip_beyond_video_duration() {
+        let cues = vec![
+            Cue {
+                start: 0.0,
+                end: 5.0,
+                source: "a".into(),
+                translation: Some("正常".into()),
+            },
+            Cue {
+                start: 4.0,
+                end: 9.0,
+                source: "b".into(),
+                translation: Some("跨越结尾".into()),
+            },
+            Cue {
+                start: 7.0,
+                end: 8.0,
+                source: "c".into(),
+                translation: Some("整体超出".into()),
+            },
+        ];
+        let cc = cc_cues_from(&cues, Some(6.5));
+        assert_eq!(cc.len(), 2);
+        assert_eq!(cc[0].to, 5.0);
+        assert_eq!(cc[1].to, 6.5);
+    }
+}
