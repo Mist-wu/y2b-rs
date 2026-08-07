@@ -22,8 +22,6 @@ pub struct RuntimeConfig {
     pub data_dir: PathBuf,
     pub database: PathBuf,
     pub download_dir: PathBuf,
-    pub output_dir: PathBuf,
-    pub log_dir: PathBuf,
     pub backup_dir: PathBuf,
     pub timezone: String,
 }
@@ -52,8 +50,6 @@ pub struct YoutubeConfig {
 pub struct BilibiliConfig {
     pub biliup: String,
     pub cookies: PathBuf,
-    pub default_tid: i64,
-    pub default_tags: Vec<String>,
     pub submit_interval_seconds: u64,
     pub rate_limit_cooldown_seconds: u64,
 }
@@ -138,8 +134,6 @@ impl Default for RuntimeConfig {
         Self {
             database: base.join("state.db"),
             download_dir: base.join("downloads"),
-            output_dir: base.join("output"),
-            log_dir: base.join("logs"),
             backup_dir: base.join("backups"),
             data_dir: base,
             timezone: "Asia/Shanghai".into(),
@@ -174,8 +168,6 @@ impl Default for BilibiliConfig {
         Self {
             biliup: "/usr/local/bin/biliup".into(),
             cookies: b.join("bilibili_cookies.json"),
-            default_tid: 172,
-            default_tags: vec!["荒野乱斗".into()],
             submit_interval_seconds: 1800,
             rate_limit_cooldown_seconds: 21600,
         }
@@ -270,8 +262,6 @@ impl Config {
         for p in [
             &self.runtime.data_dir,
             &self.runtime.download_dir,
-            &self.runtime.output_dir,
-            &self.runtime.log_dir,
             &self.runtime.backup_dir,
         ] {
             fs::create_dir_all(p)?;

@@ -370,6 +370,8 @@ impl Database {
     pub fn recover_incomplete_jobs(&self) -> Result<usize> {
         let c = self.conn();
         let now = Utc::now().to_rfc3339();
+        // 状态串里保留 downloading/segmenting/translating/rendering：这些变体已从
+        // JobStatus 移除（从未被构造），但旧数据库里可能还留着这样的行，恢复时要一并捞回。
         let recovered=c.execute("UPDATE jobs SET status='queued',error='服务重启后自动恢复',updated_at=? WHERE status IN ('inspecting','processing','downloading','segmenting','translating','rendering')",[&now])?;
         c.execute("UPDATE jobs SET status='paused',error='服务重启时上传结果不确定，请确认 Bilibili 后手动重试',updated_at=? WHERE status IN ('uploading')",[&now])?;
         c.execute(
@@ -960,7 +962,7 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        db.update_job_status(&db.list_jobs(1).unwrap()[0].id, JobStatus::Rendering, None)
+        db.update_job_status(&db.list_jobs(1).unwrap()[0].id, JobStatus::Processing, None)
             .unwrap();
         assert_eq!(db.recover_incomplete_jobs().unwrap(), 1);
         assert_eq!(db.list_jobs(1).unwrap()[0].status, JobStatus::Queued);
@@ -1303,7 +1305,7 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        db.update_job_status(&id, JobStatus::Rendering, None)
+        db.update_job_status(&id, JobStatus::Processing, None)
             .unwrap();
         let stage = db.start_stage(&id, "render", None, None, None).unwrap();
 
@@ -1382,6 +1384,42 @@ mod tests {
         assert_eq!(job.attempt, 0);
         assert!(job.error.is_none());
         assert_eq!(db.prepared_upload(&id).unwrap(), Some(plan));
+    }
+
+    #[test]
+    fn recovery_still_rescues_statuses_removed_from_the_enum() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("s.db")).unwrap();
+        let mut ids = Vec::new();
+        // downloading/segmenting/translating/rendering 已从 JobStatus 移除（从未被
+        // 构造），但旧数据库里可能还有这样的行，重启恢复必须照样把它们捞回队列。
+        for (n, legacy) in ["downloading", "segmenting", "translating", "rendering"]
+            .into_iter()
+            .enumerate()
+        {
+            let id = db
+                .create_job(NewJob {
+                    channel_id: None,
+                    video_id: &format!("legacy-{n}"),
+                    url: "https://youtu.be/legacy",
+                    title: None,
+                    published: None,
+                    updated: None,
+                    transfer_mode: TransferMode::Translated,
+                })
+                .unwrap()
+                .unwrap();
+            db.conn()
+                .execute("UPDATE jobs SET status=? WHERE id=?", params![legacy, id])
+                .unwrap();
+            // 未知状态串读回来会退化成 Failed，而不是 panic。
+            assert_eq!(db.get_job(&id).unwrap().unwrap().status, JobStatus::Failed);
+            ids.push(id);
+        }
+        assert_eq!(db.recover_incomplete_jobs().unwrap(), 4);
+        for id in ids {
+            assert_eq!(db.get_job(&id).unwrap().unwrap().status, JobStatus::Queued);
+        }
     }
 
     #[test]

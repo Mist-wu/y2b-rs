@@ -2,8 +2,6 @@
 data_dir = "/var/lib/y2b"
 database = "/var/lib/y2b/state.db"
 download_dir = "/var/lib/y2b/downloads"
-output_dir = "/var/lib/y2b/output"
-log_dir = "/var/lib/y2b/logs"
 backup_dir = "/var/lib/y2b/backups"
 timezone = "Asia/Shanghai"
 
@@ -23,8 +21,6 @@ max_fps = 60.0
 [bilibili]
 biliup = "/usr/local/bin/biliup"
 cookies = "/var/lib/y2b/bilibili_cookies.json"
-default_tid = 172
-default_tags = ["荒野乱斗"]
 # 新投稿之间至少间隔 30 分钟；B站返回 21566 后全局冷却 6 小时。
 submit_interval_seconds = 1800
 rate_limit_cooldown_seconds = 21600
@@ -36,6 +32,9 @@ policy = "/opt/y2b/pi/policy.json"
 provider = "openai-codex"
 model = "gpt-5.6-luna"
 thinking = "high"
+# 分句/翻译这类确定性转换任务的思考级别。实测大 thinking 会让流式输出涨到
+# 上百 MB，撑爆 2 GiB 服务器内存，必须保持 "off"。
+translation_thinking = "off"
 timeout_seconds = 300
 # adaptive: 分句按 token 自适应；翻译同时按 token 和条数上限拆批。
 # whole_video: 只允许整条视频一次处理，超过安全阈值则停止并提示切换模式。

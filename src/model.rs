@@ -10,15 +10,10 @@ pub enum JobStatus {
     Queued,
     Inspecting,
     Processing,
-    Downloading,
-    Segmenting,
-    Translating,
-    Rendering,
     ReadyToUpload,
     Uploading,
     UploadRetryWait,
     UploadedOriginalPendingSubtitle,
-    Appending,
     Completed,
     RetryWait,
     Paused,
@@ -140,6 +135,11 @@ pub struct PublicationMetadata {
     pub raw_json: String,
 }
 
+/// 持久化到 `jobs.prepared_upload_json` 的上传计划。
+///
+/// 只有一个变体，但保留 enum 形式：`#[serde(tag = "kind")]` 让已落盘的
+/// `{"kind":"submission",...}` 成为带版本标签的线格式，将来新增上传方式时
+/// 在飞的任务不会因为反序列化失败而卡住。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PreparedUpload {

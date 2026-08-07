@@ -216,6 +216,8 @@ pub(super) fn validate_publication_metadata(metadata: &PublicationMetadata) -> R
     {
         bail!("动态含链接、话题或引导互动内容")
     }
+    // 新解析的元数据已经被 sanitize_publication_text 剥过 emoji，但这里仍要查：
+    // publish_metadata 对数据库里已保存的旧元数据也会跑一遍校验。
     if metadata.title.chars().any(is_emoji) || metadata.dynamic.chars().any(is_emoji) {
         bail!("标题或动态含 emoji")
     }

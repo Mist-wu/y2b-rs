@@ -56,7 +56,7 @@ tar -xJf "$tmp_dir/biliup.tar.xz" -C "$tmp_dir"
 bili_bin=$(find "$tmp_dir" -type f -name biliup | head -1)
 install -m 0755 "$bili_bin" /usr/local/bin/biliup
 
-install -d /opt/y2b/pi /var/lib/y2b/{downloads,output,logs,backups} /etc/y2b
+install -d /opt/y2b/pi /var/lib/y2b/{downloads,backups} /etc/y2b
 
 echo "node=$(node --version)"
 echo "pi=$(pi --version)"
