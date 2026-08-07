@@ -21,6 +21,31 @@ use tokio::time::sleep;
 
 const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
 
+/// 投稿后到首次尝试补 CC 字幕的等待：B站稿件刚上传时查询 bvid 会返回 -404。
+pub const CC_INITIAL_DELAY_SECONDS: i64 = 90;
+/// CC 补交的最大自动尝试次数，耗尽后留给 `y2b subtitle add/--all` 手动处理。
+pub const CC_MAX_ATTEMPTS: i64 = 8;
+/// 稿件仍在 B站处理中（-404）时的固定重试间隔：这是预期内的短暂状态，
+/// 用指数退避会把首次成功推得过晚。
+const CC_NOT_READY_RETRY_SECONDS: i64 = 60;
+/// 其余失败的退避基数与上限：第 n 次失败后等待 `min(90 × 2^n, 1h)`。
+const CC_RETRY_BASE_SECONDS: i64 = 90;
+const CC_RETRY_CAP_SECONDS: i64 = 3600;
+
+/// CC 补交第 `attempt` 次失败后到下次可领取的秒数。
+fn cc_retry_delay_seconds(attempt: i64, video_not_ready: bool) -> i64 {
+    if video_not_ready {
+        return CC_NOT_READY_RETRY_SECONDS;
+    }
+    CC_RETRY_BASE_SECONDS
+        .saturating_mul(1i64 << attempt.clamp(0, 16))
+        .min(CC_RETRY_CAP_SECONDS)
+}
+
+/// 归类 CC 补交失败原因用的错误前缀（`is_missing_subtitle_material` 依赖它们）。
+const MISSING_SUBTITLE_MATERIAL_PREFIX: &str = "缺少翻译素材，跳过自动 CC 提交";
+const EMPTY_TRANSLATION_PREFIX: &str = "翻译结果为空";
+
 pub struct Pipeline {
     pub config: Config,
     pub db: Database,
@@ -1203,30 +1228,16 @@ impl Pipeline {
         };
         self.db
             .finish_prepared_upload(&job.id, &bvid, completion_status)?;
-        // 上传成功后自动补中文 CC 字幕（只复用刚生成的翻译缓存）。
-        // 只对 translated 任务触发；direct 任务不下载字幕，误触发会白跑。
-        // 失败不阻塞任务：标记待补字幕状态，`y2b subtitle --all` 会捞起重试。
+        // CC 字幕补交交给独立队列，不占用上传 worker。
+        //
+        // 此前这里同步等待最多 90s + 8×60s ≈ 9.5 分钟，期间下一个 ready_to_upload
+        // 任务无法被领取。只有 translated 任务入队：direct 任务不下载字幕，
+        // 而 completion_status 已是待补字幕的（原视频无字幕直传）也没有素材可用。
         if completion_status == JobStatus::Completed && mode == TransferMode::Translated {
-            let fresh = self
-                .db
-                .get_job(&job.id)?
-                .with_context(|| format!("自动补字幕时任务不存在: {}", job.id))?;
-            match self.auto_submit_cc_subtitle(&fresh).await {
-                Ok(message) => tracing::info!(job_id = %job.id, "{message}"),
-                Err(error) => {
-                    tracing::warn!(job_id = %job.id, error = %error, "CC 字幕自动提交失败");
-                    self.db.event(
-                        Some(&job.id),
-                        "warn",
-                        &format!("CC 字幕自动提交失败: {error:#}"),
-                    )?;
-                    self.db.update_job_status(
-                        &job.id,
-                        JobStatus::UploadedOriginalPendingSubtitle,
-                        Some(&format!("CC 字幕提交失败: {error:#}")),
-                    )?;
-                }
-            }
+            self.db
+                .queue_pending_subtitle(&job.id, CC_INITIAL_DELAY_SECONDS)?;
+            self.db
+                .event(Some(&job.id), "info", "已投稿，等待自动补交中文 CC 字幕")?;
         }
         let (raw, _, _) = self.db.job_paths(&job.id)?;
         let paths = [raw]
@@ -1296,37 +1307,53 @@ impl Pipeline {
         self.backfill_cc_subtitle_for_job(&job, true).await
     }
 
-    /// 上传成功后的自动 CC 提交：只复用刚生成的翻译缓存，素材缺失时不重新下载。
+    /// CC 字幕队列的一次尝试：只复用已有的翻译缓存，素材缺失时不重新下载。
     ///
-    /// B 站稿件上传后需要时间处理，bvid 查询可能短暂返回 -404：先等待再提交，
-    /// 仍 -404 按固定间隔重试，重试耗尽后返回错误交给调用方标记待补字幕。
-    async fn auto_submit_cc_subtitle(&self, job: &Job) -> Result<String> {
-        const INITIAL_DELAY: Duration = Duration::from_secs(90);
-        const RETRY_INTERVAL: Duration = Duration::from_secs(60);
-        const MAX_RETRIES: u32 = 8;
-        sleep(INITIAL_DELAY).await;
-        let mut retries = 0;
-        loop {
-            match self.backfill_cc_subtitle_for_job(job, false).await {
-                Ok(message) => return Ok(message),
-                Err(error) if is_bilibili_video_not_ready(&error) && retries < MAX_RETRIES => {
-                    retries += 1;
-                    tracing::warn!(
-                        job_id = %job.id,
-                        retries,
-                        error = %error,
-                        "CC 字幕提交时稿件未就绪，稍后重试"
-                    );
+    /// 由 `watch` 的字幕 worker 驱动，成功时 `backfill_cc_subtitle_for_job`
+    /// 会把任务置为 `completed`；失败时按错误类型决定退避重试还是直接耗尽。
+    pub async fn submit_pending_subtitle(&self, job: Job) -> Result<()> {
+        match self.backfill_cc_subtitle_for_job(&job, false).await {
+            Ok(message) => {
+                tracing::info!(job_id = %job.id, "{message}");
+                Ok(())
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                // 素材本就不存在（例如原视频没有英文字幕）：重试多少次都不会成功，
+                // 直接耗尽计数，留给 `y2b subtitle add/--all` 手动补。
+                if is_missing_subtitle_material(&error) {
+                    self.db.exhaust_pending_subtitle(
+                        &job.id,
+                        CC_MAX_ATTEMPTS,
+                        &format!("CC 字幕缺少素材，需手动补交: {detail}"),
+                    )?;
                     self.db.event(
                         Some(&job.id),
                         "warn",
-                        &format!(
-                            "CC 字幕提交时稿件未就绪（第 {retries} 次重试）: {error}"
-                        ),
+                        &format!("CC 字幕自动提交放弃（缺少素材）: {detail}"),
                     )?;
-                    sleep(RETRY_INTERVAL).await;
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
+                let attempt = job.subtitle_attempt + 1;
+                let delay = cc_retry_delay_seconds(attempt, is_bilibili_video_not_ready(&error));
+                self.db.defer_pending_subtitle(
+                    &job.id,
+                    &format!("CC 字幕提交失败: {detail}"),
+                    delay,
+                )?;
+                tracing::warn!(
+                    job_id = %job.id,
+                    attempt,
+                    delay,
+                    error = %error,
+                    "CC 字幕提交失败，稍后重试"
+                );
+                self.db.event(
+                    Some(&job.id),
+                    "warn",
+                    &format!("CC 字幕提交失败（第 {attempt}/{CC_MAX_ATTEMPTS} 次）: {detail}"),
+                )?;
+                Err(error)
             }
         }
     }
@@ -1396,11 +1423,13 @@ impl Pipeline {
                 .await?;
             cues
         } else {
-            bail!("缺少翻译素材，跳过自动 CC 提交（可手动执行 y2b subtitle add {bvid}）")
+            bail!(
+                "{MISSING_SUBTITLE_MATERIAL_PREFIX}（可手动执行 y2b subtitle add {bvid}）"
+            )
         };
         let cc_cues = cc_cues_from(&cues, Some(view.duration));
         if cc_cues.is_empty() {
-            bail!("翻译结果为空，没有可提交的中文字幕")
+            bail!("{EMPTY_TRANSLATION_PREFIX}，没有可提交的中文字幕")
         }
         client.submit(&view, "zh", &cc_cues).await?;
         self.db.event(
@@ -2344,10 +2373,20 @@ fn parse_ranges(v: &Value) -> Result<Vec<(usize, usize)>> {
 }
 /// B 站稿件上传后尚未处理完成时，view 接口返回 code=-404（“啥都木有”）。
 /// 该错误是瞬时的，应在稍后重试；其余错误（字幕源缺失、认证等）重试无益。
+/// 稿件刚上传、B站还在处理：查询会短暂返回 -404，值得退避重试。
 fn is_bilibili_video_not_ready(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.to_string().contains("code=-404"))
+}
+
+/// 本地根本没有可提交的中文字幕素材：重试多少次都不会变好，直接放弃自动补交。
+fn is_missing_subtitle_material(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.starts_with(MISSING_SUBTITLE_MATERIAL_PREFIX)
+            || message.starts_with(EMPTY_TRANSLATION_PREFIX)
+    })
 }
 
 fn parse_translations(v: &Value) -> Result<Vec<(usize, String)>> {
@@ -2767,6 +2806,39 @@ mod tests {
         assert_eq!(stages[2].status, "failed");
         assert_eq!(stages[2].detail.as_deref(), Some("biliup 未返回 BV 号"));
         assert_eq!(stages[2].duration_ms, Some(7));
+    }
+
+    #[test]
+    fn cc_failures_are_classified_into_retry_or_give_up() {
+        // 素材缺失是终局错误：重试多少次都不会变好。
+        for message in [
+            "缺少翻译素材，跳过自动 CC 提交（可手动执行 y2b subtitle add BV1x）",
+            "翻译结果为空，没有可提交的中文字幕",
+        ] {
+            let error = anyhow::anyhow!(message.to_string()).context("submit failed");
+            assert!(is_missing_subtitle_material(&error), "{message}");
+            assert!(!is_bilibili_video_not_ready(&error), "{message}");
+        }
+        // 稿件处理中和网络故障都该重试。
+        let not_ready = anyhow::anyhow!("查询稿件 BV1x 失败: code=-404 啥都木有");
+        assert!(!is_missing_subtitle_material(&not_ready));
+        assert!(is_bilibili_video_not_ready(&not_ready));
+        assert!(!is_missing_subtitle_material(&anyhow::anyhow!(
+            "network timeout"
+        )));
+    }
+
+    #[test]
+    fn cc_retry_delay_is_fixed_for_not_ready_and_capped_otherwise() {
+        // -404 是预期内的短暂状态，用固定短间隔而不是指数退避。
+        assert_eq!(cc_retry_delay_seconds(1, true), 60);
+        assert_eq!(cc_retry_delay_seconds(7, true), 60);
+        // 其余失败按 90 × 2^n 退避，封顶 1 小时。
+        assert_eq!(cc_retry_delay_seconds(1, false), 180);
+        assert_eq!(cc_retry_delay_seconds(2, false), 360);
+        assert_eq!(cc_retry_delay_seconds(5, false), 2880);
+        assert_eq!(cc_retry_delay_seconds(6, false), 3600);
+        assert_eq!(cc_retry_delay_seconds(64, false), 3600);
     }
 
     #[test]

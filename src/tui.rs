@@ -500,11 +500,12 @@ fn app(
                         && let Some(j) = jobs.get(i)
                     {
                         if j.status == JobStatus::UploadedOriginalPendingSubtitle {
-                            notice = format!(
-                                "{} 已直传原片，请用 y2b subtitle add {} 补 CC 字幕",
-                                j.video_id,
-                                j.bvid.as_deref().unwrap_or("<bvid>")
-                            );
+                            // 已投稿：重试的含义是重新武装 CC 字幕队列，
+                            // 而不是重跑整条流水线（那会重复投稿）。
+                            notice = match db.rearm_pending_subtitle(&j.id) {
+                                Ok(()) => format!("已重新排队 CC 字幕补交 {}", j.video_id),
+                                Err(e) => format!("重新排队失败: {e}"),
+                            };
                         } else {
                             db.retry_job(&j.id)?;
                             notice = format!("已重新排队 {}", j.video_id);

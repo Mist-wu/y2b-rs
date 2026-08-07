@@ -9,7 +9,7 @@ use y2b_rs::{
     config::Config,
     model::{JobStatus, TransferMode},
     monitor::Monitor,
-    pipeline::Pipeline,
+    pipeline::{self, Pipeline},
     process::run_monitored,
     tui,
 };
@@ -253,7 +253,11 @@ async fn main() -> Result<()> {
                     .get_job(&id)?
                     .with_context(|| format!("任务不存在: {id}"))?;
                 if job.status == JobStatus::UploadedOriginalPendingSubtitle {
-                    anyhow::bail!("该任务已直传原片，请用 `y2b subtitle add <bvid>` 补 CC 字幕")
+                    // 已投稿的任务不能重跑整条流水线（会重复投稿），
+                    // 重试对它的含义是重新武装 CC 字幕队列。
+                    db.rearm_pending_subtitle(&id)?;
+                    println!("已重新排队 CC 字幕补交 {id}");
+                    return Ok(());
                 }
                 db.retry_job(&id)?;
                 println!("已重新排队 {id}");
@@ -369,12 +373,14 @@ async fn schedule_loop(config_path: &std::path::Path, config: &Config, db: &Data
     scheduler_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut prepare_worker: Option<tokio::task::JoinHandle<()>> = None;
     let mut upload_worker: Option<tokio::task::JoinHandle<()>> = None;
+    let mut subtitle_worker: Option<tokio::task::JoinHandle<()>> = None;
     let outcome = loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break Ok(()),
             _ = scheduler_tick.tick() => {
                 reap_worker(&mut prepare_worker, "准备工作线程").await;
                 reap_worker(&mut upload_worker, "上传工作线程").await;
+                reap_worker(&mut subtitle_worker, "字幕工作线程").await;
                 if prepare_worker.is_none()
                     && let Some(job) = db.next_queued_job()?
                 {
@@ -397,10 +403,26 @@ async fn schedule_loop(config_path: &std::path::Path, config: &Config, db: &Data
                         }
                     }));
                 }
+                // CC 字幕补交独立于上传：失败已由 Pipeline 记录并安排退避重试，
+                // 这里只负责不让它占住上传 worker。
+                if subtitle_worker.is_none()
+                    && let Some(job) = db.next_pending_subtitle_job(pipeline::CC_MAX_ATTEMPTS)?
+                {
+                    let fresh = Config::load(config_path).unwrap_or_else(|_| config.clone());
+                    let worker_db = db.clone();
+                    subtitle_worker = Some(tokio::spawn(async move {
+                        let _ = Pipeline::new(fresh, worker_db)
+                            .submit_pending_subtitle(job)
+                            .await;
+                    }));
+                }
             }
         }
     };
-    for worker in [prepare_worker, upload_worker].into_iter().flatten() {
+    for worker in [prepare_worker, upload_worker, subtitle_worker]
+        .into_iter()
+        .flatten()
+    {
         worker.abort();
         let _ = worker.await;
     }

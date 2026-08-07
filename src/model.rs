@@ -100,6 +100,8 @@ pub struct Job {
     pub thinking: Option<String>,
     pub attempt: i64,
     pub error: Option<String>,
+    /// CC 字幕补交队列已自动尝试的次数（与流水线的 `attempt` 独立计数）。
+    pub subtitle_attempt: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

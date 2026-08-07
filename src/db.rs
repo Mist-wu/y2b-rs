@@ -23,7 +23,7 @@ pub struct NewJob<'a> {
 }
 
 /// jobs 表业务列清单，供所有按 id/video_id/队列查询复用。
-const JOB_COLUMNS: &str = "id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,provider,ai_model,thinking,attempt,error";
+const JOB_COLUMNS: &str = "id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,provider,ai_model,thinking,attempt,error,subtitle_attempt";
 /// ai_calls 用量聚合列，供全局/按任务/按频道汇总复用。
 const AI_USAGE_SELECT: &str = "COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(cache_read_tokens),0),COALESCE(SUM(cache_write_tokens),0),COALESCE(SUM(total_tokens),0),SUM(cost)";
 /// 原始调用与已归档汇总的统一用量数据源。
@@ -159,6 +159,21 @@ impl Database {
         }
         self.conn()
             .execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(7,CURRENT_TIMESTAMP)",[])?;
+        // v8: CC 字幕补交独立成队列，需要自己的重试计数和下次可领取时间。
+        // 旧行的 subtitle_retry_at 为 NULL，视为立即到期，各获得一次补交机会。
+        for (column, definition) in [
+            ("subtitle_attempt", "INTEGER NOT NULL DEFAULT 0"),
+            ("subtitle_retry_at", "TEXT"),
+        ] {
+            if !self.has_column("jobs", column)? {
+                self.conn().execute(
+                    &format!("ALTER TABLE jobs ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        self.conn()
+            .execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(8,CURRENT_TIMESTAMP)",[])?;
         Ok(())
     }
 
@@ -464,6 +479,78 @@ impl Database {
             .map(|json| serde_json::from_str(&json).map_err(Into::into))
             .transpose()
     }
+    /// 投稿成功后把任务交给 CC 字幕队列：`delay_seconds` 之后才允许领取，
+    /// 因为 B站稿件刚上传时查询 bvid 会短暂返回 -404。
+    pub fn queue_pending_subtitle(&self, id: &str, delay_seconds: i64) -> Result<()> {
+        let retry_at = Utc::now() + chrono::Duration::seconds(delay_seconds);
+        let changed = self.conn().execute(
+            "UPDATE jobs SET status=?,subtitle_attempt=0,subtitle_retry_at=?,updated_at=? WHERE id=?",
+            params![
+                JobStatus::UploadedOriginalPendingSubtitle.to_string(),
+                retry_at.to_rfc3339(),
+                Utc::now().to_rfc3339(),
+                id
+            ],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("任务不存在: {id}")
+        }
+        Ok(())
+    }
+
+    /// 取一条到期且未耗尽重试的待补字幕任务。
+    ///
+    /// `subtitle_retry_at IS NULL` 是 v8 之前就停在待补状态的旧行，视为立即到期。
+    pub fn next_pending_subtitle_job(&self, max_attempts: i64) -> Result<Option<Job>> {
+        self.job_opt(
+            &format!(
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='uploaded_original_pending_subtitle' \
+                 AND bvid IS NOT NULL AND bvid<>'' AND subtitle_attempt<? \
+                 AND (subtitle_retry_at IS NULL OR subtitle_retry_at<=?) \
+                 ORDER BY discovered_at LIMIT 1"
+            ),
+            params![max_attempts, Utc::now().to_rfc3339()],
+        )
+    }
+
+    /// CC 补交失败：计数加一并推迟 `delay_seconds` 后才允许再次领取。
+    /// 退避策略由调用方决定（不同失败原因该等的时间不同）。
+    pub fn defer_pending_subtitle(&self, id: &str, error: &str, delay_seconds: i64) -> Result<()> {
+        let now = Utc::now();
+        self.conn().execute(
+            "UPDATE jobs SET subtitle_attempt=subtitle_attempt+1,subtitle_retry_at=?,error=?,updated_at=? WHERE id=?",
+            params![
+                (now + chrono::Duration::seconds(delay_seconds)).to_rfc3339(),
+                error,
+                now.to_rfc3339(),
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 明确不可能自动成功（例如根本没有翻译素材）时直接耗尽重试，
+    /// 任务留在待补状态供 `y2b subtitle add/--all` 手动处理。
+    pub fn exhaust_pending_subtitle(&self, id: &str, max_attempts: i64, error: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE jobs SET subtitle_attempt=?,subtitle_retry_at=NULL,error=?,updated_at=? WHERE id=?",
+            params![max_attempts, error, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
+    /// 重新武装 CC 字幕队列：清空计数并立即到期。
+    pub fn rearm_pending_subtitle(&self, id: &str) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE jobs SET subtitle_attempt=0,subtitle_retry_at=?,error=NULL,updated_at=? WHERE id=? AND status='uploaded_original_pending_subtitle'",
+            params![Utc::now().to_rfc3339(), Utc::now().to_rfc3339(), id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("任务不在待补字幕状态: {id}")
+        }
+        Ok(())
+    }
+
     pub fn finish_prepared_upload(&self, id: &str, bvid: &str, status: JobStatus) -> Result<()> {
         let changed = self.conn().execute(
             "UPDATE jobs SET bvid=?,status=?,error=NULL,prepared_upload_json=NULL,updated_at=? WHERE id=?",
@@ -743,6 +830,7 @@ fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         thinking: r.get(17)?,
         attempt: r.get(18)?,
         error: r.get(19)?,
+        subtitle_attempt: r.get(20)?,
     })
 }
 fn usage_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AiUsage> {
@@ -829,7 +917,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), 8);
         assert_eq!(
             db.list_channels().unwrap()[0].transfer_mode,
             TransferMode::Translated
@@ -845,7 +933,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), 8);
         assert!(
             db.create_job(NewJob {
                 channel_id: None,
@@ -1294,6 +1382,105 @@ mod tests {
         assert_eq!(job.attempt, 0);
         assert!(job.error.is_none());
         assert_eq!(db.prepared_upload(&id).unwrap(), Some(plan));
+    }
+
+    #[test]
+    fn pending_subtitle_queue_respects_delay_backoff_and_attempt_cap() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("s.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "cc-queue",
+                url: "https://youtu.be/cc-queue",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        db.set_job_bvid(&id, "BV1cc").unwrap();
+
+        // 首次入队要等 delay 过去才可领取（B站刚上传时查 bvid 会 -404）。
+        db.queue_pending_subtitle(&id, 90).unwrap();
+        assert!(db.next_pending_subtitle_job(8).unwrap().is_none());
+
+        db.queue_pending_subtitle(&id, -1).unwrap();
+        let due = db.next_pending_subtitle_job(8).unwrap().unwrap();
+        assert_eq!(due.id, id);
+        assert_eq!(due.subtitle_attempt, 0);
+
+        // 失败后计数加一并推迟；未到期不再被领取。
+        db.defer_pending_subtitle(&id, "boom", 600).unwrap();
+        assert!(db.next_pending_subtitle_job(8).unwrap().is_none());
+        db.defer_pending_subtitle(&id, "boom", -1).unwrap();
+        let retried = db.next_pending_subtitle_job(8).unwrap().unwrap();
+        assert_eq!(retried.subtitle_attempt, 2);
+        assert_eq!(retried.error.as_deref(), Some("boom"));
+
+        // 计数达到上限后不再自动领取，但仍留在待补状态供手动补交。
+        db.exhaust_pending_subtitle(&id, 8, "缺少素材").unwrap();
+        assert!(db.next_pending_subtitle_job(8).unwrap().is_none());
+        assert_eq!(db.jobs_awaiting_subtitle().unwrap().len(), 1);
+
+        // 重新武装后立即到期、计数归零。
+        db.rearm_pending_subtitle(&id).unwrap();
+        let rearmed = db.next_pending_subtitle_job(8).unwrap().unwrap();
+        assert_eq!(rearmed.subtitle_attempt, 0);
+        assert_eq!(rearmed.error, None);
+
+        // 已完成的任务不属于这个队列；rearm 也只对待补状态生效。
+        db.update_job_status(&id, JobStatus::Completed, None)
+            .unwrap();
+        assert!(db.next_pending_subtitle_job(8).unwrap().is_none());
+        assert!(db.rearm_pending_subtitle(&id).is_err());
+    }
+
+    #[test]
+    fn pending_subtitle_queue_picks_up_pre_v8_rows_immediately() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("s.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "legacy-cc",
+                url: "https://youtu.be/legacy-cc",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        db.set_job_bvid(&id, "BV1legacy").unwrap();
+        // v8 之前就停在待补状态的行：subtitle_retry_at 为 NULL，应视为立即到期。
+        db.update_job_status(&id, JobStatus::UploadedOriginalPendingSubtitle, None)
+            .unwrap();
+        assert_eq!(
+            db.next_pending_subtitle_job(8).unwrap().map(|j| j.id),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn pending_subtitle_queue_skips_jobs_without_bvid() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("s.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "no-bvid",
+                url: "https://youtu.be/no-bvid",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        db.queue_pending_subtitle(&id, -1).unwrap();
+        assert!(db.next_pending_subtitle_job(8).unwrap().is_none());
     }
 
     #[test]
