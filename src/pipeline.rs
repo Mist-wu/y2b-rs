@@ -2667,6 +2667,7 @@ mod tests {
         )));
     }
 
+    #[test]
     fn description_removes_hashtags_and_includes_publication_date() {
         let mut meta = metadata();
         meta.title = "Poor   Alli #bs #brawlstars ＃keepbrawlalive".into();

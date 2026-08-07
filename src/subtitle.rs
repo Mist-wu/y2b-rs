@@ -101,11 +101,14 @@ fn strip_rolling_overlap(carry: &str, text: &str, min_chars: usize) -> String {
         return text.to_string();
     }
     // 从最长重叠往下找：carry 的尾部 == text 的头部，且剪切点位于词边界。
+    //
+    // `overlap` 是字节长度，必须在切片**之前**确认它同时落在两个字符串的字符
+    // 边界上，否则含 `♪`、`’` 等多字节字符的字幕会直接 panic。
     for overlap in (min_chars..=limit).rev() {
-        if &text[..overlap] != &carry[carry.len() - overlap..] {
+        if !text.is_char_boundary(overlap) || !carry.is_char_boundary(carry.len() - overlap) {
             continue;
         }
-        if overlap < text.len() && !text.is_char_boundary(overlap) {
+        if text[..overlap] != carry[carry.len() - overlap..] {
             continue;
         }
         let rest = &text[overlap..];
@@ -257,6 +260,46 @@ mod tests {
         assert_eq!(deduped[0].source, "Hello everyone");
         assert_eq!(deduped[1].source, "Welcome back to the channel");
     }
+    #[test]
+    fn rolling_dedup_handles_multibyte_subtitle_text() {
+        // `♪`（音乐字幕）和 `’`（智能引号）在人工上传的英文字幕里很常见：
+        // 重叠扫描必须按字符边界跳过，而不是在字节切片时 panic。
+        assert_eq!(
+            strip_rolling_overlap(
+                "♪♪♪ music playing softly ♪♪♪",
+                "♪ and then he said something else entirely",
+                10
+            ),
+            "♪ and then he said something else entirely"
+        );
+        // 多字节字符参与的真实重叠仍要被正确裁剪。
+        assert_eq!(
+            strip_rolling_overlap(
+                "that’s what I’m talking about here",
+                "that’s what I’m talking about here folks",
+                10
+            ),
+            "folks"
+        );
+        let mut cues = vec![
+            Cue {
+                start: 0.0,
+                end: 1.0,
+                source: "♪ so I’m gonna show you the new brawler".into(),
+                translation: None,
+            },
+            Cue {
+                start: 1.1,
+                end: 2.0,
+                source: "so I’m gonna show you the new brawler today ♪".into(),
+                translation: None,
+            },
+        ];
+        dedup_rolling(&mut cues);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[1].source, "today ♪");
+    }
+
     #[test]
     fn ranges() {
         let c = vec![
