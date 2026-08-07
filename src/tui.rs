@@ -19,7 +19,7 @@ use std::{
     path::Path,
     process::{Command, Stdio},
     sync::mpsc::{Receiver, TryRecvError, channel},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use sysinfo::{Disks, System};
 
@@ -123,6 +123,7 @@ fn app(
     let mut manual_input = ManualInput::Idle;
     let mut manual_result: Option<Receiver<Result<EnqueueOutcome>>> = None;
     let mut select_job_id: Option<String> = None;
+    let mut host = HostStats::new();
     loop {
         let received = manual_result.as_ref().map(Receiver::try_recv);
         match received {
@@ -189,15 +190,13 @@ fn app(
             .transpose()?
             .map(|u| u.total)
             .unwrap_or(0);
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        let disks = Disks::new_with_refreshed_list();
-        let free = disks
-            .list()
-            .iter()
-            .map(|d| d.available_space())
-            .sum::<u64>()
-            / (1024 * 1024 * 1024);
+        // 主机指标按固定节奏刷新，而不是每次重绘都刷。`System::new_all()` +
+        // `refresh_all()` 会扫描全部进程、网卡和温度传感器，在 2 GiB 服务器上
+        // 每秒来一遍是实打实的 CPU 开销；这里只取内存/swap 和磁盘可用量。
+        if host.needs_refresh() {
+            host.refresh();
+        }
+        let free = host.free_gib;
         let yt_auth = db
             .get_setting("auth.youtube")
             .unwrap_or(None)
@@ -239,10 +238,10 @@ fn app(
             let stats = vec![
                 Line::from(format!(
                     "内存: {}/{} MiB   Swap: {}/{} MiB   磁盘剩余: {} GiB",
-                    sys.used_memory() / 1024 / 1024,
-                    sys.total_memory() / 1024 / 1024,
-                    sys.used_swap() / 1024 / 1024,
-                    sys.total_swap() / 1024 / 1024,
+                    host.used_memory_mib,
+                    host.total_memory_mib,
+                    host.used_swap_mib,
+                    host.total_swap_mib,
                     free
                 )),
                 Line::from(format!(
@@ -579,6 +578,56 @@ fn app(
     Ok(())
 }
 
+/// 主机内存/swap/磁盘快照，按 `REFRESH_INTERVAL` 节流刷新。
+///
+/// 复用同一个 `System`（只刷内存那一类），而不是每次重绘都 `System::new_all()`
+/// 重新扫描全部进程。
+struct HostStats {
+    system: System,
+    refreshed_at: Option<Instant>,
+    used_memory_mib: u64,
+    total_memory_mib: u64,
+    used_swap_mib: u64,
+    total_swap_mib: u64,
+    free_gib: u64,
+}
+
+impl HostStats {
+    const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self {
+            system: System::new(),
+            refreshed_at: None,
+            used_memory_mib: 0,
+            total_memory_mib: 0,
+            used_swap_mib: 0,
+            total_swap_mib: 0,
+            free_gib: 0,
+        }
+    }
+
+    fn needs_refresh(&self) -> bool {
+        self.refreshed_at
+            .is_none_or(|at| at.elapsed() >= Self::REFRESH_INTERVAL)
+    }
+
+    fn refresh(&mut self) {
+        self.system.refresh_memory();
+        self.used_memory_mib = self.system.used_memory() / 1024 / 1024;
+        self.total_memory_mib = self.system.total_memory() / 1024 / 1024;
+        self.used_swap_mib = self.system.used_swap() / 1024 / 1024;
+        self.total_swap_mib = self.system.total_swap() / 1024 / 1024;
+        self.free_gib = Disks::new_with_refreshed_list()
+            .list()
+            .iter()
+            .map(|disk| disk.available_space())
+            .sum::<u64>()
+            / (1024 * 1024 * 1024);
+        self.refreshed_at = Some(Instant::now());
+    }
+}
+
 fn import_cookie(source: &Path, dest: &Path) -> Result<()> {
     std::fs::copy(source, dest)?;
     std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600))?;
@@ -617,6 +666,16 @@ mod tests {
             }
         );
         assert_eq!(input, ManualInput::Submitting);
+    }
+
+    #[test]
+    fn host_stats_populate_once_then_throttle() {
+        let mut host = HostStats::new();
+        assert!(host.needs_refresh(), "首次绘制必须刷新");
+        host.refresh();
+        assert!(host.total_memory_mib > 0, "刷新后应读到总内存");
+        // 刷新后进入节流窗口，后续重绘直接复用快照。
+        assert!(!host.needs_refresh());
     }
 
     #[test]

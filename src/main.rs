@@ -166,7 +166,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Tui => tui::run(&cli.config, config, db)?,
         Cmd::Backup => {
-            backup(&config, &db)?;
+            println!("backup: {}", backup(&config, &db)?.display());
         }
         Cmd::AuthCheck => {
             check_auth(&config, &db).await?;
@@ -388,7 +388,7 @@ async fn schedule_loop(
                 if prepare_worker.is_none()
                     && let Some(job) = db.next_queued_job()?
                 {
-                    let fresh = Config::load(config_path).unwrap_or_else(|_| config.clone());
+                    let fresh = reload_config(config_path, config);
                     let worker_db = db.clone();
                     prepare_worker = Some(tokio::spawn(async move {
                         if let Err(e) = Pipeline::new(fresh, worker_db).prepare_job(job).await {
@@ -399,7 +399,7 @@ async fn schedule_loop(
                 if upload_worker.is_none()
                     && let Some(job) = db.next_ready_to_upload_job()?
                 {
-                    let fresh = Config::load(config_path).unwrap_or_else(|_| config.clone());
+                    let fresh = reload_config(config_path, config);
                     let worker_db = db.clone();
                     upload_worker = Some(tokio::spawn(async move {
                         if let Err(e) = Pipeline::new(fresh, worker_db).upload_prepared_job(job).await {
@@ -412,7 +412,7 @@ async fn schedule_loop(
                 if subtitle_worker.is_none()
                     && let Some(job) = db.next_pending_subtitle_job(pipeline::CC_MAX_ATTEMPTS)?
                 {
-                    let fresh = Config::load(config_path).unwrap_or_else(|_| config.clone());
+                    let fresh = reload_config(config_path, config);
                     let worker_db = db.clone();
                     subtitle_worker = Some(tokio::spawn(async move {
                         let _ = Pipeline::new(fresh, worker_db)
@@ -469,20 +469,61 @@ async fn maintenance_loop(config: Config, db: Database) {
     auth_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            _ = backup_tick.tick() => {
-                if let Err(e) = backup(&config, &db) {
-                    tracing::error!(error = %e, "备份失败");
-                }
-                if let Err(e) = db.prune_history(HISTORY_RETENTION_DAYS) {
-                    tracing::error!(error = %e, "历史清理失败");
-                }
-            }
+            _ = backup_tick.tick() => run_backup_and_prune(&config, &db).await,
             _ = auth_tick.tick() => {
                 if let Err(e) = check_auth(&config, &db).await {
                     tracing::error!(error = %e, "认证检查失败");
                 }
             }
         }
+    }
+}
+
+/// 每个任务开始前重新读一次配置，让 `y2b model set` 之类的改动立刻生效。
+///
+/// 读取失败时沿用启动时的配置继续跑（不能因为配置写坏就停摆），但必须留下
+/// 日志——此前是静默回退，配置写错了完全没有迹象。
+fn reload_config(path: &std::path::Path, fallback: &Config) -> Config {
+    match Config::load(path) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "重新读取配置失败，本次任务沿用启动时的配置"
+            );
+            fallback.clone()
+        }
+    }
+}
+
+/// 整库备份和历史清理都是同步的重活（拷贝整个 state.db、一个大删除事务），
+/// 放到阻塞线程池执行，避免占住 tokio worker 线程数秒。
+async fn run_backup_and_prune(config: &Config, db: &Database) {
+    let config = config.clone();
+    let db = db.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        // 备份失败不该跳过清理，两者分别汇报。
+        (
+            backup(&config, &db),
+            db.prune_history(HISTORY_RETENTION_DAYS),
+        )
+    })
+    .await;
+    match outcome {
+        Ok((backup_result, prune_result)) => {
+            match backup_result {
+                Ok(dest) => tracing::info!(path = %dest.display(), "备份完成"),
+                Err(e) => tracing::error!(error = %e, "备份失败"),
+            }
+            match prune_result {
+                Ok((ai_calls, events, stages)) => {
+                    tracing::info!(ai_calls, events, stages, "历史清理完成")
+                }
+                Err(e) => tracing::error!(error = %e, "历史清理失败"),
+            }
+        }
+        Err(e) => tracing::error!(error = %e, "备份任务异常结束"),
     }
 }
 
@@ -518,7 +559,10 @@ async fn check_auth(config: &Config, db: &Database) -> Result<()> {
 
 const HISTORY_RETENTION_DAYS: i64 = 30;
 
-fn backup(config: &Config, db: &Database) -> Result<()> {
+/// 执行分层备份，返回本次写入的小时级备份路径。
+///
+/// 由调用方决定怎么汇报：CLI 打到 stdout，watch 走 tracing。
+fn backup(config: &Config, db: &Database) -> Result<PathBuf> {
     let now = chrono::Utc::now();
     let hourly = config.runtime.backup_dir.join("hourly");
     let daily = config.runtime.backup_dir.join("daily");
@@ -540,8 +584,7 @@ fn backup(config: &Config, db: &Database) -> Result<()> {
         db.backup(&week)?;
     }
     prune(&weekly, config.storage.weekly_backups)?;
-    println!("backup: {}", dest.display());
-    Ok(())
+    Ok(dest)
 }
 fn prune(dir: &std::path::Path, keep: usize) -> Result<()> {
     if !dir.exists() {
