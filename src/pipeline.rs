@@ -38,6 +38,84 @@ struct PreparedSubtitle {
     cues: Vec<Cue>,
 }
 
+/// `stage_runs` 行的 RAII 句柄。
+///
+/// 阶段收尾此前靠手写配对 `start_stage`/`finish_stage`，任何 `?` 或 `bail!`
+/// 提前返回都会留下一行永久停在 `running` 的记录，污染 `y2b jobs show` 的审计
+/// 输出。这里改为：显式 `finish` 负责成功/自定义状态，未显式收尾时由 `Drop`
+/// 兜底写入 `failed`。
+struct StageGuard {
+    db: Database,
+    id: i64,
+    started: Instant,
+    finished: bool,
+}
+
+impl StageGuard {
+    fn start(
+        db: &Database,
+        job_id: &str,
+        stage: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        thinking: Option<&str>,
+    ) -> Result<Self> {
+        let id = db.start_stage(job_id, stage, provider, model, thinking)?;
+        Ok(Self {
+            db: db.clone(),
+            id,
+            started: Instant::now(),
+            finished: false,
+        })
+    }
+
+    fn id(&self) -> i64 {
+        self.id
+    }
+
+    /// 从阶段开始至今的挂钟耗时，供没有子进程耗时可用的失败路径使用。
+    fn elapsed_ms(&self) -> i64 {
+        self.started.elapsed().as_millis() as i64
+    }
+
+    fn finish(
+        &mut self,
+        status: &str,
+        duration_ms: i64,
+        peak_rss_kib: u64,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        self.finished = true;
+        self.db
+            .finish_stage(self.id, status, duration_ms, peak_rss_kib, detail)
+    }
+
+    /// 以失败收尾并原样返回错误，供 `stage.fail(error)?` 这种单行写法使用。
+    fn fail(&mut self, error: anyhow::Error, duration_ms: i64, peak_rss_kib: u64) -> anyhow::Error {
+        if let Err(nested) =
+            self.finish("failed", duration_ms, peak_rss_kib, Some(&error.to_string()))
+        {
+            tracing::warn!(stage_id = self.id, error = %nested, "写入阶段失败状态出错");
+        }
+        error
+    }
+}
+
+impl Drop for StageGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let elapsed = self.elapsed_ms();
+        if let Err(error) =
+            self.db
+                .finish_stage(self.id, "failed", elapsed, 0, Some("阶段提前返回，未正常收尾"))
+        {
+            tracing::warn!(stage_id = self.id, error = %error, "兜底关闭阶段行失败");
+        }
+    }
+}
+
 impl Pipeline {
     pub fn new(config: Config, db: Database) -> Self {
         Self { config, db }
@@ -118,28 +196,23 @@ impl Pipeline {
         )?;
         self.db
             .update_job_status(&job.id, JobStatus::Inspecting, None)?;
-        let stage = self.db.start_stage(&job.id, "metadata", None, None, None)?;
+        let mut stage = StageGuard::start(&self.db, &job.id, "metadata", None, None, None)?;
         let monitor = Monitor::new(self.config.clone(), self.db.clone())?;
-        let metadata_started = Instant::now();
         let (meta, peak, duration) = match monitor.fetch_metadata(&job.url).await {
             Ok(result) => result,
             Err(error) => {
-                self.db.finish_stage(
-                    stage,
-                    if is_live_content_pending(&error) {
-                        "deferred"
-                    } else {
-                        "failed"
-                    },
-                    metadata_started.elapsed().as_millis() as i64,
-                    0,
-                    Some(&error.to_string()),
-                )?;
+                // 直播/预约内容不是故障，单独标记为 deferred 便于审计区分。
+                let status = if is_live_content_pending(&error) {
+                    "deferred"
+                } else {
+                    "failed"
+                };
+                let elapsed = stage.elapsed_ms();
+                stage.finish(status, elapsed, 0, Some(&error.to_string()))?;
                 return Err(error);
             }
         };
-        self.db
-            .finish_stage(stage, "completed", duration, peak, None)?;
+        stage.finish("completed", duration, peak, None)?;
         self.db.update_job_metadata(
             &job.id,
             &meta.title,
@@ -266,10 +339,7 @@ impl Pipeline {
             .thumbnail_url
             .as_deref()
             .context("YouTube 元数据缺少封面 URL")?;
-        let stage = self
-            .db
-            .start_stage(job_id, "cover_download", None, None, None)?;
-        let started = Instant::now();
+        let mut stage = StageGuard::start(&self.db, job_id, "cover_download", None, None, None)?;
         let source = work.join(format!("{}.youtube-cover.source", meta.id));
         let result = async {
             let response = reqwest::Client::new()
@@ -296,23 +366,13 @@ impl Pipeline {
         }
         .await;
         let _ = fs::remove_file(&source);
-        let duration_ms = started.elapsed().as_millis() as i64;
+        let duration_ms = stage.elapsed_ms();
         match result {
             Ok(peak_rss_kib) => {
-                self.db.finish_stage(
-                    stage,
-                    "completed",
-                    duration_ms,
-                    peak_rss_kib,
-                    Some(thumbnail_url),
-                )?;
+                stage.finish("completed", duration_ms, peak_rss_kib, Some(thumbnail_url))?;
                 Ok(cover)
             }
-            Err(error) => {
-                self.db
-                    .finish_stage(stage, "failed", duration_ms, 0, Some(&error.to_string()))?;
-                Err(error).context("下载 YouTube 封面失败")
-            }
+            Err(error) => Err(stage.fail(error, duration_ms, 0)).context("下载 YouTube 封面失败"),
         }
     }
 
@@ -442,9 +502,7 @@ impl Pipeline {
         video_id: &str,
         work: &Path,
     ) -> Result<Option<PathBuf>> {
-        let stage = self
-            .db
-            .start_stage(job_id, "subtitle_download", None, None, None)?;
+        let mut stage = StageGuard::start(&self.db, job_id, "subtitle_download", None, None, None)?;
         let mut cmd = ytdlp_command(&self.config.youtube);
         cmd.args([
             "--skip-download",
@@ -463,29 +521,19 @@ impl Pipeline {
         let result = run_monitored(cmd, Duration::from_secs(180)).await;
         match result {
             Ok(out) => {
-                let found = fs::read_dir(work)?
-                    .filter_map(|e| e.ok().map(|x| x.path()))
-                    .find(|p| {
-                        p.extension().is_some_and(|x| x == "vtt")
-                            && p.metadata().is_ok_and(|m| m.len() > 0)
-                    });
-                self.db.finish_stage(
-                    stage,
-                    if found.is_some() {
-                        "completed"
-                    } else {
-                        "missing"
-                    },
-                    out.duration_ms,
-                    out.peak_rss_kib,
-                    None,
-                )?;
+                let found = pick_subtitle_file(work, video_id)?;
+                let status = if found.is_some() {
+                    "completed"
+                } else {
+                    "missing"
+                };
+                let detail = found.as_ref().map(|path| path.to_string_lossy().into_owned());
+                stage.finish(status, out.duration_ms, out.peak_rss_kib, detail.as_deref())?;
                 Ok(found)
             }
-            Err(e) => {
-                self.db
-                    .finish_stage(stage, "failed", 0, 0, Some(&e.to_string()))?;
-                Err(e).context("字幕下载失败")
+            Err(error) => {
+                let elapsed = stage.elapsed_ms();
+                Err(stage.fail(error, elapsed, 0)).context("字幕下载失败")
             }
         }
     }
@@ -501,9 +549,7 @@ impl Pipeline {
         if let Some(p) = find_video(work, video_id) {
             return Ok(p);
         }
-        let stage = self
-            .db
-            .start_stage(job_id, "video_download", None, None, None)?;
+        let mut stage = StageGuard::start(&self.db, job_id, "video_download", None, None, None)?;
         let mut cmd = ytdlp_command(&self.config.youtube);
         let format = download_format_selector(
             meta,
@@ -524,8 +570,7 @@ impl Pipeline {
         cmd.arg(url);
         let out = run_monitored(cmd, Duration::from_secs(7200)).await?;
         let path = find_video(work, video_id).context("yt-dlp 完成但未找到视频")?;
-        self.db.finish_stage(
-            stage,
+        stage.finish(
             "completed",
             out.duration_ms,
             out.peak_rss_kib,
@@ -535,7 +580,8 @@ impl Pipeline {
     }
 
     async fn segment(&self, job_id: &str, cues: &[Cue]) -> Result<Vec<Cue>> {
-        let stage = self.db.start_stage(
+        let mut stage = StageGuard::start(
+            &self.db,
             job_id,
             "segmentation",
             Some(&self.config.ai.provider),
@@ -545,7 +591,6 @@ impl Pipeline {
         let budget = self.ai_token_budget()?;
         let estimated = estimate_segment_tokens(cues);
         let estimated_bytes = estimate_segment_argument_bytes(cues);
-        let wall_started = Instant::now();
         let mut ranges = Vec::new();
         let mut duration = 0;
         let mut peak = 0;
@@ -559,19 +604,13 @@ impl Pipeline {
                 )
             }
             let batch = self
-                .segment_batch(job_id, stage, cues, 0, cues.len().saturating_sub(1))
+                .segment_batch(job_id, stage.id(), cues, 0, cues.len().saturating_sub(1))
                 .await;
             let (local, elapsed, rss) = match batch {
                 Ok(result) => result,
                 Err(error) => {
-                    self.db.finish_stage(
-                        stage,
-                        "failed",
-                        wall_started.elapsed().as_millis() as i64,
-                        0,
-                        Some(&error.to_string()),
-                    )?;
-                    return Err(error);
+                    let elapsed = stage.elapsed_ms();
+                    return Err(stage.fail(error, elapsed, 0));
                 }
             };
             ranges = local;
@@ -602,7 +641,7 @@ impl Pipeline {
                 let batch = self
                     .segment_batch(
                         job_id,
-                        stage,
+                        stage.id(),
                         &cues[window_start..=window_end],
                         cursor - window_start,
                         preferred_end - window_start,
@@ -611,14 +650,8 @@ impl Pipeline {
                 let (local, elapsed, rss) = match batch {
                     Ok(result) => result,
                     Err(error) => {
-                        self.db.finish_stage(
-                            stage,
-                            "failed",
-                            wall_started.elapsed().as_millis() as i64,
-                            peak,
-                            Some(&error.to_string()),
-                        )?;
-                        return Err(error);
+                        let wall = stage.elapsed_ms();
+                        return Err(stage.fail(error, wall, peak));
                     }
                 };
                 let chosen_end = if has_more {
@@ -640,8 +673,7 @@ impl Pipeline {
             }
         }
         let result = subtitle::apply_ranges(cues, &ranges)?;
-        self.db.finish_stage(
-            stage,
+        stage.finish(
             "completed",
             duration,
             peak,
@@ -731,7 +763,8 @@ impl Pipeline {
     }
 
     async fn translate(&self, job_id: &str, cues: &mut [Cue], checkpoint: &Path) -> Result<()> {
-        let stage = self.db.start_stage(
+        let mut stage = StageGuard::start(
+            &self.db,
             job_id,
             "translation",
             Some(&self.config.ai.provider),
@@ -764,31 +797,23 @@ impl Pipeline {
             .ai
             .translation_concurrency
             .min(batch_inputs.len().max(1));
-        let wall_started = Instant::now();
+        let stage_id = stage.id();
         let mut results = stream::iter(batch_inputs)
             .map(|(start, chunk)| async move {
-                self.translate_batch_with_retry(job_id, stage, start, &chunk)
+                self.translate_batch_with_retry(job_id, stage_id, start, &chunk)
                     .await
             })
             .buffer_unordered(concurrency);
         let mut aggregate_call_ms = 0;
         let mut peak = 0;
         let mut checkpointed_batches = reused_batches;
+        let mut failure = None;
         while let Some(result) = results.next().await {
             let (start, local, duration_ms, peak_rss_kib) = match result {
                 Ok(result) => result,
                 Err(error) => {
-                    self.db.finish_stage(
-                        stage,
-                        "failed",
-                        wall_started.elapsed().as_millis() as i64,
-                        peak,
-                        Some(&format!(
-                            "checkpointed={checkpointed_batches}/{}; {error}",
-                            batches.len()
-                        )),
-                    )?;
-                    return Err(error);
+                    failure = Some(error);
+                    break;
                 }
             };
             let global = local
@@ -801,9 +826,15 @@ impl Pipeline {
             aggregate_call_ms += duration_ms;
             peak = peak.max(peak_rss_kib);
         }
-        let wall_duration_ms = wall_started.elapsed().as_millis() as i64;
-        self.db.finish_stage(
-            stage,
+        // 先释放流，取消仍在飞的 Pi 调用，再收尾阶段行。
+        drop(results);
+        let wall_duration_ms = stage.elapsed_ms();
+        if let Some(error) = failure {
+            let detail = format!("checkpointed={checkpointed_batches}/{}", batches.len());
+            let error = error.context(detail);
+            return Err(stage.fail(error, wall_duration_ms, peak));
+        }
+        stage.finish(
             "completed",
             wall_duration_ms,
             peak,
@@ -835,7 +866,7 @@ impl Pipeline {
             "target_lang":self.config.translation.target_lang,
             "items":items
         });
-        let input_json = payload.to_string();
+        // 每次尝试都会带上不同的 feedback，审计用的 input_json 在循环内单独构造。
         let attempts = self.config.ai.translation_batch_retries.saturating_add(1);
         let mut aggregate_duration_ms = 0;
         let mut peak_rss_kib = 0;
@@ -1016,7 +1047,8 @@ impl Pipeline {
             return Ok(saved);
         }
         let budget = self.ai_token_budget()?;
-        let stage = self.db.start_stage(
+        let mut stage = StageGuard::start(
+            &self.db,
             job_id,
             "publish_metadata",
             Some(&self.config.ai.provider),
@@ -1033,14 +1065,13 @@ impl Pipeline {
             let r = match self.call_pi(payload, &self.config.ai.thinking).await {
                 Ok(result) => result,
                 Err(error) => {
-                    self.db
-                        .finish_stage(stage, "failed", 0, 0, Some(&error.to_string()))?;
-                    return Err(error);
+                    let elapsed = stage.elapsed_ms();
+                    return Err(stage.fail(error, elapsed, 0));
                 }
             };
             self.db.record_ai_call(
                 job_id,
-                stage,
+                stage.id(),
                 "publish_metadata",
                 &self.config.ai.provider,
                 &self.config.ai.model,
@@ -1053,14 +1084,7 @@ impl Pipeline {
             let metadata = match parse_publication_metadata(&r.value) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    self.db.finish_stage(
-                        stage,
-                        "failed",
-                        r.output.duration_ms,
-                        r.output.peak_rss_kib,
-                        Some(&error.to_string()),
-                    )?;
-                    return Err(error);
+                    return Err(stage.fail(error, r.output.duration_ms, r.output.peak_rss_kib));
                 }
             };
             if let Err(error) = validate_publication_metadata(&metadata) {
@@ -1070,27 +1094,12 @@ impl Pipeline {
                     ));
                     continue;
                 }
-                self.db.finish_stage(
-                    stage,
-                    "failed",
-                    r.output.duration_ms,
-                    r.output.peak_rss_kib,
-                    Some(&error.to_string()),
-                )?;
-                return Err(error);
+                return Err(stage.fail(error, r.output.duration_ms, r.output.peak_rss_kib));
             }
             if let Err(error) = self.db.save_publication_metadata(job_id, &metadata) {
-                self.db.finish_stage(
-                    stage,
-                    "failed",
-                    r.output.duration_ms,
-                    r.output.peak_rss_kib,
-                    Some(&error.to_string()),
-                )?;
-                return Err(error);
+                return Err(stage.fail(error, r.output.duration_ms, r.output.peak_rss_kib));
             }
-            self.db.finish_stage(
-                stage,
+            stage.finish(
                 "completed",
                 r.output.duration_ms,
                 r.output.peak_rss_kib,
@@ -1245,7 +1254,7 @@ impl Pipeline {
         meta: &VideoMetadata,
         cover: Option<&Path>,
     ) -> Result<String> {
-        let stage = self.db.start_stage(job_id, "upload", None, None, None)?;
+        let mut stage = StageGuard::start(&self.db, job_id, "upload", None, None, None)?;
         let mut cmd = Command::new(&self.config.bilibili.biliup);
         cmd.arg("-u")
             .arg(&self.config.bilibili.cookies)
@@ -1258,9 +1267,8 @@ impl Pipeline {
         let out = match run_monitored(cmd, Duration::from_secs(14400)).await {
             Ok(output) => output,
             Err(error) => {
-                self.db
-                    .finish_stage(stage, "failed", 0, 0, Some(&error.to_string()))?;
-                return Err(error);
+                let elapsed = stage.elapsed_ms();
+                return Err(stage.fail(error, elapsed, 0));
             }
         };
         let merged = out.stdout.clone() + "\n" + &out.stderr;
@@ -1268,23 +1276,10 @@ impl Pipeline {
             Some(value) => value.as_str().to_string(),
             None => {
                 let error = anyhow::anyhow!("biliup 未返回 BV 号");
-                self.db.finish_stage(
-                    stage,
-                    "failed",
-                    out.duration_ms,
-                    out.peak_rss_kib,
-                    Some(&error.to_string()),
-                )?;
-                return Err(error);
+                return Err(stage.fail(error, out.duration_ms, out.peak_rss_kib));
             }
         };
-        self.db.finish_stage(
-            stage,
-            "completed",
-            out.duration_ms,
-            out.peak_rss_kib,
-            Some(&bvid),
-        )?;
+        stage.finish("completed", out.duration_ms, out.peak_rss_kib, Some(&bvid))?;
         self.defer_bilibili_submissions(self.config.bilibili.submit_interval_seconds)?;
         Ok(bvid)
     }
@@ -1391,7 +1386,7 @@ impl Pipeline {
             fs::create_dir_all(&work)?;
             let segmented = work.join(format!("{}.en.segmented.json", meta.id));
             let Some(cues) = self
-                .segment_uncached(&job, &meta, &work, &segmented)
+                .segment_uncached(job, &meta, &work, &segmented)
                 .await?
             else {
                 bail!("无法获取英文字幕，跳过 CC 字幕补交")
@@ -1494,7 +1489,7 @@ impl Pipeline {
             .set_setting(NEXT_BILIBILI_SUBMIT_AT, &not_before.to_rfc3339())
     }
     async fn probe_media(&self, job_id: &str, path: &Path, label: &str) -> Result<()> {
-        let stage = self.db.start_stage(job_id, label, None, None, None)?;
+        let mut stage = StageGuard::start(&self.db, job_id, label, None, None, None)?;
         let mut cmd = Command::new(&self.config.render.ffprobe);
         cmd.args([
             "-v",
@@ -1507,8 +1502,7 @@ impl Pipeline {
         .arg(path);
         let out = run_monitored(cmd, Duration::from_secs(60)).await?;
         serde_json::from_str::<Value>(&out.stdout).context("ffprobe 输出不是 JSON")?;
-        self.db.finish_stage(
-            stage,
+        stage.finish(
             "completed",
             out.duration_ms,
             out.peak_rss_kib,
@@ -2228,6 +2222,50 @@ fn append_core_ranges(
     Ok(())
 }
 
+/// 选出用于分句/翻译的英文字幕文件。
+///
+/// `--sub-langs "en.*,en"` 可能同时落盘 `<id>.en.vtt`、`<id>.en-US.vtt`、
+/// `<id>.en-orig.vtt`；`read_dir` 的顺序依赖文件系统，直接取第一个会让同一
+/// 视频重跑时选到不同字幕源。这里固定优先级：精确 `en` > 其余语言标签字典序，
+/// 保证结果可复现。
+fn pick_subtitle_file(work: &Path, video_id: &str) -> Result<Option<PathBuf>> {
+    let mut candidates = fs::read_dir(work)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "vtt")
+                && path.metadata().is_ok_and(|metadata| metadata.len() > 0)
+        })
+        .map(|path| (subtitle_language_tag(&path, video_id), path))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left_lang, left_path), (right_lang, right_path)| {
+        subtitle_language_rank(left_lang)
+            .cmp(&subtitle_language_rank(right_lang))
+            .then_with(|| left_lang.cmp(right_lang))
+            .then_with(|| left_path.cmp(right_path))
+    });
+    Ok(candidates.into_iter().next().map(|(_, path)| path))
+}
+
+/// 语言标签优先级：精确 `en` > 具名变体（`en-US`…） > 无法识别的文件名。
+fn subtitle_language_rank(language: &str) -> u8 {
+    match language {
+        "en" => 0,
+        "" => 2,
+        _ => 1,
+    }
+}
+
+/// 从 `<video_id>.<language>.vtt` 取出语言标签；文件名不匹配时返回空串。
+fn subtitle_language_tag(path: &Path, video_id: &str) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(video_id))
+        .and_then(|rest| rest.strip_suffix(".vtt"))
+        .unwrap_or_default()
+        .trim_matches('.')
+        .to_string()
+}
+
 fn find_video(work: &Path, video_id: &str) -> Option<PathBuf> {
     fs::read_dir(work)
         .ok()?
@@ -2651,6 +2689,86 @@ mod tests {
     }
 
     #[test]
+    fn subtitle_pick_is_deterministic_and_prefers_exact_english() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path();
+        // `--sub-langs "en.*,en"` 可能同时落盘多个变体，read_dir 顺序不可靠。
+        for name in [
+            "vid.en-US.vtt",
+            "vid.en-orig.vtt",
+            "vid.en.vtt",
+            "vid.en-GB.vtt",
+        ] {
+            std::fs::write(work.join(name), "WEBVTT\n").unwrap();
+        }
+        // 空文件和非字幕文件不参与挑选。
+        std::fs::write(work.join("vid.raw.mp4"), "x").unwrap();
+        std::fs::write(work.join("vid.zz.vtt"), "").unwrap();
+        assert_eq!(
+            pick_subtitle_file(work, "vid").unwrap(),
+            Some(work.join("vid.en.vtt"))
+        );
+
+        // 没有精确 en 时按语言标签字典序取第一个，重复调用结果一致。
+        std::fs::remove_file(work.join("vid.en.vtt")).unwrap();
+        let first = pick_subtitle_file(work, "vid").unwrap();
+        assert_eq!(first, Some(work.join("vid.en-GB.vtt")));
+        assert_eq!(pick_subtitle_file(work, "vid").unwrap(), first);
+
+        std::fs::remove_dir_all(work.join("empty")).ok();
+        assert_eq!(pick_subtitle_file(temp.path().join("nope").as_path(), "vid").ok(), None);
+    }
+
+    #[test]
+    fn stage_guard_closes_the_row_on_early_return() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "stage-guard",
+                url: "https://youtu.be/stage-guard",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+
+        // 提前返回（`?`/`bail!`）不再留下永久 running 的阶段行。
+        (|| -> Result<()> {
+            let _stage = StageGuard::start(&db, &id, "segmentation", None, None, None)?;
+            bail!("安全 token 阈值过小")
+        })()
+        .unwrap_err();
+        let stages = db.list_stages(&id).unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].status, "failed");
+        assert_eq!(stages[0].detail.as_deref(), Some("阶段提前返回，未正常收尾"));
+
+        // 显式收尾后 Drop 不再覆写状态。
+        {
+            let mut stage = StageGuard::start(&db, &id, "translation", None, None, None).unwrap();
+            stage.finish("completed", 12, 34, Some("ok")).unwrap();
+        }
+        let stages = db.list_stages(&id).unwrap();
+        assert_eq!(stages[1].status, "completed");
+        assert_eq!(stages[1].duration_ms, Some(12));
+        assert_eq!(stages[1].peak_rss_kib, Some(34));
+
+        // fail() 把真实错误写进 detail 并原样返回错误。
+        {
+            let mut stage = StageGuard::start(&db, &id, "upload", None, None, None).unwrap();
+            let returned = stage.fail(anyhow::anyhow!("biliup 未返回 BV 号"), 7, 8);
+            assert_eq!(returned.to_string(), "biliup 未返回 BV 号");
+        }
+        let stages = db.list_stages(&id).unwrap();
+        assert_eq!(stages[2].status, "failed");
+        assert_eq!(stages[2].detail.as_deref(), Some("biliup 未返回 BV 号"));
+        assert_eq!(stages[2].duration_ms, Some(7));
+    }
+
     #[test]
     fn bilibili_not_ready_error_is_classified_for_cc_retry() {
         assert!(is_bilibili_video_not_ready(&anyhow::anyhow!(

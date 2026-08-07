@@ -277,7 +277,7 @@ async fn main() -> Result<()> {
                 let mut submitted = 0;
                 for job in jobs {
                     let bvid = job.bvid.as_deref().unwrap_or_default();
-                    match pipeline.backfill_cc_subtitle(&bvid).await {
+                    match pipeline.backfill_cc_subtitle(bvid).await {
                         Ok(message) => {
                             println!("{message}");
                             if message.contains("跳过") {
