@@ -174,7 +174,34 @@ impl Database {
         }
         self.conn()
             .execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(8,CURRENT_TIMESTAMP)",[])?;
+        // v9: 重试退避改为按尝试次数指数增长，需要显式的下次可领取时间。
+        // 旧行为 NULL，按迁移前的固定 10 分钟处理（见 next_queued_job）。
+        if !self.has_column("jobs", "retry_at")? {
+            self.conn()
+                .execute("ALTER TABLE jobs ADD COLUMN retry_at TEXT", [])?;
+        }
+        self.conn()
+            .execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(9,CURRENT_TIMESTAMP)",[])?;
         Ok(())
+    }
+
+    /// `retry_at` 为 NULL 的旧行沿用迁移前的固定退避。
+    const LEGACY_RETRY_MINUTES: i64 = 10;
+
+    /// 到期判定：`retry_at` 到点，或旧行的 `updated_at` 已超过固定退避。
+    ///
+    /// 不用 SQL 日期函数——`datetime()` 的输出格式和库里存的 RFC3339 字符串
+    /// 无法直接比较，两个时间点都在 Rust 侧算好再传进去。
+    fn retry_due_clause(column: &str) -> String {
+        format!("(retry_at IS NULL AND {column}<=?) OR retry_at<=?")
+    }
+
+    fn retry_due_params() -> (String, String) {
+        let now = Utc::now();
+        (
+            (now - chrono::Duration::minutes(Self::LEGACY_RETRY_MINUTES)).to_rfc3339(),
+            now.to_rfc3339(),
+        )
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -348,23 +375,53 @@ impl Database {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn next_queued_job(&self) -> Result<Option<Job>> {
-        let retry_before = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        let (legacy_before, now) = Self::retry_due_params();
+        let due = Self::retry_due_clause("updated_at");
         self.job_opt(
             &format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='queued' OR (status='retry_wait' AND updated_at<=?) ORDER BY discovered_at LIMIT 1"
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='queued' OR (status='retry_wait' AND ({due})) ORDER BY discovered_at LIMIT 1"
             ),
-            [retry_before],
+            params![legacy_before, now],
         )
     }
 
     pub fn next_ready_to_upload_job(&self) -> Result<Option<Job>> {
-        let retry_before = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        let (legacy_before, now) = Self::retry_due_params();
+        let due = Self::retry_due_clause("updated_at");
         self.job_opt(
             &format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='ready_to_upload' OR (status='upload_retry_wait' AND updated_at<=?) ORDER BY discovered_at LIMIT 1"
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='ready_to_upload' OR (status='upload_retry_wait' AND ({due})) ORDER BY discovered_at LIMIT 1"
             ),
-            [retry_before],
+            params![legacy_before, now],
         )
+    }
+
+    /// 把任务推入退避等待：设置状态、错误和下次可领取时间。
+    ///
+    /// 只有这一个入口会写 `retry_wait` / `upload_retry_wait`，避免出现
+    /// 忘记设 `retry_at` 而被立即重新领取的紧凑重试循环。
+    pub fn defer_job_retry(
+        &self,
+        id: &str,
+        status: JobStatus,
+        error: &str,
+        delay_seconds: i64,
+    ) -> Result<()> {
+        if !matches!(status, JobStatus::RetryWait | JobStatus::UploadRetryWait) {
+            anyhow::bail!("defer_job_retry 只接受重试等待状态，收到 {status}")
+        }
+        let now = Utc::now();
+        self.conn().execute(
+            "UPDATE jobs SET status=?,error=?,retry_at=?,updated_at=? WHERE id=?",
+            params![
+                status.to_string(),
+                error,
+                (now + chrono::Duration::seconds(delay_seconds)).to_rfc3339(),
+                now.to_rfc3339(),
+                id
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn recover_incomplete_jobs(&self) -> Result<usize> {
@@ -372,7 +429,7 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         // 状态串里保留 downloading/segmenting/translating/rendering：这些变体已从
         // JobStatus 移除（从未被构造），但旧数据库里可能还留着这样的行，恢复时要一并捞回。
-        let recovered=c.execute("UPDATE jobs SET status='queued',error='服务重启后自动恢复',updated_at=? WHERE status IN ('inspecting','processing','downloading','segmenting','translating','rendering')",[&now])?;
+        let recovered=c.execute("UPDATE jobs SET status='queued',error='服务重启后自动恢复',retry_at=NULL,updated_at=? WHERE status IN ('inspecting','processing','downloading','segmenting','translating','rendering')",[&now])?;
         c.execute("UPDATE jobs SET status='paused',error='服务重启时上传结果不确定，请确认 Bilibili 后手动重试',updated_at=? WHERE status IN ('uploading')",[&now])?;
         c.execute(
             "UPDATE stage_runs SET status='failed',finished_at=?,duration_ms=COALESCE(duration_ms,CAST(MAX(0,(julianday(?) - julianday(started_at))*86400000) AS INTEGER)),detail=COALESCE(detail,'服务重启中断阶段') WHERE status='running'",
@@ -387,6 +444,10 @@ impl Database {
         status: JobStatus,
         error: Option<&str>,
     ) -> Result<()> {
+        if matches!(status, JobStatus::RetryWait | JobStatus::UploadRetryWait) {
+            // 走这里会留下 retry_at=NULL，被当成旧行立即到期，形成紧凑重试循环。
+            anyhow::bail!("重试等待状态必须用 defer_job_retry 设置退避时间: {status}")
+        }
         self.conn().execute(
             "UPDATE jobs SET status=?,error=?,updated_at=? WHERE id=?",
             params![status.to_string(), error, Utc::now().to_rfc3339(), id],
@@ -623,19 +684,21 @@ impl Database {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?)
     }
+    /// 递增尝试次数并返回新值。
+    ///
+    /// 用 `RETURNING` 一条语句完成：拆成 UPDATE + SELECT 两次取锁时，另一个进程
+    /// （例如与 `y2b watch` 并存的 `y2b run`）可能在两次之间也递增，读回别人的值。
     pub fn increment_attempt(&self, id: &str) -> Result<i64> {
-        self.conn().execute(
-            "UPDATE jobs SET attempt=attempt+1,updated_at=? WHERE id=?",
+        Ok(self.conn().query_row(
+            "UPDATE jobs SET attempt=attempt+1,updated_at=? WHERE id=? RETURNING attempt",
             params![Utc::now().to_rfc3339(), id],
-        )?;
-        Ok(self
-            .conn()
-            .query_row("SELECT attempt FROM jobs WHERE id=?", [id], |r| r.get(0))?)
+            |r| r.get(0),
+        )?)
     }
 
     pub fn retry_job(&self, id: &str) -> Result<()> {
         let changed = self.conn().execute(
-            "UPDATE jobs SET status=CASE WHEN prepared_upload_json IS NOT NULL THEN 'ready_to_upload' ELSE 'queued' END,attempt=0,error=NULL,updated_at=? WHERE id=?",
+            "UPDATE jobs SET status=CASE WHEN prepared_upload_json IS NOT NULL THEN 'ready_to_upload' ELSE 'queued' END,attempt=0,error=NULL,retry_at=NULL,updated_at=? WHERE id=?",
             params![Utc::now().to_rfc3339(), id],
         )?;
         if changed == 0 {
@@ -919,7 +982,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 8);
+        assert_eq!(db.schema_version().unwrap(), 9);
         assert_eq!(
             db.list_channels().unwrap()[0].transfer_mode,
             TransferMode::Translated
@@ -935,7 +998,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
-        assert_eq!(db.schema_version().unwrap(), 8);
+        assert_eq!(db.schema_version().unwrap(), 9);
         assert!(
             db.create_job(NewJob {
                 channel_id: None,
@@ -1114,7 +1177,7 @@ mod tests {
             raw_json: r#"{"title":"中文标题"}"#.into(),
         };
         db.save_publication_metadata(&id, &metadata).unwrap();
-        db.update_job_status(&id, JobStatus::RetryWait, Some("test"))
+        db.defer_job_retry(&id, JobStatus::RetryWait, "test", 600)
             .unwrap();
         drop(db);
 
@@ -1138,10 +1201,31 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        db.update_job_status(&id, JobStatus::RetryWait, Some("rate limited"))
+        // 退避未到期不可领取。
+        db.defer_job_retry(&id, JobStatus::RetryWait, "rate limited", 600)
             .unwrap();
         assert!(db.next_queued_job().unwrap().is_none());
 
+        // 到期后可以领取。
+        db.defer_job_retry(&id, JobStatus::RetryWait, "rate limited", -1)
+            .unwrap();
+        assert_eq!(db.next_queued_job().unwrap().unwrap().id, id);
+
+        // 忘记设退避时间的写法直接被拒绝，避免紧凑重试循环。
+        assert!(
+            db.update_job_status(&id, JobStatus::RetryWait, Some("boom"))
+                .is_err()
+        );
+
+        // v9 之前的行没有 retry_at，沿用固定 10 分钟退避。
+        let now = Utc::now().to_rfc3339();
+        db.conn()
+            .execute(
+                "UPDATE jobs SET status='retry_wait',retry_at=NULL,updated_at=? WHERE id=?",
+                params![now, id],
+            )
+            .unwrap();
+        assert!(db.next_queued_job().unwrap().is_none());
         let old = (Utc::now() - chrono::Duration::minutes(11)).to_rfc3339();
         db.conn()
             .execute("UPDATE jobs SET updated_at=? WHERE id=?", params![old, id])
@@ -1235,18 +1319,14 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        db.update_job_status(&upload_id, JobStatus::UploadRetryWait, Some("test"))
+        db.defer_job_retry(&upload_id, JobStatus::UploadRetryWait, "test", 600)
             .unwrap();
 
+        // 上传退避不影响准备队列继续推进。
         assert!(db.next_ready_to_upload_job().unwrap().is_none());
         assert_eq!(db.next_queued_job().unwrap().unwrap().id, queued_id);
 
-        let old = (Utc::now() - chrono::Duration::minutes(11)).to_rfc3339();
-        db.conn()
-            .execute(
-                "UPDATE jobs SET updated_at=? WHERE id=?",
-                params![old, upload_id],
-            )
+        db.defer_job_retry(&upload_id, JobStatus::UploadRetryWait, "test", -1)
             .unwrap();
         assert_eq!(
             db.next_ready_to_upload_job().unwrap().unwrap().id,

@@ -32,6 +32,9 @@ mod testing;
 pub struct Pipeline {
     pub config: Config,
     pub db: Database,
+    /// 复用的 HTTP 客户端（目前只用于拉 YouTube 封面）。每次调用新建
+    /// `reqwest::Client` 会重建 TLS 配置和连接池，没有必要。
+    http: reqwest::Client,
 }
 
 /// `stage_runs` 行的 RAII 句柄。
@@ -86,6 +89,20 @@ where
 
 fn requires_translated_pipeline(mode: TransferMode) -> bool {
     mode == TransferMode::Translated
+}
+
+/// 任务重试退避基数与上限：第 n 次失败后等待 `min(5min × 2^n, 1h)`。
+///
+/// n=1 恰好是迁移前的固定 10 分钟，所以首次重试的时机没变；之后逐步拉长，
+/// 避免持续故障（YouTube 限流、网络抖动）时在 max_attempts 内密集重试——
+/// 每次重试都要重新走一遍下载。
+const RETRY_BASE_SECONDS: i64 = 300;
+const RETRY_CAP_SECONDS: i64 = 3600;
+
+fn retry_delay_seconds(attempt: i64) -> i64 {
+    RETRY_BASE_SECONDS
+        .saturating_mul(1i64 << attempt.clamp(0, 16))
+        .min(RETRY_CAP_SECONDS)
 }
 
 impl StageGuard {
@@ -161,7 +178,11 @@ impl Drop for StageGuard {
 
 impl Pipeline {
     pub fn new(config: Config, db: Database) -> Self {
-        Self { config, db }
+        Self {
+            config,
+            db,
+            http: reqwest::Client::new(),
+        }
     }
 
     pub async fn run_job(&self, job: Job) -> Result<()> {
@@ -193,8 +214,17 @@ impl Pipeline {
             } else {
                 JobStatus::RetryWait
             };
-            self.db
-                .update_job_status(&job.id, status, Some(&e.to_string()))?;
+            if status == JobStatus::RetryWait {
+                self.db.defer_job_retry(
+                    &job.id,
+                    status,
+                    &e.to_string(),
+                    retry_delay_seconds(attempt),
+                )?;
+            } else {
+                self.db
+                    .update_job_status(&job.id, status, Some(&e.to_string()))?;
+            }
             self.db.event(
                 Some(&job.id),
                 if live_pending { "info" } else { "error" },
@@ -217,8 +247,17 @@ impl Pipeline {
             } else {
                 JobStatus::UploadRetryWait
             };
-            self.db
-                .update_job_status(&job.id, status, Some(&error.to_string()))?;
+            if status == JobStatus::UploadRetryWait {
+                self.db.defer_job_retry(
+                    &job.id,
+                    status,
+                    &error.to_string(),
+                    retry_delay_seconds(attempt),
+                )?;
+            } else {
+                self.db
+                    .update_job_status(&job.id, status, Some(&error.to_string()))?;
+            }
             self.db.event(Some(&job.id), "error", &error.to_string())?;
         }
         result
@@ -385,7 +424,8 @@ impl Pipeline {
         let mut stage = StageGuard::start(&self.db, job_id, "cover_download", None, None, None)?;
         let source = work.join(format!("{}.youtube-cover.source", meta.id));
         let result = async {
-            let response = reqwest::Client::new()
+            let response = self
+                .http
                 .get(thumbnail_url)
                 .send()
                 .await?
@@ -608,6 +648,16 @@ mod tests {
         assert_eq!(stages[2].status, "failed");
         assert_eq!(stages[2].detail.as_deref(), Some("biliup 未返回 BV 号"));
         assert_eq!(stages[2].duration_ms, Some(7));
+    }
+
+    #[test]
+    fn retry_backoff_keeps_the_first_retry_at_ten_minutes_then_grows() {
+        // 第一次重试和迁移前的固定 10 分钟一致，之后翻倍并封顶 1 小时。
+        assert_eq!(retry_delay_seconds(1), 600);
+        assert_eq!(retry_delay_seconds(2), 1200);
+        assert_eq!(retry_delay_seconds(3), 2400);
+        assert_eq!(retry_delay_seconds(4), 3600);
+        assert_eq!(retry_delay_seconds(64), 3600);
     }
 
     #[test]
