@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::db::Database;
 use crate::model::{Job, JobStatus, PreparedUpload, TransferMode, VideoMetadata};
-use crate::monitor::{Monitor, is_live_content_pending, ytdlp_command};
+use crate::monitor::{Monitor, exceeds_duration_limit, is_live_content_pending, ytdlp_command};
 use crate::process::run_monitored;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -199,15 +199,16 @@ impl Pipeline {
     pub async fn prepare_job(&self, job: Job) -> Result<()> {
         let result = self.prepare_job_inner(&job).await;
         if let Err(e) = &result {
-            let live_pending = is_live_content_pending(e);
-            let attempt = if live_pending {
+            // 重试也不会有不同结果的两类：直播内容尚未就绪（入队前已校验过，
+            // 走到这里说明状态有变，回放就绪后由频道轮询重新发现），以及时长
+            // 超过上限（视频不会变短）。两者都直接终结，不消耗重试次数。
+            let permanent_skip = is_live_content_pending(e) || exceeds_duration_limit(e);
+            let attempt = if permanent_skip {
                 job.attempt
             } else {
                 self.db.increment_attempt(&job.id)?
             };
-            let status = if live_pending {
-                // 直播中/预告/回放生成中：入队前已校验过，走到这里说明状态有变，
-                // 不反复重试；回放就绪后由频道轮询重新发现。
+            let status = if permanent_skip {
                 JobStatus::DeadLetter
             } else if attempt >= self.config.monitor.max_attempts as i64 {
                 self.cleanup_large(&job.id).ok();
@@ -228,7 +229,7 @@ impl Pipeline {
             }
             self.db.event(
                 Some(&job.id),
-                if live_pending { "info" } else { "error" },
+                if permanent_skip { "info" } else { "error" },
                 &e.to_string(),
             )?;
         }

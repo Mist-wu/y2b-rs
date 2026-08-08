@@ -16,11 +16,13 @@ pub struct Monitor {
     config: Config,
     db: Database,
     client: reqwest::Client,
-    /// 最近一次确认「直播内容尚未就绪」的时间（按 video_id）。
+    /// 最近一次确认「本轮不入队」的时间（按 video_id），用于限制重复拉取元数据。
     ///
-    /// 直播结束后会变成可搬运的回放，所以这里只能限制重复拉取元数据的频率，
-    /// 不能永久拉黑——否则直播中发现的视频永远等不到它的回放被入队。
-    skipped_live: Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// 两类来源：直播内容尚未就绪，以及时长超过上限。前者结束后会变成可搬运的
+    /// 回放，所以不能永久拉黑——否则直播中发现的视频永远等不到回放被入队；
+    /// 后者虽然不会变化，但同一份 TTL 也让 max_duration_seconds 改配置后能在
+    /// 一个复查周期内生效。
+    deferred_videos: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// 最近一次 yt-dlp 回退检查时间（按频道），防止 RSS 故障时高频拉取。
     last_fallback_at: Mutex<std::collections::HashMap<i64, std::time::Instant>>,
 }
@@ -51,11 +53,11 @@ pub struct EnqueueOutcome {
 
 const LIVE_CONTENT_PENDING_PREFIX: &str = "直播内容尚未就绪，暂不处理";
 
-/// 直播内容确认「尚未就绪」后，多久允许重新拉取一次元数据。
+/// 跳过某个视频后，多久允许重新拉取一次元数据。
 ///
 /// 直播中/预告的视频最终会变成 `was_live` 回放并可以搬运，所以必须周期性复查；
 /// 间隔取 30 分钟，兼顾及时性和 yt-dlp 调用成本。
-const LIVE_RECHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const RECHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// 尚未就绪、需要稍后复查的 `live_status`。
 ///
@@ -65,6 +67,33 @@ const LIVE_RECHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 ///
 /// `was_live`（直播回放）不在此列——回放已经是完整视频，按普通视频搬运。
 const LIVE_STATUS_NOT_READY: &[&str] = &["is_live", "is_upcoming", "post_live"];
+
+const DURATION_LIMIT_PREFIX: &str = "视频时长超过上限";
+
+/// 时长超限的视频永远不会变短，属于永久跳过（区别于直播的「稍后复查」）。
+pub fn exceeds_duration_limit(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with(DURATION_LIMIT_PREFIX))
+}
+
+/// 时长上限校验。`limit_seconds` 为 0 表示不限制；元数据缺少 duration 时放行
+/// （拿不到时长不作为拒绝理由，保持原有行为）。
+fn validate_duration(duration: Option<f64>, limit_seconds: u64) -> Result<()> {
+    if limit_seconds == 0 {
+        return Ok(());
+    }
+    let Some(duration) = duration else {
+        return Ok(());
+    };
+    if duration > limit_seconds as f64 {
+        bail!(
+            "{DURATION_LIMIT_PREFIX}: {:.0}s > {limit_seconds}s",
+            duration
+        )
+    }
+    Ok(())
+}
 
 /// yt-dlp 在元数据阶段就会拒绝未开始的直播/预约事件（不返回 JSON，直接报错）。
 const LIVE_EVENT_NOT_STARTED_MARKERS: &[&str] = &[
@@ -153,7 +182,7 @@ impl Monitor {
             client: reqwest::Client::builder()
                 .user_agent("y2b-rs/0.1")
                 .build()?,
-            skipped_live: Mutex::new(std::collections::HashMap::new()),
+            deferred_videos: Mutex::new(std::collections::HashMap::new()),
             last_fallback_at: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -298,6 +327,11 @@ impl Monitor {
             }
             let metadata = match self.fetch_metadata(&link).await {
                 Ok((metadata, _, _)) => metadata,
+                // 直播未就绪和超时长是预期内的跳过，不该记成故障。
+                Err(error) if is_live_content_pending(&error) || exceeds_duration_limit(&error) => {
+                    tracing::info!(video_id, error = %error, "校对候选不满足搬运条件，跳过");
+                    continue;
+                }
                 Err(error) => {
                     tracing::warn!(video_id, error = %error, "校对候选元数据获取失败，跳过");
                     continue;
@@ -364,13 +398,13 @@ impl Monitor {
                 .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={video_id}"));
             let title = e.title.as_ref().map(|x| x.content.as_str());
             if enqueue {
-                if self.live_recheck_is_throttled(&video_id) {
+                if self.recheck_is_throttled(&video_id) {
                     continue;
                 }
                 if self.db.get_job_by_video_id(&video_id)?.is_some() {
                     continue;
                 }
-                // 直播预告/直播回放按策略不转载：先拉取元数据确认非直播内容。
+                // 先拉元数据筛掉不该入队的内容：尚未就绪的直播，以及超长视频。
                 match self.fetch_metadata(&link).await {
                     Ok(_) => {}
                     Err(error) if is_live_content_pending(&error) => {
@@ -379,10 +413,12 @@ impl Monitor {
                             error = %error,
                             "直播内容尚未就绪，稍后复查是否已有回放"
                         );
-                        self.skipped_live
-                            .lock()
-                            .unwrap()
-                            .insert(video_id.clone(), std::time::Instant::now());
+                        self.defer_video(&video_id);
+                        continue;
+                    }
+                    Err(error) if exceeds_duration_limit(&error) => {
+                        tracing::info!(video_id, error = %error, "视频超过时长上限，跳过");
+                        self.defer_video(&video_id);
                         continue;
                     }
                     Err(_) => {
@@ -429,15 +465,23 @@ impl Monitor {
         true
     }
 
-    /// 距上次确认「尚未就绪」不足 `LIVE_RECHECK_INTERVAL` 时跳过本轮元数据拉取。
+    /// 距上次确认不足 `RECHECK_INTERVAL` 时跳过本轮元数据拉取。
     ///
     /// 锁不跨 await：只在这里做一次判断就释放。
-    fn live_recheck_is_throttled(&self, video_id: &str) -> bool {
-        self.skipped_live
+    fn recheck_is_throttled(&self, video_id: &str) -> bool {
+        self.deferred_videos
             .lock()
             .unwrap()
             .get(video_id)
-            .is_some_and(|at| at.elapsed() < LIVE_RECHECK_INTERVAL)
+            .is_some_and(|at| at.elapsed() < RECHECK_INTERVAL)
+    }
+
+    /// 记录本轮跳过的时间，抑制下一轮的重复元数据拉取。
+    fn defer_video(&self, video_id: &str) {
+        self.deferred_videos
+            .lock()
+            .unwrap()
+            .insert(video_id.to_string(), std::time::Instant::now());
     }
 
     /// RSS 拉取失败时回退到 yt-dlp 频道列表（带每频道冷却，防止高频拉取）。
@@ -476,6 +520,10 @@ impl Monitor {
             }
         };
         validate_single_video(&v)?;
+        validate_duration(
+            v.get("duration").and_then(Value::as_f64),
+            self.config.youtube.max_duration_seconds,
+        )?;
         let live = v
             .get("live_status")
             .and_then(Value::as_str)
@@ -627,26 +675,45 @@ mod tests {
     }
 
     #[test]
+    fn duration_limit_rejects_only_videos_over_the_cap() {
+        // 2 小时上限：正好 2 小时放行，超出一秒拒绝。
+        validate_duration(Some(7200.0), 7200).unwrap();
+        let error = validate_duration(Some(7201.0), 7200).unwrap_err();
+        assert!(exceeds_duration_limit(&error), "应被识别为时长超限");
+        assert!(!is_live_content_pending(&error), "不应被误判为直播内容");
+        // 上下文包装后仍要能识别（流水线拿到的是带 context 的错误）。
+        assert!(exceeds_duration_limit(
+            &validate_duration(Some(14400.0), 7200)
+                .unwrap_err()
+                .context("元数据校验失败")
+        ));
+        // 缺少时长不作为拒绝理由；0 表示不限制。
+        validate_duration(None, 7200).unwrap();
+        validate_duration(Some(99999.0), 0).unwrap();
+    }
+
+    #[test]
     fn live_recheck_throttles_but_does_not_blacklist_forever() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("x.db")).unwrap();
         let monitor = Monitor::new(Config::default(), db).unwrap();
         assert!(
-            !monitor.live_recheck_is_throttled("abc"),
+            !monitor.recheck_is_throttled("abc"),
             "没记录过的视频应立即检查"
         );
         monitor
-            .skipped_live
+            .deferred_videos
             .lock()
             .unwrap()
             .insert("abc".into(), std::time::Instant::now());
-        assert!(monitor.live_recheck_is_throttled("abc"), "刚确认过应节流");
+        assert!(monitor.recheck_is_throttled("abc"), "刚确认过应节流");
         // 超过复查间隔后必须重新检查，否则直播中发现的视频永远等不到回放入队。
-        monitor.skipped_live.lock().unwrap().insert(
-            "abc".into(),
-            std::time::Instant::now() - LIVE_RECHECK_INTERVAL,
-        );
-        assert!(!monitor.live_recheck_is_throttled("abc"));
+        monitor
+            .deferred_videos
+            .lock()
+            .unwrap()
+            .insert("abc".into(), std::time::Instant::now() - RECHECK_INTERVAL);
+        assert!(!monitor.recheck_is_throttled("abc"));
     }
 
     #[test]

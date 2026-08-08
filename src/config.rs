@@ -43,6 +43,12 @@ pub struct YoutubeConfig {
     pub probe_url: String,
     pub max_pixels: u64,
     pub max_fps: f64,
+    /// 超过该时长的视频直接跳过，不入队。
+    ///
+    /// 主要针对直播回放（常见 1–4 小时）：下载会撞上 `video_download` 的 7200s
+    /// 超时，`translated` 模式下的分句/翻译 token 成本也比普通视频高一个数量级。
+    /// 设为 0 表示不限制。
+    pub max_duration_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +165,7 @@ impl Default for YoutubeConfig {
             probe_url: "https://www.youtube.com/watch?v=jNQXAC9IVRw".into(),
             max_pixels: 2_073_600,
             max_fps: 60.0,
+            max_duration_seconds: 7200,
         }
     }
 }

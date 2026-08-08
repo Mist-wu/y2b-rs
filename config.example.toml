@@ -17,6 +17,8 @@ cookies = "/var/lib/y2b/youtube_cookies.txt"
 probe_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 max_pixels = 2073600
 max_fps = 60.0
+# 超过该时长的视频直接跳过，不入队（主要针对 1–4 小时的直播回放）。0 = 不限制。
+max_duration_seconds = 7200
 
 [bilibili]
 biliup = "/usr/local/bin/biliup"
