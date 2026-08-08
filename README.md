@@ -7,6 +7,7 @@ Rust CLI/TUI 工具：监控 YouTube 频道更新，按频道选择原片直传�
 ### 发现与筛选
 
 - RSS 每 60 秒发现更新，每 6 小时用 yt-dlp 校对最近 30 条。
+- 所有 yt-dlp 调用强制 `--force-ipv4`：googlevideo 的 DNS 会返回 AAAA，而部署机没有 IPv6 出口时下载会 `[Errno 101] Network is unreachable`——元数据走 youtube.com 不受影响，症状是「元数据成功、下载必失败」。
 - 直播回放（`was_live`）按普通视频搬运。直播中（`is_live`）、预约（`is_upcoming`）和回放生成中（`post_live`）暂不入队，每 30 分钟复查一次，回放就绪后自动搬运。
 - 超过 `youtube.max_duration_seconds`（默认 2 小时）的视频直接跳过，不入队；已入队的任务若发现超时长会直接进 `dead_letter`，不消耗重试次数。
 - 只自动搬运策略生效之后开播的回放。首次运行时把 `live_replay.enqueue_after` 游标设为当时时间，早于该时间开播的历史回放不会被 RSS 或 yt-dlp 校对扫进队列；手动 `y2b jobs add` 不受此限制。
