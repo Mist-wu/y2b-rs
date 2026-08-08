@@ -27,7 +27,7 @@ mod upload;
 pub use cc::{CC_INITIAL_DELAY_SECONDS, CC_MAX_ATTEMPTS};
 
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 pub struct Pipeline {
     pub config: Config,

@@ -163,6 +163,23 @@ fn extract_thumbnail_url(v: &Value) -> Option<String> {
         })
 }
 
+/// 自动发现时是否应当跳过这条直播回放。
+///
+/// 只对 `was_live` 生效：普通视频不受游标限制。拿不到开播时间的回放按积压
+/// 处理——宁可漏掉一条，也不要把历史直播灌进队列。
+fn is_backlog_replay(meta: &VideoMetadata, cutoff: DateTime<Utc>) -> bool {
+    if meta.live_status.as_deref() != Some("was_live") {
+        return false;
+    }
+    let Some(started) = meta
+        .timestamp
+        .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))
+    else {
+        return true;
+    };
+    started < cutoff
+}
+
 fn reconcile_after_baseline(
     baseline: Option<DateTime<Utc>>,
     timestamp: Option<i64>,
@@ -294,6 +311,7 @@ impl Monitor {
     async fn reconcile_channel(&self, id: i64, url: &str) -> Result<usize> {
         let transfer_mode = self.db.channel_transfer_mode(id)?;
         let baseline = self.db.channel_baseline(id)?;
+        let replay_cutoff = self.db.live_replay_cutoff()?;
         let mut cmd = ytdlp_command(&self.config.youtube);
         cmd.args([
             "--flat-playlist",
@@ -337,6 +355,10 @@ impl Monitor {
                     continue;
                 }
             };
+            if is_backlog_replay(&metadata, replay_cutoff) {
+                tracing::info!(video_id, "历史直播回放，不自动入队");
+                continue;
+            }
             match reconcile_after_baseline(baseline, metadata.timestamp) {
                 Some(true) => {}
                 Some(false) => break,
@@ -371,6 +393,7 @@ impl Monitor {
         let url = self.db.channel_feed(id)?;
         let baseline = self.db.channel_baseline(id)?;
         let transfer_mode = self.db.channel_transfer_mode(id)?;
+        let replay_cutoff = self.db.live_replay_cutoff()?;
         let bytes = match self.client.get(&url).send().await {
             Ok(response) => match response.error_for_status() {
                 Ok(response) => response.bytes().await?,
@@ -404,8 +427,18 @@ impl Monitor {
                 if self.db.get_job_by_video_id(&video_id)?.is_some() {
                     continue;
                 }
-                // 先拉元数据筛掉不该入队的内容：尚未就绪的直播，以及超长视频。
+                // 先拉元数据筛掉不该入队的内容：尚未就绪的直播、超长视频，
+                // 以及策略生效之前就开播的历史回放。
                 match self.fetch_metadata(&link).await {
+                    Ok((meta, _, _)) if is_backlog_replay(&meta, replay_cutoff) => {
+                        tracing::info!(
+                            video_id,
+                            started = ?meta.timestamp,
+                            "历史直播回放，不自动入队"
+                        );
+                        self.defer_video(&video_id);
+                        continue;
+                    }
                     Ok(_) => {}
                     Err(error) if is_live_content_pending(&error) => {
                         tracing::info!(
@@ -672,6 +705,30 @@ mod tests {
             .as_deref(),
             Some("https://i.ytimg.com/best.jpg")
         );
+    }
+
+    #[test]
+    fn backlog_replays_are_skipped_but_new_replays_and_normal_videos_pass() {
+        let cutoff = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let replay = |status: &str, ts: Option<i64>| VideoMetadata {
+            live_status: Some(status.into()),
+            timestamp: ts,
+            ..crate::pipeline::testing::metadata()
+        };
+        // 策略生效前开播的回放：跳过。
+        assert!(is_backlog_replay(
+            &replay("was_live", Some(1_799_999_999)),
+            cutoff
+        ));
+        // 生效后开播的回放：搬运。
+        assert!(!is_backlog_replay(
+            &replay("was_live", Some(1_800_000_001)),
+            cutoff
+        ));
+        // 普通视频不受游标限制，哪怕发布得很早。
+        assert!(!is_backlog_replay(&replay("not_live", Some(1)), cutoff));
+        // 回放缺少开播时间时按积压处理，避免误灌历史直播。
+        assert!(is_backlog_replay(&replay("was_live", None), cutoff));
     }
 
     #[test]

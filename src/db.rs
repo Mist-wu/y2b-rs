@@ -816,6 +816,29 @@ impl Database {
             .optional()
             .map_err(Into::into)
     }
+    /// 直播回放的自动入队起点：早于该时间开播的回放不入队。
+    ///
+    /// 放开 `was_live` 之后，频道 RSS 和 yt-dlp 校对里积压的历史回放会被一次性
+    /// 全部扫进队列。首次读取时把游标初始化为当前时间，此后只有新开播的直播
+    /// 留下的回放才会被搬运。手动 `y2b jobs add` 不受此限制。
+    pub fn live_replay_cutoff(&self) -> Result<DateTime<Utc>> {
+        const KEY: &str = "live_replay.enqueue_after";
+        if let Some(value) = self.get_setting(KEY)? {
+            match DateTime::parse_from_rfc3339(&value) {
+                Ok(parsed) => return Ok(parsed.with_timezone(&Utc)),
+                Err(error) => tracing::warn!(
+                    key = KEY,
+                    value,
+                    error = %error,
+                    "直播回放游标无法解析，按当前时间重置"
+                ),
+            }
+        }
+        let now = Utc::now();
+        self.set_setting(KEY, &now.to_rfc3339())?;
+        Ok(now)
+    }
+
     pub fn backup(&self, dest: &Path) -> Result<()> {
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p)?;
