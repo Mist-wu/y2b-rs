@@ -29,13 +29,14 @@ pub struct Monitor {
 
 /// 构造带公共参数（js 运行时、cookies）的 yt-dlp 命令，供各子命令复用。
 ///
-/// `--force-ipv4`：googlevideo 的 DNS 同时返回 A 和 AAAA，而部署机没有 IPv6
-/// 出口，yt-dlp 连到 AAAA 地址会直接 `[Errno 101] Network is unreachable`。
-/// 元数据走 youtube.com 不受影响，所以症状是「元数据成功、下载必失败」，
-/// 重试 5 次后进 dead_letter——线上有视频因此晚了两天才搬。
+/// 注意：不要加 `--force-ipv4`。曾经为了绕开 `[Errno 101] Network is unreachable`
+/// 加过，但那是误诊——真正的原因是部署机到 `74.125.0.0/16` 整段不可达，两个地址
+/// 族都连不上。而 `--force-ipv4`（实现上等价于 `--source-address 0.0.0.0`）在当前
+/// yt-dlp 版本下会让本来正常的域名解析报 `[Errno -9] Address family for hostname
+/// not supported`，属于净负面。
 pub(crate) fn ytdlp_command(config: &YoutubeConfig) -> Command {
     let mut cmd = Command::new(&config.yt_dlp);
-    cmd.args(["--force-ipv4", "--js-runtimes", "node"]);
+    cmd.args(["--js-runtimes", "node"]);
     if config.cookies.exists() {
         cmd.arg("--cookies").arg(&config.cookies);
     }
