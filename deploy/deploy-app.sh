@@ -16,6 +16,17 @@ install -m 0755 "$root_dir/deploy/restore.sh" /opt/y2b/deploy/restore.sh
 [[ -f /etc/y2b/config.toml ]] || install -m 0644 "$root_dir/config.example.toml" /etc/y2b/config.toml
 install -m 0644 "$root_dir/deploy/y2b-watch.service" /etc/systemd/system/y2b-watch.service
 systemctl daemon-reload
+
+# 迁移和基线写入要独占数据库，且新二进制必须真正接管：`enable --now` 对已在
+# 运行的服务是空操作，会出现「装上了但跑的还是旧二进制」。这里显式停 → 迁移
+# → 起。停止前先确认没有投稿在途，避免 SIGKILL 掉一半的上传。
+if systemctl is-active --quiet y2b-watch.service; then
+  echo "==> 停止 y2b-watch 以独占数据库"
+  systemctl stop y2b-watch.service
+fi
+
 /usr/local/bin/y2b --config /etc/y2b/config.toml check --write-baseline
-systemctl enable --now y2b-watch.service
+
+systemctl enable y2b-watch.service
+systemctl restart y2b-watch.service
 systemctl --no-pager --full status y2b-watch.service

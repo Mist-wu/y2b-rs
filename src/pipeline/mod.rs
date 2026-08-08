@@ -206,7 +206,8 @@ impl Pipeline {
                 self.db.increment_attempt(&job.id)?
             };
             let status = if live_pending {
-                // 直播预告/直播回放按策略永久跳过，不反复重试。
+                // 直播中/预告/回放生成中：入队前已校验过，走到这里说明状态有变，
+                // 不反复重试；回放就绪后由频道轮询重新发现。
                 JobStatus::DeadLetter
             } else if attempt >= self.config.monitor.max_attempts as i64 {
                 self.cleanup_large(&job.id).ok();

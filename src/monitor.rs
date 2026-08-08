@@ -16,8 +16,11 @@ pub struct Monitor {
     config: Config,
     db: Database,
     client: reqwest::Client,
-    /// 已确认是直播/预约内容的视频，本进程内不再重复拉取元数据。
-    skipped_live: Mutex<std::collections::HashSet<String>>,
+    /// 最近一次确认「直播内容尚未就绪」的时间（按 video_id）。
+    ///
+    /// 直播结束后会变成可搬运的回放，所以这里只能限制重复拉取元数据的频率，
+    /// 不能永久拉黑——否则直播中发现的视频永远等不到它的回放被入队。
+    skipped_live: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// 最近一次 yt-dlp 回退检查时间（按频道），防止 RSS 故障时高频拉取。
     last_fallback_at: Mutex<std::collections::HashMap<i64, std::time::Instant>>,
 }
@@ -46,7 +49,22 @@ pub struct EnqueueOutcome {
     pub created: bool,
 }
 
-const LIVE_CONTENT_PENDING_PREFIX: &str = "直播或预约内容暂不处理";
+const LIVE_CONTENT_PENDING_PREFIX: &str = "直播内容尚未就绪，暂不处理";
+
+/// 直播内容确认「尚未就绪」后，多久允许重新拉取一次元数据。
+///
+/// 直播中/预告的视频最终会变成 `was_live` 回放并可以搬运，所以必须周期性复查；
+/// 间隔取 30 分钟，兼顾及时性和 yt-dlp 调用成本。
+const LIVE_RECHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// 尚未就绪、需要稍后复查的 `live_status`。
+///
+/// - `is_live`：直播进行中，还没有完整回放
+/// - `is_upcoming`：预约中，尚未开始
+/// - `post_live`：直播刚结束，YouTube 仍在生成回放，此时下载会拿到残片
+///
+/// `was_live`（直播回放）不在此列——回放已经是完整视频，按普通视频搬运。
+const LIVE_STATUS_NOT_READY: &[&str] = &["is_live", "is_upcoming", "post_live"];
 
 /// yt-dlp 在元数据阶段就会拒绝未开始的直播/预约事件（不返回 JSON，直接报错）。
 const LIVE_EVENT_NOT_STARTED_MARKERS: &[&str] = &[
@@ -80,10 +98,7 @@ fn validate_single_video(v: &Value) -> Result<()> {
         bail!("请输入单个 YouTube 视频 URL，不支持播放列表")
     }
     let live = v.get("live_status").and_then(Value::as_str);
-    if matches!(
-        live,
-        Some("is_live" | "is_upcoming" | "post_live" | "was_live")
-    ) {
+    if live.is_some_and(|status| LIVE_STATUS_NOT_READY.contains(&status)) {
         bail!("{LIVE_CONTENT_PENDING_PREFIX}: {live:?}")
     }
     Ok(())
@@ -138,7 +153,7 @@ impl Monitor {
             client: reqwest::Client::builder()
                 .user_agent("y2b-rs/0.1")
                 .build()?,
-            skipped_live: Mutex::new(std::collections::HashSet::new()),
+            skipped_live: Mutex::new(std::collections::HashMap::new()),
             last_fallback_at: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -349,7 +364,7 @@ impl Monitor {
                 .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={video_id}"));
             let title = e.title.as_ref().map(|x| x.content.as_str());
             if enqueue {
-                if self.skipped_live.lock().unwrap().contains(&video_id) {
+                if self.live_recheck_is_throttled(&video_id) {
                     continue;
                 }
                 if self.db.get_job_by_video_id(&video_id)?.is_some() {
@@ -359,8 +374,15 @@ impl Monitor {
                 match self.fetch_metadata(&link).await {
                     Ok(_) => {}
                     Err(error) if is_live_content_pending(&error) => {
-                        tracing::warn!(video_id, error = %error, "跳过直播/预约内容");
-                        self.skipped_live.lock().unwrap().insert(video_id.clone());
+                        tracing::info!(
+                            video_id,
+                            error = %error,
+                            "直播内容尚未就绪，稍后复查是否已有回放"
+                        );
+                        self.skipped_live
+                            .lock()
+                            .unwrap()
+                            .insert(video_id.clone(), std::time::Instant::now());
                         continue;
                     }
                     Err(_) => {
@@ -405,6 +427,17 @@ impl Monitor {
         }
         map.insert(id, now);
         true
+    }
+
+    /// 距上次确认「尚未就绪」不足 `LIVE_RECHECK_INTERVAL` 时跳过本轮元数据拉取。
+    ///
+    /// 锁不跨 await：只在这里做一次判断就释放。
+    fn live_recheck_is_throttled(&self, video_id: &str) -> bool {
+        self.skipped_live
+            .lock()
+            .unwrap()
+            .get(video_id)
+            .is_some_and(|at| at.elapsed() < LIVE_RECHECK_INTERVAL)
     }
 
     /// RSS 拉取失败时回退到 yt-dlp 频道列表（带每频道冷却，防止高频拉取）。
@@ -503,15 +536,22 @@ mod tests {
             .to_string()
             .contains("播放列表")
         );
-        for live in ["is_live", "is_upcoming", "post_live", "was_live"] {
+        // 直播中/预告/回放生成中：暂不搬运，等回放就绪后复查。
+        for live in ["is_live", "is_upcoming", "post_live"] {
             assert!(
                 validate_single_video(&serde_json::json!({ "live_status": live }))
                     .unwrap_err()
                     .to_string()
                     .contains("直播"),
-                "live_status={live} 应被拒绝"
+                "live_status={live} 应被推迟"
             );
         }
+        // 直播回放已是完整视频，按普通视频搬运。
+        validate_single_video(&serde_json::json!({
+            "_type": "video",
+            "live_status": "was_live"
+        }))
+        .unwrap();
         validate_single_video(&serde_json::json!({
             "_type": "video",
             "live_status": "not_live"
@@ -584,6 +624,29 @@ mod tests {
             .as_deref(),
             Some("https://i.ytimg.com/best.jpg")
         );
+    }
+
+    #[test]
+    fn live_recheck_throttles_but_does_not_blacklist_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("x.db")).unwrap();
+        let monitor = Monitor::new(Config::default(), db).unwrap();
+        assert!(
+            !monitor.live_recheck_is_throttled("abc"),
+            "没记录过的视频应立即检查"
+        );
+        monitor
+            .skipped_live
+            .lock()
+            .unwrap()
+            .insert("abc".into(), std::time::Instant::now());
+        assert!(monitor.live_recheck_is_throttled("abc"), "刚确认过应节流");
+        // 超过复查间隔后必须重新检查，否则直播中发现的视频永远等不到回放入队。
+        monitor.skipped_live.lock().unwrap().insert(
+            "abc".into(),
+            std::time::Instant::now() - LIVE_RECHECK_INTERVAL,
+        );
+        assert!(!monitor.live_recheck_is_throttled("abc"));
     }
 
     #[test]
