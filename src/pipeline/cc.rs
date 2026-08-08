@@ -9,12 +9,18 @@ use std::fs;
 /// 投稿后到首次尝试补 CC 字幕的等待：B站稿件刚上传时查询 bvid 会返回 -404。
 pub const CC_INITIAL_DELAY_SECONDS: i64 = 90;
 
-/// CC 补交的最大自动尝试次数，耗尽后留给 `y2b subtitle add/--all` 手动处理。
-pub const CC_MAX_ATTEMPTS: i64 = 8;
+/// CC 补交的最大自动尝试次数，耗尽后留给 `y2b subtitle add/all` 手动处理。
+///
+/// 配合下面的退避，`-404` 的覆盖窗口约 7 小时、其余失败约 8.5 小时。
+pub const CC_MAX_ATTEMPTS: i64 = 12;
 
-/// 稿件仍在 B站处理中（-404）时的固定重试间隔：这是预期内的短暂状态，
-/// 用指数退避会把首次成功推得过晚。
-pub(super) const CC_NOT_READY_RETRY_SECONDS: i64 = 60;
+/// 稿件仍在 B站处理中（-404）时的退避基数：第 n 次等待 `min(30 × 2^n, 1h)`。
+///
+/// 这里曾用固定 60 秒，理由是「-404 只是短暂状态」——实测是错的：B站审核加
+/// 转码常见几十分钟到数小时，固定间隔会在 8 分钟内烧完全部重试次数，等稿件
+/// 真正就绪时已经放弃了。改成递增后前几次仍然密集（1/3/7 分钟），快速过审的
+/// 稿件能及时补上字幕，之后逐步拉长到 1 小时。
+pub(super) const CC_NOT_READY_BASE_SECONDS: i64 = 30;
 
 /// 其余失败的退避基数与上限：第 n 次失败后等待 `min(90 × 2^n, 1h)`。
 pub(super) const CC_RETRY_BASE_SECONDS: i64 = 90;
@@ -23,11 +29,12 @@ pub(super) const CC_RETRY_CAP_SECONDS: i64 = 3600;
 
 /// CC 补交第 `attempt` 次失败后到下次可领取的秒数。
 pub(super) fn cc_retry_delay_seconds(attempt: i64, video_not_ready: bool) -> i64 {
-    if video_not_ready {
-        return CC_NOT_READY_RETRY_SECONDS;
-    }
-    CC_RETRY_BASE_SECONDS
-        .saturating_mul(1i64 << attempt.clamp(0, 16))
+    let base = if video_not_ready {
+        CC_NOT_READY_BASE_SECONDS
+    } else {
+        CC_RETRY_BASE_SECONDS
+    };
+    base.saturating_mul(1i64 << attempt.clamp(0, 16))
         .min(CC_RETRY_CAP_SECONDS)
 }
 
@@ -264,16 +271,29 @@ mod tests {
     }
 
     #[test]
-    fn cc_retry_delay_is_fixed_for_not_ready_and_capped_otherwise() {
-        // -404 是预期内的短暂状态，用固定短间隔而不是指数退避。
+    fn cc_retry_delay_backs_off_for_both_failure_kinds() {
+        // -404：前几次密集，快速过审的稿件能及时补字幕。
         assert_eq!(cc_retry_delay_seconds(1, true), 60);
-        assert_eq!(cc_retry_delay_seconds(7, true), 60);
-        // 其余失败按 90 × 2^n 退避，封顶 1 小时。
+        assert_eq!(cc_retry_delay_seconds(2, true), 120);
+        assert_eq!(cc_retry_delay_seconds(3, true), 240);
+        // 之后逐步拉长并封顶 1 小时——固定 60 秒会在 8 分钟内烧完全部重试，
+        // 而 B站审核转码常见几十分钟到数小时。
+        assert_eq!(cc_retry_delay_seconds(7, true), 3600);
+        assert_eq!(cc_retry_delay_seconds(64, true), 3600);
+        // 其余失败按 90 × 2^n 退避，同样封顶 1 小时。
         assert_eq!(cc_retry_delay_seconds(1, false), 180);
-        assert_eq!(cc_retry_delay_seconds(2, false), 360);
         assert_eq!(cc_retry_delay_seconds(5, false), 2880);
         assert_eq!(cc_retry_delay_seconds(6, false), 3600);
-        assert_eq!(cc_retry_delay_seconds(64, false), 3600);
+    }
+
+    #[test]
+    fn cc_not_ready_window_covers_bilibili_review_time() {
+        // 12 次尝试累计覆盖的时长必须远超 B站审核的常见耗时，
+        // 否则会在稿件真正就绪之前就放弃（线上出现过：8 次 × 60 秒 = 8 分钟）。
+        let total: i64 = (1..=CC_MAX_ATTEMPTS)
+            .map(|attempt| cc_retry_delay_seconds(attempt, true))
+            .sum();
+        assert!(total >= 6 * 3600, "-404 覆盖窗口只有 {total}s，不足 6 小时");
     }
 
     #[test]
