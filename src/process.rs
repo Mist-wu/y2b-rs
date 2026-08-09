@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
+use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -47,6 +48,10 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // 每条外部命令独占进程组。服务器上的 yt-dlp 是 PyInstaller onefile：启动器
+    // 会再 fork 真正的 Python 进程，只 kill 启动器会留下 PPID=1 的 yt-dlp/Node，
+    // 继续占用数百 MiB。独立进程组允许超时时一次清掉完整后代树。
+    command.as_std_mut().process_group(0);
     let mut child = command.spawn().context("启动子进程失败")?;
     let pid = child.id().context("子进程没有 PID")?;
     let mut stdout = child.stdout.take().unwrap();
@@ -69,7 +74,15 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
     {
         Ok(result) => result?,
         Err(_) => {
-            let _ = child.kill().await;
+            kill_process_group(pid);
+            // `start_kill` 是 killpg 失败时对直接子进程的兜底。先显式终止两个
+            // 读取任务，不能让它们继续等待 PyInstaller 后代继承的输出管道。
+            let _ = child.start_kill();
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            let _ = child.wait().await;
             bail!("子进程超时: {}s", timeout.as_secs());
         }
     };
@@ -90,6 +103,18 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
         duration_ms: started.elapsed().as_millis() as i64,
         peak_rss_kib: peak,
     })
+}
+
+/// 向整组发 SIGKILL。进程组 leader 即使已经退出，组内 PyInstaller/Node 后代
+/// 仍保留同一个 pgid，`killpg` 依然可以清理它们。
+fn kill_process_group(pid: u32) {
+    if let Ok(pgid) = libc::pid_t::try_from(pid) {
+        // SAFETY: killpg 只接收整数 pgid/signal；该 pgid 由刚 spawn 的子进程创建，
+        // 不会命中 y2b 自身所在的进程组。
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
 }
 
 fn process_tree_rss(root: u32, sys: &mut System) -> u64 {
@@ -118,4 +143,45 @@ fn process_tree_rss(root: u32, sys: &mut System) -> u64 {
 pub fn tail(s: &str, lines: usize) -> String {
     let v: Vec<_> = s.lines().collect();
     v[v.len().saturating_sub(lines)..].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let script = format!(
+            "sh -c 'echo $$ > {}; exec sleep 30' & wait",
+            pid_file.display()
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+
+        let error = run_monitored(command, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("子进程超时"));
+
+        let grandchild: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal 0 only checks whether this test-owned PID still exists.
+            let alive = unsafe { libc::kill(grandchild, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "超时后代进程仍存活: {grandchild}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }

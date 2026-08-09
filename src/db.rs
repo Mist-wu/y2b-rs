@@ -182,6 +182,25 @@ impl Database {
         }
         self.conn()
             .execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(9,CURRENT_TIMESTAMP)",[])?;
+        // v10: 永久超时长的视频不能只放在进程内 TTL；服务重启或 30 分钟后反复
+        // 拉元数据会浪费请求并放大 YouTube 429。记录判定时的上限；配置放宽后会
+        // 自动重新检查，而不是永久锁死。
+        self.conn().execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS over_duration_videos(
+              video_id TEXT PRIMARY KEY,
+              channel_id INTEGER REFERENCES channels(id) ON DELETE SET NULL,
+              limit_seconds INTEGER NOT NULL,
+              detail TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_over_duration_channel
+              ON over_duration_videos(channel_id);
+            INSERT OR IGNORE INTO schema_migrations(version,applied_at)
+              VALUES(10,CURRENT_TIMESTAMP);
+            "#,
+        )?;
         Ok(())
     }
 
@@ -322,6 +341,38 @@ impl Database {
         self.conn().execute(
             "UPDATE channels SET last_reconcile_at=?,last_error=? WHERE id=?",
             params![Utc::now().to_rfc3339(), error, id],
+        )?;
+        Ok(())
+    }
+
+    /// 当前时长上限不高于此前拒绝时的上限时，无需再次请求 YouTube 元数据。
+    /// 上限为 0（关闭限制）或配置已放宽时返回 false，让调用方重新确认一次。
+    pub fn is_over_duration_video(&self, video_id: &str, limit_seconds: u64) -> Result<bool> {
+        if limit_seconds == 0 {
+            return Ok(false);
+        }
+        let rejected_limit = self
+            .conn()
+            .query_row(
+                "SELECT limit_seconds FROM over_duration_videos WHERE video_id=?",
+                [video_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?;
+        Ok(rejected_limit.is_some_and(|stored| limit_seconds <= stored))
+    }
+
+    pub fn record_over_duration_video(
+        &self,
+        video_id: &str,
+        channel_id: Option<i64>,
+        limit_seconds: u64,
+        detail: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn().execute(
+            "INSERT INTO over_duration_videos(video_id,channel_id,limit_seconds,detail,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(video_id) DO UPDATE SET channel_id=excluded.channel_id,limit_seconds=excluded.limit_seconds,detail=excluded.detail,updated_at=excluded.updated_at",
+            params![video_id, channel_id, limit_seconds, detail, now, now],
         )?;
         Ok(())
     }
@@ -1005,7 +1056,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(db.schema_version().unwrap(), 10);
         assert_eq!(
             db.list_channels().unwrap()[0].transfer_mode,
             TransferMode::Translated
@@ -1021,7 +1072,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(db.schema_version().unwrap(), 10);
         assert!(
             db.create_job(NewJob {
                 channel_id: None,
@@ -1661,6 +1712,28 @@ mod tests {
             db.get_job(&id).unwrap().unwrap().status,
             JobStatus::Uploading
         );
+    }
+
+    #[test]
+    fn over_duration_rejection_is_persistent_but_respects_config_changes() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("duration.db");
+        let db = Database::open(&path).unwrap();
+        db.record_over_duration_video("too-long", None, 7200, "9000s > 7200s")
+            .unwrap();
+        assert!(db.is_over_duration_video("too-long", 7200).unwrap());
+        assert!(db.is_over_duration_video("too-long", 3600).unwrap());
+        assert!(!db.is_over_duration_video("too-long", 8000).unwrap());
+        assert!(!db.is_over_duration_video("too-long", 0).unwrap());
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.schema_version().unwrap(), 10);
+        assert!(reopened.is_over_duration_video("too-long", 7200).unwrap());
+        reopened
+            .record_over_duration_video("too-long", None, 8000, "9000s > 8000s")
+            .unwrap();
+        assert!(reopened.is_over_duration_video("too-long", 8000).unwrap());
     }
 
     #[test]

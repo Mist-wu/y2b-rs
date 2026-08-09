@@ -3306,6 +3306,7 @@ dependencies = [
  "fs2",
  "futures",
  "hex",
+ "libc",
  "ratatui",
  "regex",
  "reqwest",

@@ -8,8 +8,9 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use feed_rs::parser;
 use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 
 pub struct Monitor {
@@ -23,8 +24,8 @@ pub struct Monitor {
     /// 后者虽然不会变化，但同一份 TTL 也让 max_duration_seconds 改配置后能在
     /// 一个复查周期内生效。
     deferred_videos: Mutex<std::collections::HashMap<String, std::time::Instant>>,
-    /// 最近一次 yt-dlp 回退检查时间（按频道），防止 RSS 故障时高频拉取。
-    last_fallback_at: Mutex<std::collections::HashMap<i64, std::time::Instant>>,
+    /// RSS 故障时的 yt-dlp 回退限流：既限制单频道频率，也限制全局风暴。
+    fallback_limiter: Mutex<FallbackLimiter>,
 }
 
 /// 构造带公共参数（js 运行时、cookies）的 yt-dlp 命令，供各子命令复用。
@@ -75,6 +76,70 @@ const RECHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const LIVE_STATUS_NOT_READY: &[&str] = &["is_live", "is_upcoming", "post_live"];
 
 const DURATION_LIMIT_PREFIX: &str = "视频时长超过上限";
+
+const RSS_ATTEMPTS: usize = 3;
+const FALLBACK_CHANNEL_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+const FALLBACK_GLOBAL_WINDOW: Duration = Duration::from_secs(10 * 60);
+const FALLBACK_GLOBAL_LIMIT: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackClaim {
+    Allowed,
+    ChannelCooldown,
+    GlobalCircuitOpen,
+}
+
+#[derive(Default)]
+struct FallbackLimiter {
+    per_channel: HashMap<i64, Instant>,
+    global_starts: VecDeque<Instant>,
+}
+
+impl FallbackLimiter {
+    fn claim(&mut self, channel_id: i64, now: Instant) -> FallbackClaim {
+        if self
+            .per_channel
+            .get(&channel_id)
+            .is_some_and(|last| now.duration_since(*last) < FALLBACK_CHANNEL_COOLDOWN)
+        {
+            return FallbackClaim::ChannelCooldown;
+        }
+        while self
+            .global_starts
+            .front()
+            .is_some_and(|started| now.duration_since(*started) >= FALLBACK_GLOBAL_WINDOW)
+        {
+            self.global_starts.pop_front();
+        }
+        if self.global_starts.len() >= FALLBACK_GLOBAL_LIMIT {
+            return FallbackClaim::GlobalCircuitOpen;
+        }
+        self.per_channel.insert(channel_id, now);
+        self.global_starts.push_back(now);
+        FallbackClaim::Allowed
+    }
+}
+
+fn is_youtube_video_id(value: &str) -> bool {
+    value.len() == 11
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// yt-dlp 对裸频道 URL 返回的首层 entries 是 videos/shorts/streams 标签页，不是
+/// 视频。新频道入库和旧频道校对都在运行时规范化；用户明确给出的标签页则保留。
+fn normalize_channel_url(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    if ["/videos", "/shorts", "/streams"]
+        .iter()
+        .any(|suffix| trimmed.ends_with(suffix))
+    {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/videos")
+    }
+}
 
 /// 时长超限的视频永远不会变短，属于永久跳过（区别于直播的「稍后复查」）。
 pub fn exceeds_duration_limit(error: &anyhow::Error) -> bool {
@@ -206,7 +271,7 @@ impl Monitor {
                 .user_agent("y2b-rs/0.1")
                 .build()?,
             deferred_videos: Mutex::new(std::collections::HashMap::new()),
-            last_fallback_at: Mutex::new(std::collections::HashMap::new()),
+            fallback_limiter: Mutex::new(FallbackLimiter::default()),
         })
     }
 
@@ -238,7 +303,7 @@ impl Monitor {
             feed_url: format!("https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"),
             channel_id,
             name,
-            url: url.to_string(),
+            url: normalize_channel_url(url),
         })
     }
 
@@ -318,6 +383,7 @@ impl Monitor {
         let transfer_mode = self.db.channel_transfer_mode(id)?;
         let baseline = self.db.channel_baseline(id)?;
         let replay_cutoff = self.db.live_replay_cutoff()?;
+        let normalized_url = normalize_channel_url(url);
         let mut cmd = ytdlp_command(&self.config.youtube);
         cmd.args([
             "--flat-playlist",
@@ -325,7 +391,7 @@ impl Monitor {
             &self.config.monitor.reconcile_limit.to_string(),
             "--dump-single-json",
             "--skip-download",
-            url,
+            &normalized_url,
         ]);
         let out = run_monitored(cmd, Duration::from_secs(180)).await?;
         let v: Value = serde_json::from_str(out.stdout.trim()).context("yt-dlp 校对 JSON 无效")?;
@@ -339,6 +405,10 @@ impl Monitor {
             let Some(video_id) = e.get("id").and_then(Value::as_str) else {
                 continue;
             };
+            if !is_youtube_video_id(video_id) {
+                tracing::debug!(video_id, "校对条目不是 YouTube 视频，跳过");
+                continue;
+            }
             let link = e
                 .get("url")
                 .or_else(|| e.get("webpage_url"))
@@ -346,14 +416,27 @@ impl Monitor {
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={video_id}"));
             let title = e.get("title").and_then(Value::as_str);
-            if self.db.get_job_by_video_id(video_id)?.is_some() {
+            if self.db.get_job_by_video_id(video_id)?.is_some()
+                || self
+                    .db
+                    .is_over_duration_video(video_id, self.config.youtube.max_duration_seconds)?
+            {
                 continue;
             }
             let metadata = match self.fetch_metadata(&link).await {
                 Ok((metadata, _, _)) => metadata,
-                // 直播未就绪和超时长是预期内的跳过，不该记成故障。
-                Err(error) if is_live_content_pending(&error) || exceeds_duration_limit(&error) => {
-                    tracing::info!(video_id, error = %error, "校对候选不满足搬运条件，跳过");
+                Err(error) if exceeds_duration_limit(&error) => {
+                    self.db.record_over_duration_video(
+                        video_id,
+                        Some(id),
+                        self.config.youtube.max_duration_seconds,
+                        &error.to_string(),
+                    )?;
+                    tracing::info!(video_id, error = %error, "校对候选超过时长上限，持久化跳过");
+                    continue;
+                }
+                Err(error) if is_live_content_pending(&error) => {
+                    tracing::info!(video_id, error = %error, "校对候选直播尚未就绪，跳过");
                     continue;
                 }
                 Err(error) => {
@@ -395,19 +478,39 @@ impl Monitor {
         Ok(added)
     }
 
+    async fn fetch_feed_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let mut last_error = None;
+        for attempt in 1..=RSS_ATTEMPTS {
+            let result: Result<Vec<u8>> = async {
+                let response = self.client.get(url).send().await?.error_for_status()?;
+                Ok(response.bytes().await?.to_vec())
+            }
+            .await;
+            match result {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < RSS_ATTEMPTS {
+                        let delay = Duration::from_secs(attempt as u64);
+                        tracing::debug!(attempt, ?delay, url, "RSS 拉取失败，短退避后重试");
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+        Err(last_error.expect("RSS_ATTEMPTS 必须大于 0"))
+    }
+
     pub async fn poll_channel(&self, id: i64, enqueue: bool) -> Result<usize> {
         let url = self.db.channel_feed(id)?;
         let baseline = self.db.channel_baseline(id)?;
         let transfer_mode = self.db.channel_transfer_mode(id)?;
         let replay_cutoff = self.db.live_replay_cutoff()?;
-        let bytes = match self.client.get(&url).send().await {
-            Ok(response) => match response.error_for_status() {
-                Ok(response) => response.bytes().await?,
-                Err(error) => return self.fallback_poll_channel(id, error.into()).await,
-            },
-            Err(error) => return self.fallback_poll_channel(id, error.into()).await,
+        let bytes = match self.fetch_feed_bytes(&url).await {
+            Ok(bytes) => bytes,
+            Err(error) => return self.fallback_poll_channel(id, error).await,
         };
-        let feed = parser::parse(bytes.as_ref()).context("YouTube RSS 格式无效")?;
+        let feed = parser::parse(bytes.as_slice()).context("YouTube RSS 格式无效")?;
         let mut added = 0;
         for e in feed.entries {
             let published = e.published.or(e.updated);
@@ -430,7 +533,12 @@ impl Monitor {
                 if self.recheck_is_throttled(&video_id) {
                     continue;
                 }
-                if self.db.get_job_by_video_id(&video_id)?.is_some() {
+                if self.db.get_job_by_video_id(&video_id)?.is_some()
+                    || self.db.is_over_duration_video(
+                        &video_id,
+                        self.config.youtube.max_duration_seconds,
+                    )?
+                {
                     continue;
                 }
                 // 先拉元数据筛掉不该入队的内容：尚未就绪的直播、超长视频，
@@ -456,8 +564,13 @@ impl Monitor {
                         continue;
                     }
                     Err(error) if exceeds_duration_limit(&error) => {
-                        tracing::info!(video_id, error = %error, "视频超过时长上限，跳过");
-                        self.defer_video(&video_id);
+                        self.db.record_over_duration_video(
+                            &video_id,
+                            Some(id),
+                            self.config.youtube.max_duration_seconds,
+                            &error.to_string(),
+                        )?;
+                        tracing::info!(video_id, error = %error, "视频超过时长上限，持久化跳过");
                         continue;
                     }
                     Err(_) => {
@@ -486,22 +599,12 @@ impl Monitor {
         Ok(added)
     }
 
-    /// 领取本频道的回退名额：冷却期内返回 false。
-    ///
-    /// 单独成函数是为了把 `MutexGuard` 的生存期限制在同步作用域内——回退本身要
-    /// `await` 一个分钟级的 yt-dlp 调用，跨 await 持有 `std::sync::Mutex` 在多个
-    /// 任务并发访问同一个 Monitor 时会死锁。
-    fn claim_fallback_slot(&self, id: i64) -> bool {
-        const FALLBACK_COOLDOWN: Duration = Duration::from_secs(600);
-        let now = std::time::Instant::now();
-        let mut map = self.last_fallback_at.lock().unwrap();
-        if let Some(last) = map.get(&id)
-            && now.duration_since(*last) < FALLBACK_COOLDOWN
-        {
-            return false;
-        }
-        map.insert(id, now);
-        true
+    /// 领取 yt-dlp 回退名额。锁只覆盖纯内存判定，不跨分钟级 await。
+    fn claim_fallback_slot(&self, id: i64) -> FallbackClaim {
+        self.fallback_limiter
+            .lock()
+            .unwrap()
+            .claim(id, Instant::now())
     }
 
     /// 距上次确认不足 `RECHECK_INTERVAL` 时跳过本轮元数据拉取。
@@ -525,14 +628,19 @@ impl Monitor {
 
     /// RSS 拉取失败时回退到 yt-dlp 频道列表（带每频道冷却，防止高频拉取）。
     async fn fallback_poll_channel(&self, id: i64, error: anyhow::Error) -> Result<usize> {
-        if !self.claim_fallback_slot(id) {
-            tracing::debug!(channel_id = id, "RSS 故障，回退冷却中，跳过本轮");
-            return Ok(0);
+        match self.claim_fallback_slot(id) {
+            FallbackClaim::Allowed => {}
+            FallbackClaim::ChannelCooldown => {
+                return Err(error).context("RSS 仍不可用，单频道 yt-dlp 回退冷却中");
+            }
+            FallbackClaim::GlobalCircuitOpen => {
+                return Err(error).context("RSS 大面积异常，yt-dlp 全局回退熔断中");
+            }
         }
         tracing::warn!(
             channel_id = id,
             error = %error,
-            "RSS 拉取失败，回退 yt-dlp 频道列表"
+            "RSS 重试耗尽，回退 yt-dlp 频道列表"
         );
         self.reconcile_channel(id, &self.db.channel_url(id)?).await
     }
@@ -777,6 +885,75 @@ mod tests {
             .unwrap()
             .insert("abc".into(), std::time::Instant::now() - RECHECK_INTERVAL);
         assert!(!monitor.recheck_is_throttled("abc"));
+    }
+
+    #[test]
+    fn reconciliation_filters_channel_tabs_and_normalizes_bare_urls() {
+        assert!(is_youtube_video_id("P3ncIFdXrO0"));
+        assert!(is_youtube_video_id("-lfxKdAm3vA"));
+        assert!(!is_youtube_video_id("UCoFbVpsJ-XP8zl77ntGWBqw"));
+        assert!(!is_youtube_video_id("playlist"));
+
+        assert_eq!(
+            normalize_channel_url("https://www.youtube.com/@WiiBrawlStars"),
+            "https://www.youtube.com/@WiiBrawlStars/videos"
+        );
+        assert_eq!(
+            normalize_channel_url("https://www.youtube.com/@WiiBrawlStars/"),
+            "https://www.youtube.com/@WiiBrawlStars/videos"
+        );
+        for tab in ["videos", "shorts", "streams"] {
+            let url = format!("https://www.youtube.com/@channel/{tab}");
+            assert_eq!(normalize_channel_url(&url), url);
+        }
+    }
+
+    #[tokio::test]
+    async fn rss_fetch_retries_before_succeeding() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for status in [500, 502, 200] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await.unwrap();
+                let body = if status == 200 { "feed" } else { "error" };
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("rss.db")).unwrap();
+        let monitor = Monitor::new(Config::default(), db).unwrap();
+        let bytes = monitor
+            .fetch_feed_bytes(&format!("http://{address}/feed"))
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"feed");
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn fallback_limiter_enforces_channel_cooldown_and_global_circuit() {
+        let start = Instant::now();
+        let mut limiter = FallbackLimiter::default();
+        assert_eq!(limiter.claim(1, start), FallbackClaim::Allowed);
+        assert_eq!(
+            limiter.claim(1, start + Duration::from_secs(1)),
+            FallbackClaim::ChannelCooldown
+        );
+        assert_eq!(limiter.claim(2, start), FallbackClaim::Allowed);
+        assert_eq!(limiter.claim(3, start), FallbackClaim::Allowed);
+        assert_eq!(limiter.claim(4, start), FallbackClaim::GlobalCircuitOpen);
+        assert_eq!(
+            limiter.claim(4, start + FALLBACK_GLOBAL_WINDOW),
+            FallbackClaim::Allowed
+        );
     }
 
     #[test]

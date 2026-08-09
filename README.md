@@ -6,9 +6,9 @@ Rust CLI/TUI 工具：监控 YouTube 频道更新，按频道选择原片直传�
 
 ### 发现与筛选
 
-- RSS 每 60 秒发现更新，每 6 小时用 yt-dlp 校对最近 30 条。
+- RSS 每 60 秒发现更新，每 6 小时用 yt-dlp 校对最近 30 条。RSS 请求失败会先短退避重试 3 次；yt-dlp 回退同时受单频道冷却和全局 10 分钟最多 3 次的熔断限制，避免 YouTube 暂态故障演变成请求风暴。
 - 直播回放（`was_live`）按普通视频搬运。直播中（`is_live`）、预约（`is_upcoming`）和回放生成中（`post_live`）暂不入队，每 30 分钟复查一次，回放就绪后自动搬运。
-- 超过 `youtube.max_duration_seconds`（默认 2 小时）的视频直接跳过，不入队；已入队的任务若发现超时长会直接进 `dead_letter`，不消耗重试次数。
+- 超过 `youtube.max_duration_seconds`（默认 2 小时）的视频直接跳过，不入队，并持久化判定以免每 30 分钟重复请求；放宽上限后会自动重新检查。已入队的任务若发现超时长会直接进 `dead_letter`，不消耗重试次数。
 - 只自动搬运策略生效之后开播的回放。首次运行时把 `live_replay.enqueue_after` 游标设为当时时间，早于该时间开播的历史回放不会被 RSS 或 yt-dlp 校对扫进队列；手动 `y2b jobs add` 不受此限制。
 
 ### 处理
@@ -33,7 +33,8 @@ Rust CLI/TUI 工具：监控 YouTube 频道更新，按频道选择原片直传�
 
 - SQLite 持久化频道、任务、阶段、峰值 RSS、Pi token/cost 和认证状态。连续失败 5 次进入 `dead_letter` 并删除大型视频；失败之间按 `min(5min × 2^n, 1h)` 退避，首次重试仍是 10 分钟。
 - `watch` 分别使用单个准备 worker、单个上传 worker 和单个字幕 worker；任务准备完成后持久化为 `ready_to_upload`，投稿冷却期间仍可继续下载和翻译后续任务，实际上传保持严格串行。CC 字幕补交独立成队列，不占用上传 worker。
-- `watch` 的 RSS 轮询/yt-dlp 校对和备份/认证各跑一个独立任务，长时间的 yt-dlp 调用不会阻塞队列调度。
+- `watch` 的 RSS 轮询/yt-dlp 校对和备份/认证各跑一个独立任务，长时间的 yt-dlp 调用不会阻塞队列调度。裸频道 URL 会规范化到内容标签页，校对结果中的频道/播放列表条目不会被误当视频。
+- 所有外部命令独占 Unix 进程组；超时会清理完整后代树和输出读取任务，避免 PyInstaller yt-dlp/Node 变成孤儿进程。
 - 新投稿默认至少间隔 30 分钟；B站返回 `21566` 时全局冷却 6 小时并自动等待后重试，避免积压任务集中撞风控。
 
 ## CLI
@@ -138,7 +139,7 @@ systemctl show y2b-watch -p MemoryCurrent -p MemoryPeak -p MemorySwapCurrent
 1. 在空服务器运行 `bootstrap-server.sh`。
 2. 恢复 `/etc/y2b/config.toml`、三份认证文件、`/opt/y2b/fonts`、Pi extension/policy、`audit-policy.json` 和 `brawl-stars-glossary.json`。
 3. 从 `/var/lib/y2b/backups/daily` 或 `weekly` 选择数据库，执行 `deploy/restore.sh BACKUP.db`。
-4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时会自动升级到 v9（纯加列，幂等）。旧频道和任务的模式均为 `translated`。升级前就停在待补字幕状态的任务会各获得一次自动补交机会；升级前的 `retry_wait` 行沿用固定 10 分钟退避。
+4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时会自动升级到 v10（新增超时长视频判定表，幂等）。旧频道和任务的模式均为 `translated`。升级前就停在待补字幕状态的任务会各获得一次自动补交机会；升级前的 `retry_wait` 行沿用固定 10 分钟退避。
 5. SQLite 保存完整任务队列；`queued`/`retry_wait`/`processing` 会在重启后恢复，任务模式和追加目标 BV 不丢失，`dead_letter` 从 TUI 或 CLI 恢复后会重新下载。
 
 在线备份每 6 小时执行一次：保留 4 个小时备份、7 个日备份和 4 个周备份。数据库迁移前应先执行 `y2b backup`。
