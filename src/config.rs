@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub const AI_PROVIDER: &str = "deepseek";
+pub const AI_MODEL: &str = "deepseek-v4-flash";
+pub const AI_THINKING: &str = "off";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -62,19 +66,15 @@ pub struct BilibiliConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct AiConfig {
     pub pi: String,
     pub extension: PathBuf,
     pub policy: PathBuf,
     pub provider: String,
     pub model: String,
-    /// publish_metadata 等质量敏感任务的思考级别。
+    /// 所有 AI 阶段共用同一个思考级别，避免任务间配置漂移。
     pub thinking: String,
-    /// 分句/翻译这类确定性转换任务的思考级别。实测 deepseek 下 `off` 的
-    /// 流式输出约 1.5MB/批，`low` 涨到 14MB，`medium` 177MB——
-    /// 大 thinking 会撑爆 2GB 服务器内存，必须用 `off`。
-    pub translation_thinking: String,
-    pub allowed_models: Vec<ModelConfig>,
     pub timeout_seconds: u64,
     pub batch_mode: BatchMode,
     pub context_window_tokens: usize,
@@ -95,13 +95,6 @@ pub enum BatchMode {
     WholeVideo,
     #[default]
     Adaptive,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
-    pub provider: String,
-    pub model: String,
-    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,27 +179,9 @@ impl Default for AiConfig {
             pi: "/usr/local/bin/pi".into(),
             extension: "/opt/y2b/pi/y2b-extension.ts".into(),
             policy: "/opt/y2b/pi/policy.json".into(),
-            provider: "openai-codex".into(),
-            model: "gpt-5.6-luna".into(),
-            thinking: "high".into(),
-            translation_thinking: "off".into(),
-            allowed_models: vec![
-                ModelConfig {
-                    provider: "openai-codex".into(),
-                    model: "gpt-5.6-luna".into(),
-                    label: "GPT-5.6 Luna".into(),
-                },
-                ModelConfig {
-                    provider: "openai-codex".into(),
-                    model: "gpt-5.6-sol".into(),
-                    label: "GPT-5.6 Sol".into(),
-                },
-                ModelConfig {
-                    provider: "openai-codex".into(),
-                    model: "gpt-5.6-terra".into(),
-                    label: "GPT-5.6 Terra".into(),
-                },
-            ],
+            provider: AI_PROVIDER.into(),
+            model: AI_MODEL.into(),
+            thinking: AI_THINKING.into(),
             timeout_seconds: 300,
             batch_mode: BatchMode::Adaptive,
             context_window_tokens: 256_000,
@@ -249,15 +224,19 @@ impl Default for TranslationConfig {
 }
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("读取配置失败: {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("配置格式无效: {}", path.display()))
+        let config = if path.exists() {
+            let raw = fs::read_to_string(path)
+                .with_context(|| format!("读取配置失败: {}", path.display()))?;
+            toml::from_str(&raw).with_context(|| format!("配置格式无效: {}", path.display()))?
+        } else {
+            Self::default()
+        };
+        config.validate_ai_profile()?;
+        Ok(config)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.validate_ai_profile()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -275,6 +254,19 @@ impl Config {
         }
         Ok(())
     }
+
+    pub fn validate_ai_profile(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.ai.provider == AI_PROVIDER
+                && self.ai.model == AI_MODEL
+                && self.ai.thinking == AI_THINKING,
+            "AI 配置必须统一为 provider={AI_PROVIDER}, model={AI_MODEL}, thinking={AI_THINKING}；当前为 provider={}, model={}, thinking={}",
+            self.ai.provider,
+            self.ai.model,
+            self.ai.thinking
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -290,11 +282,35 @@ mod tests {
         assert_eq!(adaptive.translation_batch_cues, 50);
         assert_eq!(adaptive.translation_concurrency, 4);
         assert_eq!(adaptive.translation_batch_retries, 2);
+        assert_eq!(adaptive.provider, AI_PROVIDER);
+        assert_eq!(adaptive.model, AI_MODEL);
+        assert_eq!(adaptive.thinking, AI_THINKING);
 
         let legacy: AiConfig = toml::from_str("batch_size = 25").unwrap();
         assert_eq!(legacy.translation_batch_cues, 25);
 
         let whole: AiConfig = toml::from_str("batch_mode = \"whole_video\"").unwrap();
         assert_eq!(whole.batch_mode, BatchMode::WholeVideo);
+    }
+
+    #[test]
+    fn example_uses_the_fixed_ai_profile() {
+        let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        config.validate_ai_profile().unwrap();
+    }
+
+    #[test]
+    fn rejects_ai_profile_drift() {
+        for (provider, model, thinking) in [
+            ("openai-codex", AI_MODEL, AI_THINKING),
+            (AI_PROVIDER, "deepseek-v4-pro", AI_THINKING),
+            (AI_PROVIDER, AI_MODEL, "high"),
+        ] {
+            let mut config = Config::default();
+            config.ai.provider = provider.into();
+            config.ai.model = model.into();
+            config.ai.thinking = thinking.into();
+            assert!(config.validate_ai_profile().is_err());
+        }
     }
 }

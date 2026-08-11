@@ -276,7 +276,7 @@ pub(super) fn batch_mode_name(mode: BatchMode) -> &'static str {
 }
 
 impl Pipeline {
-    pub(super) async fn call_pi(&self, payload: Value, thinking: &str) -> Result<PiResult> {
+    pub(super) async fn call_pi(&self, payload: Value) -> Result<PiResult> {
         let mut cmd = Command::new(&self.config.ai.pi);
         cmd.args([
             "--mode",
@@ -297,7 +297,7 @@ impl Pipeline {
             "--model",
             &self.config.ai.model,
             "--thinking",
-            thinking,
+            &self.config.ai.thinking,
             "--no-approve",
         ]);
         cmd.env("Y2B_PI_POLICY_PATH", &self.config.ai.policy);

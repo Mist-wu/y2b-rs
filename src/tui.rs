@@ -532,18 +532,6 @@ fn app(
                         notice = format!("已暂停 {}", j.video_id);
                     }
                 }
-                KeyCode::Char('m') => {
-                    if let Some(pos) = config.ai.allowed_models.iter().position(|m| {
-                        m.provider == config.ai.provider && m.model == config.ai.model
-                    }) {
-                        let m =
-                            &config.ai.allowed_models[(pos + 1) % config.ai.allowed_models.len()];
-                        config.ai.provider = m.provider.clone();
-                        config.ai.model = m.model.clone();
-                        config.save(config_path)?;
-                        notice = format!("新任务模型: {}/{}", config.ai.provider, config.ai.model);
-                    }
-                }
                 KeyCode::Char('a') => {
                     match std::env::current_exe().and_then(|exe| {
                         Command::new(exe)

@@ -25,8 +25,8 @@ Rust CLI/TUI 工具：监控 YouTube 频道更新，按频道选择原片直传�
 
 ### Pi
 
-- Pi 默认 `openai-codex/gpt-5.6-luna`；每次调用使用 `--no-session --no-tools`，只加载 `pi/y2b-extension.ts`。质量敏感的 `publish_metadata` 用 `thinking=high`，分句/翻译用 `translation_thinking=off`——后者的流式输出量随 thinking 级别暴涨（实测 off 约 1.5MB/批，medium 到 177MB），在 2 GiB 服务器上会 OOM。
-- `pi/brawl-stars-glossary.json` 来自国际服客户端英文/简中本地化资源。审计脚本从游戏逻辑 TID 中提取无歧义术语并依次测试 Terra、Luna、Sol，只把至少一个模型译错的官译加入词库；extension 每次仅注入当前输入实际出现的词条，避免全量词库占用上下文。
+- 所有 Pi 调用固定为 `deepseek/deepseek-v4-flash`、`thinking=off`；投稿元数据、分句、翻译和词库审计共用同一配置。每次调用使用 `--no-session --no-tools`，只加载 `pi/y2b-extension.ts`。配置加载和部署预检都会拒绝其他 provider、model 或 thinking，避免任务间漂移和大 thinking 流式输出导致的额外成本/OOM。
+- `pi/brawl-stars-glossary.json` 来自国际服客户端英文/简中本地化资源。当前审计脚本只测试固定的 DeepSeek V4 Flash 配置；JSON 内的 `audit` 字段保留词库生成时的历史模型溯源，不参与运行时模型选择。extension 每次仅注入当前输入实际出现的词条，避免全量词库占用上下文。
 - Pi 批处理支持 `adaptive` 和 `whole_video`。默认按 256k 上下文、200k 安全阈值估算输入与输出；阈值内整条视频只调用一次分句和一次翻译，超限时按 token 拆批。自适应分句携带前后 12 条上下文，并在 Pi 返回的自然分句边界衔接批次。
 
 ### 队列与容错
@@ -41,6 +41,7 @@ Rust CLI/TUI 工具：监控 YouTube 频道更新，按频道选择原片直传�
 
 ```bash
 y2b init
+y2b config-check
 y2b check --write-baseline
 y2b channels add 'https://www.youtube.com/@channel/videos' --mode direct
 y2b channels add 'https://www.youtube.com/@another/videos' --mode translated
@@ -60,14 +61,14 @@ y2b jobs retry JOB_ID
 y2b subtitle add BV1xxxxx
 y2b subtitle all
 y2b model list
-y2b model set gpt-5.6-sol
+y2b model set deepseek-v4-flash
 y2b login youtube /path/to/cookies.txt
 y2b login bilibili
 y2b backup
 y2b auth-check
 ```
 
-TUI：`Tab` 切换任务/频道列表，`↑/↓` 选择，`n` 输入单个 YouTube URL 并选择 `direct` 或 `translated`，`r` 重试或恢复 dead-letter（对已投稿待补字幕的任务则是重新排队 CC 字幕补交），`p` 提示补 CC 字幕，`Space` 暂停，`m` 在 Luna/Sol/Terra 间切换，`a` 重做认证检查，`y`/`b` 导入 YouTube/Bilibili cookies，`q` 退出。手动 URL 在后台解析并入队，重复 URL 会定位已有任务；频道增删、模式切换和启停仅由 CLI 管理。
+TUI：`Tab` 切换任务/频道列表，`↑/↓` 选择，`n` 输入单个 YouTube URL 并选择 `direct` 或 `translated`，`r` 重试或恢复 dead-letter（对已投稿待补字幕的任务则是重新排队 CC 字幕补交），`p` 提示补 CC 字幕，`Space` 暂停，`a` 重做认证检查，`y`/`b` 导入 YouTube/Bilibili cookies，`q` 退出。手动 URL 在后台解析并入队，重复 URL 会定位已有任务；频道增删、模式切换和启停仅由 CLI 管理。
 
 `y2b subtitle add <bvid>` 给指定已投稿视频补中文 CC 字幕；`y2b subtitle all` 遍历所有已投稿视频补字幕，已有中文字幕的自动跳过。字幕素材优先复用 `downloads/<video_id>/*.en-zh-CN.translated.json` 缓存，缺失时重新下载英文字幕、分句并调 Pi 翻译；提交走 B站审核（非即时生效）。
 
@@ -80,7 +81,7 @@ TUI：`Tab` 切换任务/频道列表，`↑/↓` 选择，`n` 输入单个 YouT
 ```bash
 python3 scripts/audit_brawl_glossary.py \
   --server root@157.230.241.109 \
-  --models gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra \
+  --models deepseek-v4-flash \
   --output /tmp/y2b-brawl-glossary-audit.json
 
 # 使用已有模型错误并集重建分层生产词库
@@ -91,7 +92,7 @@ python3 scripts/audit_brawl_glossary.py \
   --production-output pi/brawl-stars-glossary.json
 ```
 
-脚本固定使用 `thinking=high`，默认使用不含任何答案的 `pi/audit-policy.json`，extension 在此模式下不会加载生产词库，避免污染模型能力测试；支持 `--terms-file` 重用提取结果、`--resume` 断点续跑和 `--shard-index/--shard-count` 分片。单词调用超时或失败会按错误计入并继续。
+脚本固定使用 `deepseek/deepseek-v4-flash` 和 `thinking=off`，通过服务器的 `/etc/y2b/y2b.env` 注入凭据，默认使用不含任何答案的 `pi/audit-policy.json`；extension 在此模式下不会加载生产词库，避免污染模型能力测试。脚本支持 `--terms-file` 重用提取结果、`--resume` 断点续跑和 `--shard-index/--shard-count` 分片；单词调用超时或失败会按错误计入并继续。
 
 生产运行时的四层优先级为：`policy.json` 人工 `curated` > 动态数值 `patterns` > 当前 `active` > 历史 `legacy`。Pi 每次只接收输入中精确命中的词；`legacy` 不会常驻上下文，但视频明确提到旧地图时仍使用当年的游戏内官译。被规则折叠或来源排除的模型错误保存在 `omitted` 供下次重建，不参与运行时注入。
 
@@ -121,7 +122,7 @@ scp -r pi config.example.toml deploy Cargo.lock root@157.230.241.109:/tmp/y2b-re
 ssh root@157.230.241.109 'bash /tmp/y2b-release/deploy/deploy-app.sh /tmp/y2b'
 ```
 
-`deploy-app.sh` 会先停服务再跑迁移和基线，最后 `restart`——迁移需要独占数据库，
+`deploy-app.sh` 会先用新二进制执行只读 `config-check`，再停服务、跑迁移和基线，最后 `restart`——迁移需要独占数据库，
 且 `enable --now` 对已在运行的服务是空操作，会出现「装上了但跑的还是旧二进制」。
 部署前确认没有投稿在途（`y2b jobs list` 无 `uploading`），避免中断真实上传。
 

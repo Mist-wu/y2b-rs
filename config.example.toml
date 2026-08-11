@@ -31,12 +31,10 @@ rate_limit_cooldown_seconds = 21600
 pi = "/usr/local/bin/pi"
 extension = "/opt/y2b/pi/y2b-extension.ts"
 policy = "/opt/y2b/pi/policy.json"
-provider = "openai-codex"
-model = "gpt-5.6-luna"
-thinking = "high"
-# 分句/翻译这类确定性转换任务的思考级别。实测大 thinking 会让流式输出涨到
-# 上百 MB，撑爆 2 GiB 服务器内存，必须保持 "off"。
-translation_thinking = "off"
+provider = "deepseek"
+model = "deepseek-v4-flash"
+# 投稿元数据、分句和翻译统一关闭 thinking，避免成本和流式输出量失控。
+thinking = "off"
 timeout_seconds = 300
 # adaptive: 分句按 token 自适应；翻译同时按 token 和条数上限拆批。
 # whole_video: 只允许整条视频一次处理，超过安全阈值则停止并提示切换模式。
@@ -52,21 +50,6 @@ translation_concurrency = 4
 # 单批输出不是有效 JSON、索引校验失败或 Pi 调用失败时的额外重试次数。
 translation_batch_retries = 2
 # daily_token_limit = 1000000
-
-[[ai.allowed_models]]
-provider = "openai-codex"
-model = "gpt-5.6-luna"
-label = "GPT-5.6 Luna"
-
-[[ai.allowed_models]]
-provider = "openai-codex"
-model = "gpt-5.6-sol"
-label = "GPT-5.6 Sol"
-
-[[ai.allowed_models]]
-provider = "openai-codex"
-model = "gpt-5.6-terra"
-label = "GPT-5.6 Terra"
 
 [render]
 ffmpeg = "/usr/local/bin/ffmpeg"

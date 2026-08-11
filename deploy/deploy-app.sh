@@ -5,6 +5,13 @@ root_dir=$(cd "$(dirname "$0")/.." && pwd)
 binary=${1:-"$root_dir/target/x86_64-unknown-linux-musl/release/y2b"}
 [[ -x "$binary" ]] || { echo "missing executable: $binary" >&2; exit 1; }
 
+config_file=/etc/y2b/config.toml
+if [[ ! -f "$config_file" ]]; then
+  install -d -m 0755 /etc/y2b
+  install -m 0644 "$root_dir/config.example.toml" "$config_file"
+fi
+"$binary" --config "$config_file" config-check
+
 env_file=/etc/y2b/y2b.env
 [[ -f "$env_file" ]] || { echo "missing credential file: $env_file" >&2; exit 1; }
 [[ $(stat -c '%U:%G' "$env_file") == root:root ]] || {
@@ -39,7 +46,6 @@ install -m 0644 "$root_dir/Cargo.lock" /opt/y2b/Cargo.lock
 install -d /opt/y2b/deploy
 install -m 0755 "$root_dir/deploy/restore.sh" /opt/y2b/deploy/restore.sh
 install -m 0644 "$root_dir/deploy/y2b-watch.service" /opt/y2b/deploy/y2b-watch.service
-[[ -f /etc/y2b/config.toml ]] || install -m 0644 "$root_dir/config.example.toml" /etc/y2b/config.toml
 install -m 0644 "$root_dir/deploy/y2b-watch.service" /etc/systemd/system/y2b-watch.service
 systemctl daemon-reload
 
@@ -51,7 +57,7 @@ if systemctl is-active --quiet y2b-watch.service; then
   systemctl stop y2b-watch.service
 fi
 
-/usr/local/bin/y2b --config /etc/y2b/config.toml check --write-baseline
+/usr/local/bin/y2b --config "$config_file" check --write-baseline
 
 systemctl enable y2b-watch.service
 systemctl restart y2b-watch.service

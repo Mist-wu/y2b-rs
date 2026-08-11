@@ -384,7 +384,7 @@ impl Pipeline {
                 payload["feedback"] = json!(message);
             }
             let input_json = payload.to_string();
-            let r = match self.call_pi(payload, &self.config.ai.thinking).await {
+            let r = match self.call_pi(payload).await {
                 Ok(result) => result,
                 Err(error) => {
                     let elapsed = stage.elapsed_ms();

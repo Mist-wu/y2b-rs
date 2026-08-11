@@ -21,6 +21,10 @@ from typing import Any
 
 API_ROOT = "https://api.brawlapi.com"
 USER_AGENT = "y2b-rs-glossary-audit/2.0"
+PI_PROVIDER = "deepseek"
+PI_MODEL = "deepseek-v4-flash"
+PI_THINKING = "off"
+PI_ENV_FILE = "/etc/y2b/y2b.env"
 PATTERN_RULES = [
     {
         "id": "numeric-gems",
@@ -345,15 +349,18 @@ def call_pi(
         "--extension",
         extension,
         "--provider",
-        "openai-codex",
+        PI_PROVIDER,
         "--model",
         model,
         "--thinking",
-        "high",
+        PI_THINKING,
         "--no-approve",
         payload,
     ]
-    command = ["ssh", "-o", "BatchMode=yes", server, shlex.join(args)]
+    remote_command = (
+        f"set -a; . {shlex.quote(PI_ENV_FILE)}; set +a; exec {shlex.join(args)}"
+    )
+    command = ["ssh", "-o", "BatchMode=yes", server, remote_command]
     started = time.monotonic()
     process = subprocess.run(
         command,
@@ -546,8 +553,8 @@ def main() -> int:
     parser.add_argument("--server", default="root@157.230.241.109")
     parser.add_argument(
         "--models",
-        default="gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra",
-        help="Comma-separated Pi model names; empty means extraction only",
+        default=PI_MODEL,
+        help=f"Fixed Pi model ({PI_MODEL}); empty means extraction only",
     )
     parser.add_argument("--batch-size", type=int, default=300)
     parser.add_argument("--timeout", type=int, default=180)
@@ -581,6 +588,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
         parser.error("--shard-index must be within [0, --shard-count)")
+    models = [model.strip() for model in args.models.split(",") if model.strip()]
+    if models not in ([], [PI_MODEL]):
+        parser.error(f"--models must be {PI_MODEL!r} or empty")
 
     if args.terms_file:
         extracted = json.loads(args.terms_file.read_text(encoding="utf-8"))
@@ -648,7 +658,6 @@ def main() -> int:
         }
     write_report(args.output, report)
 
-    models = [model.strip() for model in args.models.split(",") if model.strip()]
     suggested: dict[str, str] = dict(report.get("suggested_glossary", {}))
     for model in models:
         existing = report["models"].get(model, {})

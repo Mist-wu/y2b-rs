@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use y2b_rs::{
     Database, check,
-    config::Config,
+    config::{AI_MODEL, AI_PROVIDER, AI_THINKING, Config},
     model::{JobStatus, TransferMode},
     monitor::Monitor,
     pipeline::{self, AiCircuitBreaker, Pipeline},
@@ -29,6 +29,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Init,
+    /// 只读取并校验配置，不打开数据库或启动外部进程。
+    ConfigCheck,
     Check {
         #[arg(long)]
         write_baseline: bool,
@@ -125,6 +127,10 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let mut config = Config::load(&cli.config)?;
+    if matches!(cli.command, Cmd::ConfigCheck) {
+        println!("AI profile: {AI_PROVIDER}/{AI_MODEL} thinking={AI_THINKING}");
+        return Ok(());
+    }
     if matches!(cli.command, Cmd::Init) {
         config.ensure_dirs()?;
         config.save(&cli.config)?;
@@ -135,6 +141,7 @@ async fn main() -> Result<()> {
     let db = Database::open(&config.runtime.database)?;
     match cli.command {
         Cmd::Init => unreachable!(),
+        Cmd::ConfigCheck => unreachable!(),
         Cmd::Check { write_baseline } => {
             for i in check::run(&config, &db).await {
                 println!(
@@ -301,24 +308,22 @@ async fn main() -> Result<()> {
         },
         Cmd::Model(c) => match c {
             ModelCmd::List => {
-                for m in &config.ai.allowed_models {
-                    println!("{}/{}\t{}", m.provider, m.model, m.label)
-                }
+                println!(
+                    "{}/{}\tthinking={}",
+                    config.ai.provider, config.ai.model, config.ai.thinking
+                );
             }
             ModelCmd::Set { model, provider } => {
-                let provider = provider.unwrap_or_else(|| "openai-codex".into());
-                if !config
-                    .ai
-                    .allowed_models
-                    .iter()
-                    .any(|m| m.provider == provider && m.model == model)
-                {
-                    anyhow::bail!("模型不在 allowed_models: {provider}/{model}")
-                }
+                let provider = provider.unwrap_or_else(|| AI_PROVIDER.into());
+                anyhow::ensure!(
+                    provider == AI_PROVIDER && model == AI_MODEL,
+                    "AI profile 已固定为 {AI_PROVIDER}/{AI_MODEL} thinking={AI_THINKING}"
+                );
                 config.ai.provider = provider;
                 config.ai.model = model;
+                config.ai.thinking = AI_THINKING.into();
                 config.save(&cli.config)?;
-                println!("默认模型已更新");
+                println!("AI profile 已确认");
             }
         },
         Cmd::Login(c) => match c {

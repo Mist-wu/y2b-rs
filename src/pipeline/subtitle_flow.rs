@@ -439,7 +439,7 @@ impl Pipeline {
             "segmentation",
             Some(&self.config.ai.provider),
             Some(&self.config.ai.model),
-            Some(&self.config.ai.translation_thinking),
+            Some(&self.config.ai.thinking),
         )?;
         let budget = self.ai_token_budget()?;
         let estimated = estimate_segment_tokens(cues);
@@ -566,9 +566,7 @@ impl Pipeline {
         let mut last_error = None;
         let mut result = None;
         for attempt in 1..=attempts {
-            let r = self
-                .call_pi(payload.clone(), &self.config.ai.translation_thinking)
-                .await;
+            let r = self.call_pi(payload.clone()).await;
             match r {
                 Ok(r) => match parse_ranges(&r.value).and_then(|local| {
                     validate_ranges_cover(cues.len(), &local)?;
@@ -607,7 +605,7 @@ impl Pipeline {
             "segment",
             &self.config.ai.provider,
             &self.config.ai.model,
-            &self.config.ai.translation_thinking,
+            &self.config.ai.thinking,
             &r.usage,
             r.output.duration_ms,
             &input_json,
@@ -628,7 +626,7 @@ impl Pipeline {
             "translation",
             Some(&self.config.ai.provider),
             Some(&self.config.ai.model),
-            Some(&self.config.ai.translation_thinking),
+            Some(&self.config.ai.thinking),
         )?;
         let budget = self.ai_token_budget()?;
         let estimated = estimate_translation_tokens(cues);
@@ -738,10 +736,7 @@ impl Pipeline {
                 call_payload["feedback"] = json!(message);
             }
             let input_json = call_payload.to_string();
-            match self
-                .call_pi(call_payload, &self.config.ai.translation_thinking)
-                .await
-            {
+            match self.call_pi(call_payload).await {
                 Ok(result) => {
                     aggregate_duration_ms += result.output.duration_ms;
                     peak_rss_kib = peak_rss_kib.max(result.output.peak_rss_kib);
@@ -751,7 +746,7 @@ impl Pipeline {
                         "translate",
                         &self.config.ai.provider,
                         &self.config.ai.model,
-                        &self.config.ai.translation_thinking,
+                        &self.config.ai.thinking,
                         &result.usage,
                         result.output.duration_ms,
                         &input_json,
