@@ -20,6 +20,16 @@ grep -Eq '^DEEPSEEK_API_KEY=sk-[A-Za-z0-9_-]+$' "$env_file" || {
   exit 1
 }
 
+database=/var/lib/y2b/state.db
+if systemctl is-active --quiet y2b-watch.service && [[ -f "$database" ]]; then
+  active_jobs=$(sqlite3 "$database" "SELECT COUNT(*) FROM jobs WHERE status IN ('inspecting','processing','uploading');")
+  running_stages=$(sqlite3 "$database" "SELECT COUNT(*) FROM stage_runs WHERE status='running';")
+  if (( active_jobs > 0 || running_stages > 0 )); then
+    echo "refusing to restart y2b-watch with active jobs=$active_jobs running stages=$running_stages" >&2
+    exit 1
+  fi
+fi
+
 install -m 0755 "$binary" /usr/local/bin/y2b
 install -m 0644 "$root_dir/pi/y2b-extension.ts" /opt/y2b/pi/y2b-extension.ts
 install -m 0644 "$root_dir/pi/policy.json" /opt/y2b/pi/policy.json
