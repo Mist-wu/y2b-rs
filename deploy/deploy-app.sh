@@ -28,14 +28,18 @@ grep -Eq '^DEEPSEEK_API_KEY=sk-[A-Za-z0-9_-]+$' "$env_file" || {
 }
 
 database=/var/lib/y2b/state.db
-if systemctl is-active --quiet y2b-watch.service && [[ -f "$database" ]]; then
-  active_jobs=$(sqlite3 "$database" "SELECT COUNT(*) FROM jobs WHERE status IN ('inspecting','processing','uploading');")
-  running_stages=$(sqlite3 "$database" "SELECT COUNT(*) FROM stage_runs WHERE status='running';")
-  if (( active_jobs > 0 || running_stages > 0 )); then
-    echo "refusing to restart y2b-watch with active jobs=$active_jobs running stages=$running_stages" >&2
-    exit 1
+assert_idle() {
+  if systemctl is-active --quiet y2b-watch.service && [[ -f "$database" ]]; then
+    active_jobs=$(sqlite3 "$database" "SELECT COUNT(*) FROM jobs WHERE status IN ('inspecting','processing','uploading');")
+    running_stages=$(sqlite3 "$database" "SELECT COUNT(*) FROM stage_runs WHERE status='running';")
+    if (( active_jobs > 0 || running_stages > 0 )); then
+      echo "refusing to restart y2b-watch with active jobs=$active_jobs running stages=$running_stages" >&2
+      exit 1
+    fi
   fi
-fi
+}
+
+assert_idle
 
 install -m 0755 "$binary" /usr/local/bin/y2b
 install -m 0644 "$root_dir/pi/y2b-extension.ts" /opt/y2b/pi/y2b-extension.ts
@@ -53,6 +57,7 @@ systemctl daemon-reload
 # 运行的服务是空操作，会出现「装上了但跑的还是旧二进制」。这里显式停 → 迁移
 # → 起。停止前先确认没有投稿在途，避免 SIGKILL 掉一半的上传。
 if systemctl is-active --quiet y2b-watch.service; then
+  assert_idle
   echo "==> 停止 y2b-watch 以独占数据库"
   systemctl stop y2b-watch.service
 fi
