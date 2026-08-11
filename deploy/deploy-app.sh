@@ -38,6 +38,7 @@ install -m 0644 "$root_dir/pi/brawl-stars-glossary.json" /opt/y2b/pi/brawl-stars
 install -m 0644 "$root_dir/Cargo.lock" /opt/y2b/Cargo.lock
 install -d /opt/y2b/deploy
 install -m 0755 "$root_dir/deploy/restore.sh" /opt/y2b/deploy/restore.sh
+install -m 0644 "$root_dir/deploy/y2b-watch.service" /opt/y2b/deploy/y2b-watch.service
 [[ -f /etc/y2b/config.toml ]] || install -m 0644 "$root_dir/config.example.toml" /etc/y2b/config.toml
 install -m 0644 "$root_dir/deploy/y2b-watch.service" /etc/systemd/system/y2b-watch.service
 systemctl daemon-reload
