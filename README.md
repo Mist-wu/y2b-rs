@@ -110,7 +110,12 @@ cargo install cargo-zigbuild --locked
 rustup target add x86_64-unknown-linux-musl
 cargo zigbuild --release --target x86_64-unknown-linux-musl
 
-# 3. 上传二进制和运行资源
+# 3. 通过安全通道放置 DeepSeek 凭据；文件只包含 DEEPSEEK_API_KEY=<value>
+ssh root@157.230.241.109 'install -d -o root -g root -m 700 /etc/y2b'
+scp /path/to/y2b.env root@157.230.241.109:/tmp/y2b.env
+ssh root@157.230.241.109 'install -o root -g root -m 600 /tmp/y2b.env /etc/y2b/y2b.env && rm /tmp/y2b.env'
+
+# 4. 上传二进制和运行资源
 scp target/x86_64-unknown-linux-musl/release/y2b root@157.230.241.109:/tmp/y2b
 scp -r pi config.example.toml deploy Cargo.lock root@157.230.241.109:/tmp/y2b-release/
 ssh root@157.230.241.109 'bash /tmp/y2b-release/deploy/deploy-app.sh /tmp/y2b'
@@ -122,6 +127,7 @@ ssh root@157.230.241.109 'bash /tmp/y2b-release/deploy/deploy-app.sh /tmp/y2b'
 
 需要另行放置且权限为 `0600`：
 
+- `/etc/y2b/y2b.env`（`root:root`；仓库和 systemd unit 只引用路径，不保存 Key）
 - `/root/.pi/agent/auth.json`
 - `/var/lib/y2b/youtube_cookies.txt`
 - `/var/lib/y2b/bilibili_cookies.json`

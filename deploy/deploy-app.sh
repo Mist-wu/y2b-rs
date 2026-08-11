@@ -5,6 +5,21 @@ root_dir=$(cd "$(dirname "$0")/.." && pwd)
 binary=${1:-"$root_dir/target/x86_64-unknown-linux-musl/release/y2b"}
 [[ -x "$binary" ]] || { echo "missing executable: $binary" >&2; exit 1; }
 
+env_file=/etc/y2b/y2b.env
+[[ -f "$env_file" ]] || { echo "missing credential file: $env_file" >&2; exit 1; }
+[[ $(stat -c '%U:%G' "$env_file") == root:root ]] || {
+  echo "credential file must be owned by root:root: $env_file" >&2
+  exit 1
+}
+[[ $(stat -c '%a' "$env_file") == 600 ]] || {
+  echo "credential file must have mode 600: $env_file" >&2
+  exit 1
+}
+grep -Eq '^DEEPSEEK_API_KEY=sk-[A-Za-z0-9_-]+$' "$env_file" || {
+  echo "credential file has invalid DEEPSEEK_API_KEY syntax: $env_file" >&2
+  exit 1
+}
+
 install -m 0755 "$binary" /usr/local/bin/y2b
 install -m 0644 "$root_dir/pi/y2b-extension.ts" /opt/y2b/pi/y2b-extension.ts
 install -m 0644 "$root_dir/pi/policy.json" /opt/y2b/pi/policy.json
