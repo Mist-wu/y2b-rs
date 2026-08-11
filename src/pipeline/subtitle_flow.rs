@@ -2,8 +2,8 @@
 use super::ai::{
     PI_MAX_PROMPT_ARGUMENT_BYTES, PI_PROMPT_OVERHEAD_TOKENS, batch_mode_name,
     estimate_segment_argument_bytes, estimate_segment_tokens, estimate_translation_tokens,
-    parse_ranges, parse_translations, segment_cue_argument_bytes, segment_cue_tokens,
-    translation_cue_tokens,
+    is_ai_global_fault, parse_ranges, parse_translations, segment_cue_argument_bytes,
+    segment_cue_tokens, translation_cue_tokens,
 };
 use super::{Pipeline, StageGuard};
 use crate::config::BatchMode;
@@ -439,7 +439,7 @@ impl Pipeline {
             "segmentation",
             Some(&self.config.ai.provider),
             Some(&self.config.ai.model),
-            Some(&self.config.ai.thinking),
+            Some(&self.config.ai.translation_thinking),
         )?;
         let budget = self.ai_token_budget()?;
         let estimated = estimate_segment_tokens(cues);
@@ -580,6 +580,7 @@ impl Pipeline {
                     }
                     Err(error) => last_error = Some(error),
                 },
+                Err(error) if is_ai_global_fault(&error) => return Err(error),
                 Err(error) => last_error = Some(error),
             }
             if attempt < attempts {
@@ -606,7 +607,7 @@ impl Pipeline {
             "segment",
             &self.config.ai.provider,
             &self.config.ai.model,
-            &self.config.ai.thinking,
+            &self.config.ai.translation_thinking,
             &r.usage,
             r.output.duration_ms,
             &input_json,
@@ -627,7 +628,7 @@ impl Pipeline {
             "translation",
             Some(&self.config.ai.provider),
             Some(&self.config.ai.model),
-            Some(&self.config.ai.thinking),
+            Some(&self.config.ai.translation_thinking),
         )?;
         let budget = self.ai_token_budget()?;
         let estimated = estimate_translation_tokens(cues);
@@ -750,7 +751,7 @@ impl Pipeline {
                         "translate",
                         &self.config.ai.provider,
                         &self.config.ai.model,
-                        &self.config.ai.thinking,
+                        &self.config.ai.translation_thinking,
                         &result.usage,
                         result.output.duration_ms,
                         &input_json,
@@ -798,6 +799,7 @@ impl Pipeline {
                         }
                     }
                 }
+                Err(error) if is_ai_global_fault(&error) => return Err(error),
                 Err(error) => last_error = Some(error),
             }
 

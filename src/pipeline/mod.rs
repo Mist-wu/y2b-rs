@@ -13,6 +13,10 @@ use serde_json::Value;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 
@@ -26,12 +30,28 @@ mod upload;
 
 pub use cc::{CC_INITIAL_DELAY_SECONDS, CC_MAX_ATTEMPTS};
 
+#[derive(Clone, Debug, Default)]
+pub struct AiCircuitBreaker {
+    open: Arc<AtomicBool>,
+}
+
+impl AiCircuitBreaker {
+    pub fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
+    fn trip(&self) -> bool {
+        !self.open.swap(true, Ordering::AcqRel)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testing;
 
 pub struct Pipeline {
     pub config: Config,
     pub db: Database,
+    ai_circuit_breaker: AiCircuitBreaker,
     /// 复用的 HTTP 客户端（目前只用于拉 YouTube 封面）。每次调用新建
     /// `reqwest::Client` 会重建 TLS 配置和连接池，没有必要。
     http: reqwest::Client,
@@ -103,6 +123,23 @@ fn retry_delay_seconds(attempt: i64) -> i64 {
     RETRY_BASE_SECONDS
         .saturating_mul(1i64 << attempt.clamp(0, 16))
         .min(RETRY_CAP_SECONDS)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrepareFailureClass {
+    GlobalAi,
+    PermanentSkip,
+    Retryable,
+}
+
+fn classify_prepare_failure(error: &anyhow::Error) -> PrepareFailureClass {
+    if ai::is_ai_global_fault(error) {
+        PrepareFailureClass::GlobalAi
+    } else if is_live_content_pending(error) || exceeds_duration_limit(error) {
+        PrepareFailureClass::PermanentSkip
+    } else {
+        PrepareFailureClass::Retryable
+    }
 }
 
 impl StageGuard {
@@ -178,9 +215,18 @@ impl Drop for StageGuard {
 
 impl Pipeline {
     pub fn new(config: Config, db: Database) -> Self {
+        Self::with_ai_circuit_breaker(config, db, AiCircuitBreaker::default())
+    }
+
+    pub fn with_ai_circuit_breaker(
+        config: Config,
+        db: Database,
+        ai_circuit_breaker: AiCircuitBreaker,
+    ) -> Self {
         Self {
             config,
             db,
+            ai_circuit_breaker,
             http: reqwest::Client::new(),
         }
     }
@@ -199,16 +245,26 @@ impl Pipeline {
     pub async fn prepare_job(&self, job: Job) -> Result<()> {
         let result = self.prepare_job_inner(&job).await;
         if let Err(e) = &result {
-            // 重试也不会有不同结果的两类：直播内容尚未就绪（入队前已校验过，
-            // 走到这里说明状态有变，回放就绪后由频道轮询重新发现），以及时长
-            // 超过上限（视频不会变短）。两者都直接终结，不消耗重试次数。
-            let permanent_skip = is_live_content_pending(e) || exceeds_duration_limit(e);
-            let attempt = if permanent_skip {
+            // 重试也不会有不同结果的故障：直播内容尚未就绪（回放就绪后由频道
+            // 轮询重新发现）和时长超限直接终结；401/402 则暂停当前任务并打开
+            // 进程级熔断，停止领取新的准备任务。它们都不消耗任务重试次数。
+            let failure_class = classify_prepare_failure(e);
+            let global_ai_fault = failure_class == PrepareFailureClass::GlobalAi;
+            if global_ai_fault && self.ai_circuit_breaker.trip() {
+                tracing::error!(
+                    error = %e,
+                    "AI 认证/余额全局故障，已打开熔断并暂停领取新的准备任务"
+                );
+            }
+            let permanent_skip = failure_class == PrepareFailureClass::PermanentSkip;
+            let attempt = if permanent_skip || global_ai_fault {
                 job.attempt
             } else {
                 self.db.increment_attempt(&job.id)?
             };
-            let status = if permanent_skip {
+            let status = if global_ai_fault {
+                JobStatus::Paused
+            } else if permanent_skip {
                 JobStatus::DeadLetter
             } else if attempt >= self.config.monitor.max_attempts as i64 {
                 self.cleanup_large(&job.id).ok();
@@ -660,6 +716,26 @@ mod tests {
         assert_eq!(retry_delay_seconds(3), 2400);
         assert_eq!(retry_delay_seconds(4), 3600);
         assert_eq!(retry_delay_seconds(64), 3600);
+    }
+
+    #[test]
+    fn ai_circuit_breaker_stays_open_after_first_trip() {
+        let breaker = AiCircuitBreaker::default();
+        let shared = breaker.clone();
+        assert!(!breaker.is_open());
+        assert!(breaker.trip());
+        assert!(shared.is_open());
+        assert!(!shared.trip());
+    }
+
+    #[test]
+    fn global_ai_fault_is_non_retryable_prepare_failure() {
+        let stream = r#"{"type":"agent_end","messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Insufficient Balance"}]}"#;
+        let error = ai::parse_pi_stream(stream).unwrap_err();
+        assert_eq!(
+            classify_prepare_failure(&error),
+            PrepareFailureClass::GlobalAi
+        );
     }
 
     #[test]

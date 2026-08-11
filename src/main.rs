@@ -9,7 +9,7 @@ use y2b_rs::{
     config::Config,
     model::{JobStatus, TransferMode},
     monitor::Monitor,
-    pipeline::{self, Pipeline},
+    pipeline::{self, AiCircuitBreaker, Pipeline},
     process::run_monitored,
     tui,
 };
@@ -378,6 +378,7 @@ async fn schedule_loop(
     let mut prepare_worker: Option<tokio::task::JoinHandle<()>> = None;
     let mut upload_worker: Option<tokio::task::JoinHandle<()>> = None;
     let mut subtitle_worker: Option<tokio::task::JoinHandle<()>> = None;
+    let ai_circuit_breaker = AiCircuitBreaker::default();
     let outcome = loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break Ok(()),
@@ -386,12 +387,21 @@ async fn schedule_loop(
                 reap_worker(&mut upload_worker, "上传工作线程").await;
                 reap_worker(&mut subtitle_worker, "字幕工作线程").await;
                 if prepare_worker.is_none()
+                    && !ai_circuit_breaker.is_open()
                     && let Some(job) = db.next_queued_job()?
                 {
                     let fresh = reload_config(config_path, config);
                     let worker_db = db.clone();
+                    let worker_breaker = ai_circuit_breaker.clone();
                     prepare_worker = Some(tokio::spawn(async move {
-                        if let Err(e) = Pipeline::new(fresh, worker_db).prepare_job(job).await {
+                        if let Err(e) = Pipeline::with_ai_circuit_breaker(
+                            fresh,
+                            worker_db,
+                            worker_breaker,
+                        )
+                        .prepare_job(job)
+                        .await
+                        {
                             tracing::error!(error = %e, "任务准备失败");
                         }
                     }));
