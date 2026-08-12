@@ -80,7 +80,7 @@ TUI：`Tab` 切换任务/频道列表，`↑/↓` 选择，`n` 输入单个 YouT
 
 ```bash
 python3 scripts/audit_brawl_glossary.py \
-  --server root@157.230.241.109 \
+  --server azureuser@20.89.60.23 \
   --models deepseek-v4-flash \
   --output /tmp/y2b-brawl-glossary-audit.json
 
@@ -92,18 +92,18 @@ python3 scripts/audit_brawl_glossary.py \
   --production-output pi/brawl-stars-glossary.json
 ```
 
-脚本固定使用 `deepseek/deepseek-v4-flash` 和 `thinking=off`，通过服务器的 `/etc/y2b/y2b.env` 注入凭据，默认使用不含任何答案的 `pi/audit-policy.json`；extension 在此模式下不会加载生产词库，避免污染模型能力测试。脚本支持 `--terms-file` 重用提取结果、`--resume` 断点续跑和 `--shard-index/--shard-count` 分片；单词调用超时或失败会按错误计入并继续。
+脚本固定使用 `deepseek/deepseek-v4-flash` 和 `thinking=off`，通过服务器的 `/etc/y2b/y2b.env` 注入凭据，默认使用不含任何答案的 `pi/audit-policy.json`；`--server` 不是 `root@` 时远程命令自动加 `sudo -n`（凭据文件和 Pi session 都只有 root 可读）。extension 在此模式下不会加载生产词库，避免污染模型能力测试。脚本支持 `--terms-file` 重用提取结果、`--resume` 断点续跑和 `--shard-index/--shard-count` 分片；单词调用超时或失败会按错误计入并继续。
 
 生产运行时的四层优先级为：`policy.json` 人工 `curated` > 动态数值 `patterns` > 当前 `active` > 历史 `legacy`。Pi 每次只接收输入中精确命中的词；`legacy` 不会常驻上下文，但视频明确提到旧地图时仍使用当年的游戏内官译。被规则折叠或来源排除的模型错误保存在 `omitted` 供下次重建，不参与运行时注入。
 
 ## 新服务器部署
 
-目标：Ubuntu 22.04 x86_64，`root@157.230.241.109`。服务器不编译 Rust 或 FFmpeg。
+目标：Ubuntu 22.04 x86_64，`azureuser@20.89.60.23`。Azure 镜像禁止 root 直接 SSH，所有特权操作走 `azureuser` 的免密 `sudo`。服务器不编译 Rust 或 FFmpeg。
 
 ```bash
 # 1. 服务器：2 GiB swap 和预编译依赖
-scp deploy/bootstrap-server.sh root@157.230.241.109:/tmp/
-ssh root@157.230.241.109 'bash /tmp/bootstrap-server.sh'
+scp deploy/bootstrap-server.sh azureuser@20.89.60.23:/tmp/
+ssh azureuser@20.89.60.23 'sudo bash /tmp/bootstrap-server.sh'
 
 # 2. Mac：静态交叉编译
 brew install zig
@@ -112,19 +112,24 @@ rustup target add x86_64-unknown-linux-musl
 cargo zigbuild --release --target x86_64-unknown-linux-musl
 
 # 3. 通过安全通道放置 DeepSeek 凭据；文件只包含 DEEPSEEK_API_KEY=<value>
-ssh root@157.230.241.109 'install -d -o root -g root -m 700 /etc/y2b'
-scp /path/to/y2b.env root@157.230.241.109:/tmp/y2b.env
-ssh root@157.230.241.109 'install -o root -g root -m 600 /tmp/y2b.env /etc/y2b/y2b.env && rm /tmp/y2b.env'
+ssh azureuser@20.89.60.23 'sudo install -d -o root -g root -m 700 /etc/y2b'
+scp /path/to/y2b.env azureuser@20.89.60.23:/tmp/y2b.env
+ssh azureuser@20.89.60.23 'sudo install -o root -g root -m 600 /tmp/y2b.env /etc/y2b/y2b.env && rm /tmp/y2b.env'
 
 # 4. 上传二进制和运行资源
-scp target/x86_64-unknown-linux-musl/release/y2b root@157.230.241.109:/tmp/y2b
-scp -r pi config.example.toml deploy Cargo.lock root@157.230.241.109:/tmp/y2b-release/
-ssh root@157.230.241.109 'bash /tmp/y2b-release/deploy/deploy-app.sh /tmp/y2b'
+scp target/x86_64-unknown-linux-musl/release/y2b azureuser@20.89.60.23:/tmp/y2b
+ssh azureuser@20.89.60.23 'mkdir -p /tmp/y2b-release'
+scp -r pi config.example.toml deploy Cargo.lock azureuser@20.89.60.23:/tmp/y2b-release/
+ssh azureuser@20.89.60.23 'sudo bash /tmp/y2b-release/deploy/deploy-app.sh /tmp/y2b'
 ```
 
 `deploy-app.sh` 会先用新二进制执行只读 `config-check`，再停服务、跑迁移和基线，最后 `restart`——迁移需要独占数据库，
 且 `enable --now` 对已在运行的服务是空操作，会出现「装上了但跑的还是旧二进制」。
 部署前确认没有投稿在途（`y2b jobs list` 无 `uploading`），避免中断真实上传。
+
+第 4 步不能只拷二进制：`/opt/y2b/pi/` 下的 `y2b-extension.ts`、`policy.json`、`audit-policy.json` 和
+`brawl-stars-glossary.json` 由 `deploy-app.sh` 一并安装，缺任何一个都要等到第一次真正调用 Pi 才会暴露（`config-check`
+只校验配置本身，不检查这些文件是否存在）。换机或手工搬运后必须跑一次 `deploy-app.sh` 补齐。
 
 需要另行放置且权限为 `0600`：
 
@@ -144,7 +149,7 @@ systemctl show y2b-watch -p MemoryCurrent -p MemoryPeak -p MemorySwapCurrent
 ## 恢复
 
 1. 在空服务器运行 `bootstrap-server.sh`。
-2. 恢复 `/etc/y2b/config.toml`、三份认证文件、`/opt/y2b/fonts`、Pi extension/policy、`audit-policy.json` 和 `brawl-stars-glossary.json`。
+2. 恢复 `/etc/y2b/config.toml` 和三份认证文件；`/opt/y2b/pi/` 下的 extension、`policy.json`、`audit-policy.json` 和 `brawl-stars-glossary.json` 由 `deploy-app.sh` 从仓库安装，不需要单独备份。
 3. 从 `/var/lib/y2b/backups/daily` 或 `weekly` 选择数据库，执行 `deploy/restore.sh BACKUP.db`。
 4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时会自动升级到 v10（新增超时长视频判定表，幂等）。旧频道和任务的模式均为 `translated`。升级前就停在待补字幕状态的任务会各获得一次自动补交机会；升级前的 `retry_wait` 行沿用固定 10 分钟退避。
 5. SQLite 保存完整任务队列；`queued`/`retry_wait`/`processing` 会在重启后恢复，任务模式和追加目标 BV 不丢失，`dead_letter` 从 TUI 或 CLI 恢复后会重新下载。

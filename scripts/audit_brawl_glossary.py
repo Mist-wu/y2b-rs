@@ -360,6 +360,9 @@ def call_pi(
     remote_command = (
         f"set -a; . {shlex.quote(PI_ENV_FILE)}; set +a; exec {shlex.join(args)}"
     )
+    if not server.startswith("root@"):
+        # 凭据文件和 Pi session 只有 root 可读，非 root 登录时提权执行。
+        remote_command = f"sudo -n bash -c {shlex.quote(remote_command)}"
     command = ["ssh", "-o", "BatchMode=yes", server, remote_command]
     started = time.monotonic()
     process = subprocess.run(
@@ -550,7 +553,7 @@ def build_production_glossary(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--server", default="root@157.230.241.109")
+    parser.add_argument("--server", default="azureuser@20.89.60.23")
     parser.add_argument(
         "--models",
         default=PI_MODEL,
