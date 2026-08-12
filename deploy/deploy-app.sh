@@ -12,6 +12,15 @@ if [[ ! -f "$config_file" ]]; then
 fi
 "$binary" --config "$config_file" config-check
 
+# Pi extension 由 pi 子进程加载，config-check 只看文件在不在、不解析内容：一个
+# 反引号写进模板字符串就能让所有 Pi 调用等到运行时才炸，并白白消耗任务重试次数。
+# `node --check` 对 .ts 无效（不剥类型，恒为 0），这里用真正的 import 解析一遍。
+node --input-type=module -e "await import('file://'+process.argv[1])" \
+  "$root_dir/pi/y2b-extension.ts" || {
+  echo "pi extension failed to parse: $root_dir/pi/y2b-extension.ts" >&2
+  exit 1
+}
+
 env_file=/etc/y2b/y2b.env
 [[ -f "$env_file" ]] || { echo "missing credential file: $env_file" >&2; exit 1; }
 [[ $(stat -c '%U:%G' "$env_file") == root:root ]] || {
