@@ -178,12 +178,22 @@ pub(super) fn parse_publication_metadata(value: &Value) -> Result<PublicationMet
     Ok(metadata)
 }
 
+/// 对已落库的元数据重新跑一遍解析期的清洗，尽量把它救回可投稿状态。
+pub(super) fn repair_publication_metadata(metadata: &PublicationMetadata) -> PublicationMetadata {
+    PublicationMetadata {
+        title: sanitize_publication_text(&metadata.title),
+        dynamic: sanitize_publication_text(&metadata.dynamic),
+        tags: sanitize_tags(&metadata.tags),
+        tid: BILIBILI_TID,
+        raw_json: metadata.raw_json.clone(),
+    }
+}
+
 pub(super) fn validate_publication_metadata(metadata: &PublicationMetadata) -> Result<()> {
     validate_text_field("标题", &metadata.title, MAX_TITLE_WIDTH)?;
     validate_text_field("动态", &metadata.dynamic, MAX_DYNAMIC_WIDTH)?;
-    if metadata.title.contains('#')
-        || metadata.title.contains('＃')
-        || ["http://", "https://", "www."]
+    if metadata.title.contains(['#', '＃'])
+        || LINK_NEEDLES
             .iter()
             .any(|needle| metadata.title.to_ascii_lowercase().contains(needle))
     {
@@ -205,9 +215,8 @@ pub(super) fn validate_publication_metadata(metadata: &PublicationMetadata) -> R
     {
         bail!("投稿标签为空或超过 {MAX_TAG_CHARS} 字")
     }
-    if metadata.dynamic.contains('#')
-        || metadata.dynamic.contains('＃')
-        || ["http://", "https://", "www."]
+    if metadata.dynamic.contains(['#', '＃'])
+        || LINK_NEEDLES
             .iter()
             .any(|needle| metadata.dynamic.to_ascii_lowercase().contains(needle))
         || ["关注我", "点赞", "投币", "三连", "订阅频道", "转发"]
@@ -255,12 +264,59 @@ pub(super) fn is_emoji(ch: char) -> bool {
 }
 
 pub(super) fn sanitize_publication_text(text: &str) -> String {
-    text.chars()
+    let cleaned = text
+        .chars()
         .filter(|ch| !is_emoji(*ch) && !matches!(*ch, '\u{200D}' | '\u{20E3}'))
-        .collect::<String>()
-        .split_whitespace()
+        .collect::<String>();
+    let stripped = join_tokens(&cleaned, strip_link_and_hashtag);
+    if !stripped.is_empty() {
+        return stripped;
+    }
+    // 整段都是话题或链接（真实案例：原视频标题就叫 `#sync`，且没有简介）。
+    // 此时保词去标记，好过清洗出空标题——空标题一样过不了校验，任务照样进死信。
+    join_tokens(&cleaned, drop_link_keep_words)
+}
+
+fn join_tokens(text: &str, keep: fn(&str) -> Option<String>) -> String {
+    text.split_whitespace()
+        .filter_map(keep)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+pub(super) const LINK_NEEDLES: [&str; 3] = ["http://", "https://", "www."];
+
+/// 砍掉 token 中从链接或话题标记开始的部分，整段变空时丢弃这个 token。
+///
+/// YouTube 原标题常带 `#bs #brawlstars` 这类尾巴，AI 忠实翻译时会照抄；校验拒绝
+/// 后即使带反馈重试也未必纠正得掉，最终把任务推进死信。这里在解析阶段确定性地
+/// 剥掉，校验只作为兜底。
+fn strip_link_and_hashtag(token: &str) -> Option<String> {
+    let lower = token.to_ascii_lowercase();
+    let cut = token
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '#' | '＃'))
+        .map(|(index, _)| index)
+        .into_iter()
+        .chain(LINK_NEEDLES.iter().filter_map(|needle| lower.find(needle)))
+        .min()
+        .unwrap_or(token.len());
+    let kept = token[..cut].trim();
+    (!kept.is_empty()).then(|| kept.to_string())
+}
+
+/// 退让版清洗：只删话题标记本身、整词丢掉链接，词还留着。
+fn drop_link_keep_words(token: &str) -> Option<String> {
+    let lower = token.to_ascii_lowercase();
+    if LINK_NEEDLES.iter().any(|needle| lower.contains(needle)) {
+        return None;
+    }
+    let kept = token
+        .chars()
+        .filter(|ch| !matches!(ch, '#' | '＃'))
+        .collect::<String>();
+    let kept = kept.trim();
+    (!kept.is_empty()).then(|| kept.to_string())
 }
 
 pub(super) fn sanitize_tags(raw: &[String]) -> Vec<String> {
@@ -365,8 +421,17 @@ impl Pipeline {
         cues: Option<&[Cue]>,
     ) -> Result<PublicationMetadata> {
         if let Some(saved) = self.db.publication_metadata(job_id)? {
-            validate_publication_metadata(&saved)?;
-            return Ok(saved);
+            if validate_publication_metadata(&saved).is_ok() {
+                return Ok(saved);
+            }
+            // 已落库的元数据可能是在清洗/校验规则收紧之前写入的。能就地清洗就复用，
+            // 否则丢弃重新生成——否则每次重试都拿同一份坏数据失败，直到进死信。
+            let repaired = repair_publication_metadata(&saved);
+            if validate_publication_metadata(&repaired).is_ok() {
+                self.db.save_publication_metadata(job_id, &repaired)?;
+                return Ok(repaired);
+            }
+            tracing::warn!(job_id, "已保存的投稿元数据无法清洗通过校验，重新生成");
         }
         let budget = self.ai_token_budget()?;
         let mut stage = StageGuard::start(
@@ -489,6 +554,91 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.title, "新英雄登场");
         assert_eq!(parsed.dynamic, "本期展示冠军对局。");
+    }
+
+    #[test]
+    fn publication_metadata_strips_hashtags_and_links_instead_of_failing() {
+        // AI 照抄 YouTube 原标题里的 hashtag/链接曾让校验反复失败，最终把任务推进死信。
+        let parsed = parse_publication_metadata(&json!({
+            "title": "可怜的艾莉 #bs ＃brawlstars 第2078集",
+            "dynamic": "本期展示冠军对局，完整版见 https://youtu.be/abc 和 www.example.com。",
+            "tags": ["荒野乱斗", "排位赛"]
+        }))
+        .unwrap();
+        assert_eq!(parsed.title, "可怜的艾莉 第2078集");
+        assert_eq!(parsed.dynamic, "本期展示冠军对局，完整版见 和");
+        validate_publication_metadata(&parsed).unwrap();
+    }
+
+    #[test]
+    fn publication_metadata_strips_hashtag_and_link_inside_a_token() {
+        let parsed = parse_publication_metadata(&json!({
+            "title": "全球第一玩家#brawlstars",
+            "dynamic": "开局连续三杀。详情见https://youtu.be/abc",
+            "tags": ["荒野乱斗"]
+        }))
+        .unwrap();
+        assert_eq!(parsed.title, "全球第一玩家");
+        assert_eq!(parsed.dynamic, "开局连续三杀。详情见");
+        validate_publication_metadata(&parsed).unwrap();
+    }
+
+    #[test]
+    fn title_made_entirely_of_hashtags_keeps_the_words() {
+        // 线上死信 jBb5bAqhLKY：原标题就是 `#sync`、简介为空，direct 模式下 AI
+        // 除了照抄没有别的素材。剥成空标题同样过不了校验，所以退让到保词去标记。
+        let parsed = parse_publication_metadata(&json!({
+            "title": "#sync",
+            "dynamic": "该视频内容暂无可用描述。",
+            "tags": ["荒野乱斗"]
+        }))
+        .unwrap();
+        assert_eq!(parsed.title, "sync");
+        validate_publication_metadata(&parsed).unwrap();
+
+        let parsed = parse_publication_metadata(&json!({
+            "title": "#同步 ＃brawlstars",
+            "dynamic": "该视频内容暂无可用描述。",
+            "tags": ["荒野乱斗"]
+        }))
+        .unwrap();
+        assert_eq!(parsed.title, "同步 brawlstars");
+        validate_publication_metadata(&parsed).unwrap();
+    }
+
+    #[test]
+    fn title_made_entirely_of_links_stays_invalid() {
+        // 没有任何词可留时不硬编一个标题，交回反馈重试让 AI 重写。
+        let parsed = parse_publication_metadata(&json!({
+            "title": "https://youtu.be/abc www.example.com",
+            "dynamic": "该视频内容暂无可用描述。",
+            "tags": ["荒野乱斗"]
+        }))
+        .unwrap();
+        assert!(parsed.title.is_empty());
+        assert!(validate_publication_metadata(&parsed).is_err());
+    }
+
+    #[test]
+    fn saved_metadata_with_hashtag_is_repaired_rather_than_failing_forever() {
+        let saved = PublicationMetadata {
+            title: "可怜的艾莉 #bs".into(),
+            dynamic: "最后一局上演极限翻盘。".into(),
+            tags: vec!["荒野乱斗".into(), "排位赛".into()],
+            tid: BILIBILI_TID,
+            raw_json: "{}".into(),
+        };
+        assert!(validate_publication_metadata(&saved).is_err());
+        let repaired = repair_publication_metadata(&saved);
+        assert_eq!(repaired.title, "可怜的艾莉");
+        validate_publication_metadata(&repaired).unwrap();
+
+        // 清洗后标题为空的元数据救不回来，调用方应重新生成而不是复用。
+        let empty = PublicationMetadata {
+            title: "https://youtu.be/abc".into(),
+            ..saved
+        };
+        assert!(validate_publication_metadata(&repair_publication_metadata(&empty)).is_err());
     }
 
     #[test]
