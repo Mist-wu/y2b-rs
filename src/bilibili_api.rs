@@ -54,6 +54,15 @@ struct Cookie {
     value: String,
 }
 
+fn language_matches(actual: &str, requested: &str) -> bool {
+    let actual = actual.to_ascii_lowercase();
+    let requested = requested.to_ascii_lowercase();
+    actual == requested
+        || actual
+            .strip_prefix(&requested)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+}
+
 impl BiliSubtitleClient {
     /// 从 biliup 格式的 cookies JSON 文件读取登录态（SESSDATA/bili_jct 等）。
     pub fn from_cookies_file(path: &Path) -> Result<Self> {
@@ -131,7 +140,13 @@ impl BiliSubtitleClient {
         }
         Ok(value["data"]["lans"]
             .as_array()
-            .map(|lans| lans.iter().any(|l| l["lan"].as_str() == Some(lan)))
+            .map(|lans| {
+                lans.iter().any(|item| {
+                    item["lan"]
+                        .as_str()
+                        .is_some_and(|actual| language_matches(actual, lan))
+                })
+            })
             .unwrap_or(false))
     }
 
@@ -190,5 +205,20 @@ impl BiliSubtitleClient {
             }
             None => bail!("提交字幕失败: 响应缺少 code"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_language_matches_bilibili_region_variants() {
+        assert!(language_matches("zh", "zh"));
+        assert!(language_matches("zh-CN", "zh"));
+        assert!(language_matches("zh-Hans", "zh"));
+        assert!(language_matches("ZH-cn", "zh"));
+        assert!(!language_matches("en-US", "zh"));
+        assert!(!language_matches("zho", "zh"));
     }
 }
