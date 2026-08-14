@@ -89,14 +89,32 @@ fn download_format_selector(meta: &VideoMetadata, max_pixels: u64, max_fps: f64)
 }
 
 fn find_video(work: &Path, video_id: &str) -> Option<PathBuf> {
-    fs::read_dir(work)
+    let prefix = format!("{video_id}.raw.");
+    let mut candidates = fs::read_dir(work)
         .ok()?
-        .filter_map(|e| e.ok().map(|x| x.path()))
-        .find(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with(&format!("{video_id}.raw.")))
-                && p.metadata().is_ok_and(|m| m.len() > 1024)
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.metadata().is_ok_and(|metadata| metadata.len() > 1024))
+        .filter(|path| {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            let Some(extension) = name.strip_prefix(&prefix) else {
+                return false;
+            };
+            // yt-dlp 下载/合并过程中会留下 `.raw.f299.mp4.part`、
+            // `.raw.f140.m4a` 等中间文件。最终文件只有一个扩展名层级；把分片
+            // 当成成片会把错误路径持久化，之后每次上传都稳定失败。
+            !extension.contains('.') && matches!(extension, "mp4" | "mkv" | "webm" | "mov")
         })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    // 下载参数要求 merge-output-format=mp4；若目录里还保留其他旧格式，优先
+    // 选择确定的最终 mp4，其余格式仅作为兼容兜底。
+    candidates
+        .iter()
+        .find(|path| path.extension().is_some_and(|extension| extension == "mp4"))
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
 }
 
 async fn try_join_branches<A, B, FA, FB>(left: FA, right: FB) -> Result<(A, B)>
@@ -118,6 +136,8 @@ fn requires_translated_pipeline(mode: TransferMode) -> bool {
 /// 每次重试都要重新走一遍下载。
 const RETRY_BASE_SECONDS: i64 = 300;
 const RETRY_CAP_SECONDS: i64 = 3600;
+/// 已入队的直播/预约每 30 分钟复查一次，直到完整回放可用。
+const LIVE_RETRY_SECONDS: i64 = 30 * 60;
 
 fn retry_delay_seconds(attempt: i64) -> i64 {
     RETRY_BASE_SECONDS
@@ -128,6 +148,7 @@ fn retry_delay_seconds(attempt: i64) -> i64 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrepareFailureClass {
     GlobalAi,
+    DeferredLive,
     PermanentSkip,
     Retryable,
 }
@@ -135,7 +156,9 @@ enum PrepareFailureClass {
 fn classify_prepare_failure(error: &anyhow::Error) -> PrepareFailureClass {
     if ai::is_ai_global_fault(error) {
         PrepareFailureClass::GlobalAi
-    } else if is_live_content_pending(error) || exceeds_duration_limit(error) {
+    } else if is_live_content_pending(error) {
+        PrepareFailureClass::DeferredLive
+    } else if exceeds_duration_limit(error) {
         PrepareFailureClass::PermanentSkip
     } else {
         PrepareFailureClass::Retryable
@@ -245,11 +268,12 @@ impl Pipeline {
     pub async fn prepare_job(&self, job: Job) -> Result<()> {
         let result = self.prepare_job_inner(&job).await;
         if let Err(e) = &result {
-            // 重试也不会有不同结果的故障：直播内容尚未就绪（回放就绪后由频道
-            // 轮询重新发现）和时长超限直接终结；401/402 则暂停当前任务并打开
-            // 进程级熔断，停止领取新的准备任务。它们都不消耗任务重试次数。
+            // 直播内容尚未就绪时保留原任务并定时复查：同一个 video_id 已有任务
+            // 后，频道轮询不会重复创建，直接终结会让它永远无法在回放就绪后恢复。
+            // 时长超限才是永久终结；401/402 则暂停当前任务并打开进程级熔断。
             let failure_class = classify_prepare_failure(e);
             let global_ai_fault = failure_class == PrepareFailureClass::GlobalAi;
+            let deferred_live = failure_class == PrepareFailureClass::DeferredLive;
             if global_ai_fault && self.ai_circuit_breaker.trip() {
                 tracing::error!(
                     error = %e,
@@ -257,13 +281,15 @@ impl Pipeline {
                 );
             }
             let permanent_skip = failure_class == PrepareFailureClass::PermanentSkip;
-            let attempt = if permanent_skip || global_ai_fault {
+            let attempt = if permanent_skip || deferred_live || global_ai_fault {
                 job.attempt
             } else {
                 self.db.increment_attempt(&job.id)?
             };
             let status = if global_ai_fault {
                 JobStatus::Paused
+            } else if deferred_live {
+                JobStatus::RetryWait
             } else if permanent_skip {
                 JobStatus::DeadLetter
             } else if attempt >= self.config.monitor.max_attempts as i64 {
@@ -272,21 +298,29 @@ impl Pipeline {
             } else {
                 JobStatus::RetryWait
             };
+            let detail = format!("{e:#}");
             if status == JobStatus::RetryWait {
                 self.db.defer_job_retry(
                     &job.id,
                     status,
-                    &e.to_string(),
-                    retry_delay_seconds(attempt),
+                    &detail,
+                    if deferred_live {
+                        LIVE_RETRY_SECONDS
+                    } else {
+                        retry_delay_seconds(attempt)
+                    },
                 )?;
             } else {
-                self.db
-                    .update_job_status(&job.id, status, Some(&e.to_string()))?;
+                self.db.update_job_status(&job.id, status, Some(&detail))?;
             }
             self.db.event(
                 Some(&job.id),
-                if permanent_skip { "info" } else { "error" },
-                &e.to_string(),
+                if permanent_skip || deferred_live {
+                    "info"
+                } else {
+                    "error"
+                },
+                &detail,
             )?;
         }
         result
@@ -656,6 +690,31 @@ mod tests {
     }
 
     #[test]
+    fn find_video_ignores_ytdlp_parts_and_format_fragments() {
+        let temp = tempfile::tempdir().unwrap();
+        let video_id = "partial-video";
+        std::fs::write(
+            temp.path().join(format!("{video_id}.raw.f299.mp4.part")),
+            vec![1; 2048],
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join(format!("{video_id}.raw.f140.m4a")),
+            vec![1; 2048],
+        )
+        .unwrap();
+        assert_eq!(find_video(temp.path(), video_id), None);
+
+        let webm = temp.path().join(format!("{video_id}.raw.webm"));
+        std::fs::write(&webm, vec![1; 2048]).unwrap();
+        assert_eq!(find_video(temp.path(), video_id), Some(webm));
+
+        let mp4 = temp.path().join(format!("{video_id}.raw.mp4"));
+        std::fs::write(&mp4, vec![1; 2048]).unwrap();
+        assert_eq!(find_video(temp.path(), video_id), Some(mp4));
+    }
+
+    #[test]
     fn stage_guard_closes_the_row_on_early_return() {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::open(&temp.path().join("state.db")).unwrap();
@@ -735,6 +794,18 @@ mod tests {
         assert_eq!(
             classify_prepare_failure(&error),
             PrepareFailureClass::GlobalAi
+        );
+    }
+
+    #[test]
+    fn live_content_is_deferred_but_duration_limit_is_permanent() {
+        assert_eq!(
+            classify_prepare_failure(&anyhow::anyhow!("直播内容尚未就绪，暂不处理: post_live")),
+            PrepareFailureClass::DeferredLive
+        );
+        assert_eq!(
+            classify_prepare_failure(&anyhow::anyhow!("视频时长超过上限: 7201s > 7200s")),
+            PrepareFailureClass::PermanentSkip
         );
     }
 
