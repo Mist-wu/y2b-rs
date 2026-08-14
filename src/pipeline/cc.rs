@@ -45,6 +45,54 @@ pub(super) const MISSING_SUBTITLE_MATERIAL_PREFIX: &str = "缺少翻译素材，
 
 pub(super) const EMPTY_TRANSLATION_PREFIX: &str = "翻译结果为空";
 
+/// B站字幕接口对单条 content 的双重上限。线上返回的零基 `line 501/507`
+/// 分别对应 107/102 个中文字符（305/306 UTF-8 字节），其余不超过 100 字符的
+/// 条目均通过，因此提交前同时约束字符数和字节数。
+const BILIBILI_CC_MAX_CHARS: usize = 100;
+const BILIBILI_CC_MAX_BYTES: usize = 300;
+
+fn is_cc_split_boundary(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '。' | '！' | '？' | '；' | '，' | '、' | '.' | '!' | '?' | ';' | ','
+        )
+}
+
+fn split_cc_content(content: &str) -> Vec<String> {
+    let mut remaining = content.trim();
+    let mut chunks = Vec::new();
+    while !remaining.is_empty() {
+        let mut chars = 0usize;
+        let mut hard_end = 0usize;
+        let mut preferred_end = None;
+        for (start, character) in remaining.char_indices() {
+            let end = start + character.len_utf8();
+            if chars >= BILIBILI_CC_MAX_CHARS || end > BILIBILI_CC_MAX_BYTES {
+                break;
+            }
+            chars += 1;
+            hard_end = end;
+            // 避免在很靠前的标点就切开；后半段存在自然边界时才优先使用。
+            if chars >= BILIBILI_CC_MAX_CHARS / 2 && is_cc_split_boundary(character) {
+                preferred_end = Some(end);
+            }
+        }
+        if hard_end == remaining.len() {
+            chunks.push(remaining.to_string());
+            break;
+        }
+        let split_at = preferred_end.unwrap_or(hard_end);
+        let (head, tail) = remaining.split_at(split_at);
+        let head = head.trim();
+        if !head.is_empty() {
+            chunks.push(head.to_string());
+        }
+        remaining = tail.trim_start();
+    }
+    chunks
+}
+
 /// 把双语 cue 转成 B站 CC 字幕条目：只保留有非空翻译且时间合法（end > start）的。
 pub(super) fn cc_cues_from(cues: &[Cue], max_to: Option<f64>) -> Vec<CcCue> {
     cues.iter()
@@ -66,16 +114,42 @@ pub(super) fn cc_cues_from(cues: &[Cue], max_to: Option<f64>) -> Vec<CcCue> {
             if to <= from {
                 return None;
             }
-            Some(CcCue {
+            Some((
                 from,
                 to,
-                content: c
-                    .translation
+                c.translation
                     .as_deref()
                     .unwrap_or_default()
                     .trim()
                     .to_string(),
-            })
+            ))
+        })
+        .flat_map(|(from, to, content)| {
+            let chunks = split_cc_content(&content);
+            let chunk_count = chunks.len();
+            let total_weight = chunks
+                .iter()
+                .map(|chunk| chunk.chars().count())
+                .sum::<usize>()
+                .max(1);
+            let mut consumed_weight = 0usize;
+            let mut chunk_from = from;
+            let mut result = Vec::with_capacity(chunk_count);
+            for (index, content) in chunks.into_iter().enumerate() {
+                consumed_weight += content.chars().count();
+                let chunk_to = if index + 1 == chunk_count {
+                    to
+                } else {
+                    from + (to - from) * consumed_weight as f64 / total_weight as f64
+                };
+                result.push(CcCue {
+                    from: chunk_from,
+                    to: chunk_to,
+                    content,
+                });
+                chunk_from = chunk_to;
+            }
+            result
         })
         .collect()
 }
@@ -355,6 +429,36 @@ mod tests {
         assert_eq!(cc[0].content, "你好");
         assert_eq!(cc[0].from, 0.0);
         assert_eq!(cc[0].to, 1.5);
+    }
+
+    #[test]
+    fn cc_cues_split_platform_oversize_content_without_truncation() {
+        for original in ["中".repeat(107), "🧪".repeat(100)] {
+            let cues = vec![Cue {
+                start: 10.0,
+                end: 20.0,
+                source: "source".into(),
+                translation: Some(original.clone()),
+            }];
+            let cc = cc_cues_from(&cues, None);
+            assert!(cc.len() >= 2);
+            assert_eq!(cc.first().unwrap().from, 10.0);
+            assert_eq!(cc.last().unwrap().to, 20.0);
+            assert_eq!(
+                cc.iter()
+                    .map(|cue| cue.content.as_str())
+                    .collect::<String>(),
+                original
+            );
+            for (index, cue) in cc.iter().enumerate() {
+                assert!(cue.content.chars().count() <= BILIBILI_CC_MAX_CHARS);
+                assert!(cue.content.len() <= BILIBILI_CC_MAX_BYTES);
+                assert!(cue.to > cue.from);
+                if let Some(next) = cc.get(index + 1) {
+                    assert_eq!(cue.to, next.from);
+                }
+            }
+        }
     }
 
     #[test]
