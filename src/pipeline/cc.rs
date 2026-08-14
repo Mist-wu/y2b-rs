@@ -9,10 +9,12 @@ use std::fs;
 /// 投稿后到首次尝试补 CC 字幕的等待：B站稿件刚上传时查询 bvid 会返回 -404。
 pub const CC_INITIAL_DELAY_SECONDS: i64 = 90;
 
-/// CC 补交的最大自动尝试次数，耗尽后留给 `y2b subtitle add/all` 手动处理。
+/// CC 补交的最大自动检查次数，耗尽后留给 `y2b subtitle add/all` 手动处理。
 ///
-/// 配合下面的退避，`-404` 的覆盖窗口约 7 小时、其余失败约 8.5 小时。
-pub const CC_MAX_ATTEMPTS: i64 = 12;
+/// 每次都会先检查 B站是否已生成中文字幕；配合下面的退避，`-404` 的覆盖窗口
+/// 约 10 小时、其余失败约 11.5 小时。线上观察到 B站自动字幕曾在投稿约 8 小时
+/// 后才出现，因此窗口必须留出余量。
+pub const CC_MAX_ATTEMPTS: i64 = 16;
 
 /// 稿件仍在 B站处理中（-404）时的退避基数：第 n 次等待 `min(30 × 2^n, 1h)`。
 ///
@@ -79,7 +81,7 @@ pub(super) fn cc_cues_from(cues: &[Cue], max_to: Option<f64>) -> Vec<CcCue> {
 }
 
 /// B 站稿件上传后尚未处理完成时，view 接口返回 code=-404（“啥都木有”）。
-/// 该错误是瞬时的，应在稍后重试；其余错误（字幕源缺失、认证等）重试无益。
+/// 该错误是瞬时的，应在稍后重试。
 /// 稿件刚上传、B站还在处理：查询会短暂返回 -404，值得退避重试。
 pub(super) fn is_bilibili_video_not_ready(error: &anyhow::Error) -> bool {
     error
@@ -87,7 +89,9 @@ pub(super) fn is_bilibili_video_not_ready(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("code=-404"))
 }
 
-/// 本地根本没有可提交的中文字幕素材：重试多少次都不会变好，直接放弃自动补交。
+/// 本地当前没有可提交的中文字幕素材。它本身不会凭空恢复，但 B站可能在数小时
+/// 后生成 `zh-CN` 自动字幕；补交 worker 每次都会先查平台字幕，因此仍应保留
+/// 有上限的退避检查，而不是第一次看到缺素材就伪装成已经失败 12 次。
 pub(super) fn is_missing_subtitle_material(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string();
@@ -112,7 +116,7 @@ impl Pipeline {
     /// CC 字幕队列的一次尝试：只复用已有的翻译缓存，素材缺失时不重新下载。
     ///
     /// 由 `watch` 的字幕 worker 驱动，成功时 `backfill_cc_subtitle_for_job`
-    /// 会把任务置为 `completed`；失败时按错误类型决定退避重试还是直接耗尽。
+    /// 会把任务置为 `completed`；失败时退避重试，达到上限后再明确耗尽。
     pub async fn submit_pending_subtitle(&self, job: Job) -> Result<()> {
         match self.backfill_cc_subtitle_for_job(&job, false).await {
             Ok(message) => {
@@ -121,22 +125,23 @@ impl Pipeline {
             }
             Err(error) => {
                 let detail = format!("{error:#}");
-                // 素材本就不存在（例如原视频没有英文字幕）：重试多少次都不会成功，
-                // 直接耗尽计数，留给 `y2b subtitle add/--all` 手动补。
-                if is_missing_subtitle_material(&error) {
-                    self.db.exhaust_pending_subtitle(
-                        &job.id,
-                        CC_MAX_ATTEMPTS,
-                        &format!("CC 字幕缺少素材，需手动补交: {detail}"),
-                    )?;
-                    self.db.event(
-                        Some(&job.id),
-                        "warn",
-                        &format!("CC 字幕自动提交放弃（缺少素材）: {detail}"),
-                    )?;
+                let attempt = job.subtitle_attempt + 1;
+                let missing_material = is_missing_subtitle_material(&error);
+                if attempt >= CC_MAX_ATTEMPTS {
+                    let exhausted = if missing_material {
+                        format!(
+                            "CC 字幕素材在 {CC_MAX_ATTEMPTS} 次检查后仍不可用，需手动补交: {detail}"
+                        )
+                    } else {
+                        format!(
+                            "CC 字幕自动重试耗尽（第 {attempt}/{CC_MAX_ATTEMPTS} 次）: {detail}"
+                        )
+                    };
+                    self.db
+                        .exhaust_pending_subtitle(&job.id, CC_MAX_ATTEMPTS, &exhausted)?;
+                    self.db.event(Some(&job.id), "warn", &exhausted)?;
                     return Err(error);
                 }
-                let attempt = job.subtitle_attempt + 1;
                 let delay = cc_retry_delay_seconds(attempt, is_bilibili_video_not_ready(&error));
                 self.db.defer_pending_subtitle(
                     &job.id,
@@ -147,6 +152,7 @@ impl Pipeline {
                     job_id = %job.id,
                     attempt,
                     delay,
+                    missing_material,
                     error = %error,
                     "CC 字幕提交失败，稍后重试"
                 );
@@ -251,8 +257,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cc_failures_are_classified_into_retry_or_give_up() {
-        // 素材缺失是终局错误：重试多少次都不会变好。
+    fn cc_failures_distinguish_missing_material_from_platform_not_ready() {
+        // 素材缺失需要单独标记，达到上限时给出可操作的人工补交说明；期间仍会
+        // 继续检查 B站是否已经生成平台自动字幕。
         for message in [
             "缺少翻译素材，跳过自动 CC 提交（可手动执行 y2b subtitle add BV1x）",
             "翻译结果为空，没有可提交的中文字幕",
@@ -288,12 +295,15 @@ mod tests {
 
     #[test]
     fn cc_not_ready_window_covers_bilibili_review_time() {
-        // 12 次尝试累计覆盖的时长必须远超 B站审核的常见耗时，
-        // 否则会在稿件真正就绪之前就放弃（线上出现过：8 次 × 60 秒 = 8 分钟）。
-        let total: i64 = (1..=CC_MAX_ATTEMPTS)
+        // 最后一次检查之前累计覆盖的时长必须超过线上观察到的约 8 小时，
+        // 否则会在平台自动字幕真正出现之前就放弃。
+        let total: i64 = (1..CC_MAX_ATTEMPTS)
             .map(|attempt| cc_retry_delay_seconds(attempt, true))
             .sum();
-        assert!(total >= 6 * 3600, "-404 覆盖窗口只有 {total}s，不足 6 小时");
+        assert!(
+            total >= 10 * 3600,
+            "-404 覆盖窗口只有 {total}s，不足 10 小时"
+        );
     }
 
     #[test]
