@@ -43,6 +43,36 @@ pub struct ProcessOutput {
     pub peak_rss_kib: u64,
 }
 
+/// `run_monitored` future 被 `try_join!` 等调用方取消时，Tokio 的
+/// `kill_on_drop` 只保证终止直接子进程，无法覆盖 yt-dlp PyInstaller 启动器 fork
+/// 出来的后代。用独立进程组的 RAII guard 补齐取消路径，避免孤儿下载继续写
+/// `.part` 并占用内存/带宽。
+struct ProcessGroupGuard {
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid: Some(pid) }
+    }
+
+    fn kill(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            kill_process_group(pid);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<ProcessOutput> {
     command
         .stdout(Stdio::piped())
@@ -54,6 +84,7 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
     command.as_std_mut().process_group(0);
     let mut child = command.spawn().context("启动子进程失败")?;
     let pid = child.id().context("子进程没有 PID")?;
+    let mut process_group = ProcessGroupGuard::new(pid);
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let stdout_task = tokio::spawn(async move { read_capped(&mut stdout).await });
@@ -74,7 +105,7 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
     {
         Ok(result) => result?,
         Err(_) => {
-            kill_process_group(pid);
+            process_group.kill();
             // `start_kill` 是 killpg 失败时对直接子进程的兜底。先显式终止两个
             // 读取任务，不能让它们继续等待 PyInstaller 后代继承的输出管道。
             let _ = child.start_kill();
@@ -88,6 +119,9 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
     };
     let out = stdout_task.await??;
     let err = stderr_task.await??;
+    // 直接子进程已退出且输出管道已全部 EOF，此时确认整组正常收尾；之后即使
+    // 构造返回值失败，也不应再向可能复用的 PID 发信号。
+    process_group.disarm();
     let stdout = String::from_utf8_lossy(&out).to_string();
     let stderr = String::from_utf8_lossy(&err).to_string();
     if !status.success() {
@@ -180,6 +214,49 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "超时后代进程仍存活: {grandchild}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_kills_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("cancelled-grandchild.pid");
+        let script = format!(
+            "sh -c 'echo $$ > {}; exec sleep 30' & wait",
+            pid_file.display()
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+        let task = tokio::spawn(run_monitored(command, Duration::from_secs(30)));
+
+        let created_deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_file.exists() {
+            assert!(
+                Instant::now() < created_deadline,
+                "取消测试的后代进程未启动"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let grandchild: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        task.abort();
+        let _ = task.await;
+        let killed_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal 0 only checks whether this test-owned PID still exists.
+            let alive = unsafe { libc::kill(grandchild, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < killed_deadline,
+                "取消后代进程仍存活: {grandchild}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

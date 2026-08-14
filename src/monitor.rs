@@ -82,6 +82,14 @@ const FALLBACK_CHANNEL_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const FALLBACK_GLOBAL_WINDOW: Duration = Duration::from_secs(10 * 60);
 const FALLBACK_GLOBAL_LIMIT: usize = 3;
 
+/// 只让 yt-dlp 输出流水线实际使用的元数据字段。
+///
+/// `--dump-single-json` 会把直播回放的 HLS fragments/formats 全部展开；线上一条
+/// `post_live` 视频产生了约 74 MiB JSON，超过进程捕获上限后只剩尾部，稳定触发
+/// “yt-dlp 输出不是 JSON”。yt-dlp 的对象选择输出模板可以保留所需字段，同时把
+/// 输出压缩到几 KiB 以内。
+const VIDEO_METADATA_TEMPLATE: &str = "%(.{_type,id,title,description,uploader,upload_date,channel,channel_id,timestamp,duration,width,height,fps,thumbnail,webpage_url,live_status})j";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FallbackClaim {
     Allowed,
@@ -117,6 +125,10 @@ impl FallbackLimiter {
         self.per_channel.insert(channel_id, now);
         self.global_starts.push_back(now);
         FallbackClaim::Allowed
+    }
+
+    fn last_attempt(&self, channel_id: i64) -> Option<Instant> {
+        self.per_channel.get(&channel_id).copied()
     }
 }
 
@@ -349,12 +361,26 @@ impl Monitor {
 
     pub async fn poll_all(&self) -> Result<usize> {
         let mut count = 0;
-        for c in self.db.list_channels()?.into_iter().filter(|x| x.enabled) {
+        let mut channels = self
+            .db
+            .list_channels()?
+            .into_iter()
+            .filter(|channel| channel.enabled)
+            .collect::<Vec<_>>();
+        // RSS 全面异常时，固定按数据库 id 顺序轮询会让最前面的三个频道每逢
+        // 10 分钟窗口都抢走全部 yt-dlp 名额，其余频道永久饥饿。优先轮询从未
+        // 回退或最久未回退的频道，使有限名额在所有频道间公平轮转。
+        {
+            let limiter = self.fallback_limiter.lock().unwrap();
+            channels.sort_by_key(|channel| limiter.last_attempt(channel.id));
+        }
+        for c in channels {
             match self.poll_channel(c.id, true).await {
                 Ok(n) => count += n,
                 Err(e) => {
-                    self.db.mark_channel_checked(c.id, Some(&e.to_string()))?;
-                    tracing::warn!(channel=%c.name,error=%e,"频道轮询失败");
+                    let detail = format!("{e:#}");
+                    self.db.mark_channel_checked(c.id, Some(&detail))?;
+                    tracing::warn!(channel=%c.name,error=%detail,"频道轮询失败");
                 }
             }
         }
@@ -370,9 +396,9 @@ impl Monitor {
                     self.db.mark_channel_reconciled(c.id, None)?
                 }
                 Err(e) => {
-                    self.db
-                        .mark_channel_reconciled(c.id, Some(&e.to_string()))?;
-                    tracing::warn!(channel=%c.name,error=%e,"频道校对失败");
+                    let detail = format!("{e:#}");
+                    self.db.mark_channel_reconciled(c.id, Some(&detail))?;
+                    tracing::warn!(channel=%c.name,error=%detail,"频道校对失败");
                 }
             }
         }
@@ -648,7 +674,8 @@ impl Monitor {
     pub async fn fetch_metadata(&self, url: &str) -> Result<(VideoMetadata, u64, i64)> {
         let mut cmd = ytdlp_command(&self.config.youtube);
         cmd.args([
-            "--dump-single-json",
+            "--print",
+            VIDEO_METADATA_TEMPLATE,
             "--skip-download",
             "--no-playlist",
             url,
@@ -954,6 +981,28 @@ mod tests {
             limiter.claim(4, start + FALLBACK_GLOBAL_WINDOW),
             FallbackClaim::Allowed
         );
+    }
+
+    #[test]
+    fn fallback_priority_moves_never_attempted_channels_to_the_front() {
+        let start = Instant::now();
+        let mut limiter = FallbackLimiter::default();
+        assert_eq!(limiter.claim(1, start), FallbackClaim::Allowed);
+        assert_eq!(limiter.claim(2, start), FallbackClaim::Allowed);
+        assert_eq!(limiter.claim(3, start), FallbackClaim::Allowed);
+
+        let mut channel_ids = [1, 2, 3, 4, 5, 6];
+        channel_ids.sort_by_key(|channel_id| limiter.last_attempt(*channel_id));
+        assert_eq!(&channel_ids[..3], &[4, 5, 6]);
+    }
+
+    #[test]
+    fn metadata_template_excludes_unbounded_format_and_fragment_lists() {
+        for field in ["id", "title", "duration", "thumbnail", "live_status"] {
+            assert!(VIDEO_METADATA_TEMPLATE.contains(field), "缺少字段: {field}");
+        }
+        assert!(!VIDEO_METADATA_TEMPLATE.contains("formats"));
+        assert!(!VIDEO_METADATA_TEMPLATE.contains("fragments"));
     }
 
     #[test]
