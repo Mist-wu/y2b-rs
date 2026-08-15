@@ -1,90 +1,142 @@
+<div align="center">
+
 # y2b-rs
 
-Rust CLI/TUI 工具：监控 YouTube 频道更新，按频道选择原片直传或 Pi 分句/翻译后投稿，并通过 biliup 投稿 Bilibili，已投稿视频自动补中文 CC 字幕。
+**监控 YouTube 频道 → 下载 → Pi 分句翻译 → 投稿 Bilibili → 自动补中文 CC 字幕**
 
-## 流程
+单二进制 Rust CLI/TUI，SQLite 持久化队列，全流程无人值守。
 
-### 发现与筛选
+[![Rust](https://img.shields.io/badge/Rust-2024_edition-000?logo=rust)](https://www.rust-lang.org)
+[![License](https://img.shields.io/badge/license-MIT-blue)](Cargo.toml)
+[![Target](https://img.shields.io/badge/deploy-Ubuntu%2022.04%20musl-E95420?logo=ubuntu&logoColor=white)](#部署)
 
-- RSS 每 60 秒发现更新，每 6 小时用 yt-dlp 校对最近 30 条。RSS 请求失败会先短退避重试 3 次；yt-dlp 回退同时受单频道冷却和全局 10 分钟最多 3 次的熔断限制，避免 YouTube 暂态故障演变成请求风暴。回退名额优先分配给从未尝试或最久未尝试的频道，RSS 全面异常时不会永远饿死固定排在后面的频道。
-- 直播回放（`was_live`）按普通视频搬运。直播中（`is_live`）、预约（`is_upcoming`）和回放生成中（`post_live`）暂不入队，每 30 分钟复查一次，回放就绪后自动搬运。
-- 超过 `youtube.max_duration_seconds`（默认 2 小时）的视频直接跳过，不入队，并持久化判定以免每 30 分钟重复请求；放宽上限后会自动重新检查。已入队的任务若发现超时长会直接进 `dead_letter`，不消耗重试次数。
-- 只自动搬运策略生效之后开播的回放。首次运行时把 `live_replay.enqueue_after` 游标设为当时时间，早于该时间开播的历史回放不会被 RSS 或 yt-dlp 校对扫进队列；手动 `y2b jobs add` 不受此限制。
+</div>
 
-### 处理
+---
 
-- 单个 `translated` 任务内部并行下载视频和处理字幕。下载限制到 60fps、约 2,073,600 像素，优先 AVC/AAC。
-- `direct`：并行下载视频和调用 Pi 一次生成中文标题、动态文案和标签；不下载字幕、不分句。
-- `translated`：英文字幕 → Pi 分句 → Pi 翻译 → 上传原片 → 自动提交中文 CC 字幕（B站软字幕，观众可开关，不走压制）。投稿成功后任务转入 `uploaded_original_pending_subtitle`，字幕 worker 在 90 秒后开始检查；稿件仍在 B站处理中（`-404`）按较短基数退避，其余失败按 `min(90 × 2^n, 1h)` 退避，最多 16 次。每次先识别 B站已有的 `zh`/`zh-CN` 等中文变体；本地素材暂缺时仍继续等待平台自动字幕，达到上限才留给 `y2b subtitle add/all` 手动补。提交前会按标点拆分超过 B站单条 100 字符/300 字节限制的 cue，并按字符比例保持原时间轴和全文内容。
-- 普通投稿按每个视频一次无状态 `publish_metadata` Pi 请求生成中文标题、动态文案和标签。字幕模式在预算内传入完整双语字幕，超限时保留首尾并均匀采样；结果持久化后，任务重试或服务重启不会重复调用 Pi。标题和动态里的 hashtag、链接和 emoji 在解析时确定性剥掉（YouTube 原标题常带 `#bs #brawlstars`，AI 会照抄）；整条标题都是话题时（如原标题就叫 `#sync`）退让为保词去标记，只有链接这类无词可留的输入才交回 AI 重写。落库的旧元数据校验不过时也先清洗再复用，清洗后仍不合格才重新生成，不会一直拿同一份坏元数据失败到死信。其余不合格情况带原因反馈重试，不会用英文原标题或固定动态投稿。
+## 两种搬运模式
 
-### 投稿
+| 模式 | 流程 | 字幕 |
+| --- | --- | --- |
+| `direct` | 并行下载视频 + 调用 Pi 生成中文标题／动态／标签 | 不下载、不分句 |
+| `translated` | 英文字幕 → Pi 分句 → Pi 翻译 → 上传原片 → 提交中文 CC | B 站软字幕，观众可开关，不走压制 |
 
-- 投稿固定为手机游戏分区 `tid=172`、自制 `copyright=1` 并允许转载；不使用 Bilibili 转载来源字段。标签始终以“荒野乱斗”开头，简介按清理 hashtag 后的原标题、YouTube 来源、原作者和工具地址确定性生成。
-- 所有新投稿都下载 yt-dlp 选定的 YouTube 原封面，转为 JPEG 后通过 biliup `--cover` 上传；封面失败时任务重试而不会无封面投稿。
+频道模式只是**新任务的默认值**：任务入队即固化模式，之后 `channels set-mode` 不改写旧任务。`video_id` 全局唯一，同一视频不会二次入队或二次投稿。
 
-### Pi
+## 快速开始
 
-- 所有 Pi 调用固定为 `deepseek/deepseek-v4-flash`、`thinking=off`；投稿元数据、分句、翻译和词库审计共用同一配置。每次调用使用 `--no-session --no-tools`，只加载 `pi/y2b-extension.ts`。配置加载和部署预检都会拒绝其他 provider、model 或 thinking，避免任务间漂移和大 thinking 流式输出导致的额外成本/OOM。
-- `pi/brawl-stars-glossary.json` 来自国际服客户端英文/简中本地化资源。当前审计脚本只测试固定的 DeepSeek V4 Flash 配置；JSON 内的 `audit` 字段保留词库生成时的历史模型溯源，不参与运行时模型选择。extension 每次仅注入当前输入实际出现的词条，避免全量词库占用上下文。
-- Pi 批处理支持 `adaptive` 和 `whole_video`。默认按 256k 上下文、200k 安全阈值估算输入与输出；阈值内整条视频只调用一次分句和一次翻译，超限时按 token 拆批。自适应分句携带前后 12 条上下文，并在 Pi 返回的自然分句边界衔接批次。
-
-### 队列与容错
-
-- SQLite 持久化频道、任务、阶段、峰值 RSS、Pi token/cost 和认证状态。普通故障连续失败 5 次进入 `dead_letter` 并删除大型视频；失败之间按 `min(5min × 2^n, 1h)` 退避，首次重试仍是 10 分钟。直播/预约/回放生成中不消耗失败次数，每 30 分钟复查直到完整回放可用。
-- `watch` 分别使用单个准备 worker、单个上传 worker 和单个字幕 worker；任务准备完成后持久化为 `ready_to_upload`，投稿冷却期间仍可继续下载和翻译后续任务，实际上传保持严格串行。CC 字幕补交独立成队列，不占用上传 worker。
-- `watch` 的 RSS 轮询/yt-dlp 校对和备份/认证各跑一个独立任务，长时间的 yt-dlp 调用不会阻塞队列调度。裸频道 URL 会规范化到内容标签页，校对结果中的频道/播放列表条目不会被误当视频。
-- 所有外部命令独占 Unix 进程组；超时或并行分支提前取消都会清理完整后代树，避免 PyInstaller yt-dlp/Node 变成孤儿进程并继续写临时分片。
-- 新投稿默认至少间隔 30 分钟；B站返回 `21566` 时全局冷却 6 小时并自动等待后重试，避免积压任务集中撞风控。
+```bash
+y2b init                 # 生成配置
+y2b config-check         # 校验配置
+y2b login youtube /path/to/cookies.txt
+y2b login bilibili
+y2b channels add 'https://www.youtube.com/@channel/videos' --mode translated
+y2b check --write-baseline
+y2b watch                # 常驻；或 y2b tui 交互查看
+```
 
 ## CLI
 
 ```bash
-y2b init
-y2b config-check
-y2b check --write-baseline
-y2b channels add 'https://www.youtube.com/@channel/videos' --mode direct
-y2b channels add 'https://www.youtube.com/@another/videos' --mode translated
-y2b channels list
-y2b channels set-mode 1 translated
-y2b channels enable 1
-y2b channels disable 1
-y2b channels sync
-y2b watch
-y2b tui
-y2b jobs add 'https://www.youtube.com/watch?v=VIDEO_ID' --mode direct
-y2b jobs add 'https://www.youtube.com/watch?v=VIDEO_ID' --mode translated
-y2b run 'https://www.youtube.com/watch?v=VIDEO_ID' --mode translated
-y2b jobs list 50
-y2b jobs show JOB_ID
-y2b jobs retry JOB_ID
-y2b subtitle add BV1xxxxx
-y2b subtitle all
-y2b model list
-y2b model set deepseek-v4-flash
-y2b login youtube /path/to/cookies.txt
-y2b login bilibili
-y2b backup
-y2b auth-check
+# 频道
+y2b channels add <URL> --mode direct|translated   # 必须显式指定 --mode
+y2b channels list | set-mode <ID> <MODE> | enable <ID> | disable <ID> | sync
+
+# 任务
+y2b jobs add <URL> --mode direct|translated       # 必须显式指定 --mode
+y2b run <URL> [--mode translated]                 # 单次跑完，默认 translated
+y2b jobs list [N] | show <JOB_ID> | retry <JOB_ID>
+
+# 字幕 / 模型 / 运维
+y2b subtitle add <BVID>   # 给指定已投稿视频补中文 CC
+y2b subtitle all          # 遍历所有已投稿视频，已有中文字幕自动跳过
+y2b model list | set deepseek-v4-flash
+y2b backup | auth-check | check --write-baseline
 ```
 
-TUI：`Tab` 切换任务/频道列表，`↑/↓` 选择，`n` 输入单个 YouTube URL 并选择 `direct` 或 `translated`，`r` 重试或恢复 dead-letter（对已投稿待补字幕的任务则是重新排队 CC 字幕补交），`p` 提示补 CC 字幕，`Space` 暂停，`a` 重做认证检查，`y`/`b` 导入 YouTube/Bilibili cookies，`q` 退出。手动 URL 在后台解析并入队，重复 URL 会定位已有任务；频道增删、模式切换和启停仅由 CLI 管理。
+`subtitle` 优先复用 `downloads/<video_id>/*.en-zh-CN.translated.json` 缓存，缺失时重新下载英文字幕、分句并调 Pi 翻译；提交走 B 站审核，非即时生效。
 
-`y2b subtitle add <bvid>` 给指定已投稿视频补中文 CC 字幕；`y2b subtitle all` 遍历所有已投稿视频补字幕，已有中文字幕的自动跳过。字幕素材优先复用 `downloads/<video_id>/*.en-zh-CN.translated.json` 缓存，缺失时重新下载英文字幕、分句并调 Pi 翻译；提交走 B站审核（非即时生效）。
+### TUI
 
-频道模式只是新任务的默认值。任务入队后会固化当时的模式，后续 `channels set-mode` 不会改写旧任务。`video_id` 全局唯一，同一视频不会二次入队或二次投稿。`y2b run` 的 `--mode` 默认为 `translated`；`channels add` 和 `jobs add` 要求显式指定 `--mode`。
+| 键 | 作用 | 键 | 作用 |
+| --- | --- | --- | --- |
+| `Tab` | 切换任务／频道列表 | `p` | 提示补 CC 字幕 |
+| `↑` `↓` | 选择 | `Space` | 暂停 |
+| `n` | 输入单个 URL 并选模式 | `a` | 重做认证检查 |
+| `r` | 重试／恢复 dead-letter<br>（待补字幕任务则重排字幕队列） | `y` `b` | 导入 YouTube／Bilibili cookies |
+| `q` | 退出 | | |
 
-## 荒野乱斗词库审计
+手动 URL 后台解析入队，重复 URL 会定位到已有任务。频道增删、模式切换和启停仅由 CLI 管理。
 
-`scripts/audit_brawl_glossary.py` 从国际服客户端镜像的 `localization/texts`、`localization/cn`、`localization/texts_patch` 以及游戏逻辑 TID 引用生成英文/简中术语集。完整说明句、占位模板、纯数字、一词多译项目、商店/通知/教程 UI 不会进入强制词库。提取器按引用行的 `Disabled` 字段把术语分为当前 `active` 和历史 `legacy`，不依靠名称或发布时间猜测状态。
+## 工作流程
+
+<details>
+<summary><b>发现与筛选</b></summary>
+
+- RSS 每 60 秒发现更新，每 6 小时用 yt-dlp 校对最近 30 条。RSS 失败先短退避重试 3 次；yt-dlp 回退受单频道冷却和「全局 10 分钟最多 3 次」熔断限制，避免暂态故障演变成请求风暴。回退名额优先给从未尝试或最久未尝试的频道，RSS 全面异常时排在后面的频道不会被饿死。
+- 直播回放（`was_live`）按普通视频搬运。直播中（`is_live`）、预约（`is_upcoming`）、回放生成中（`post_live`）不入队，每 30 分钟复查，回放就绪后自动搬运。
+- 超过 `youtube.max_duration_seconds`（默认 2 小时）直接跳过并持久化判定，不重复请求；放宽上限后自动重查。已入队任务若发现超时长直接进 `dead_letter`，不消耗重试次数。
+- 只自动搬运策略生效后开播的回放：首次运行把 `live_replay.enqueue_after` 游标设为当时时间，更早的历史回放不会被扫进队列；手动 `jobs add` 不受限。
+
+</details>
+
+<details>
+<summary><b>处理与元数据</b></summary>
+
+- 单个 `translated` 任务内部并行下载视频和处理字幕。下载限制 60fps、约 2,073,600 像素，优先 AVC/AAC。
+- 元数据按每视频一次无状态 `publish_metadata` Pi 请求生成；字幕模式在预算内传入完整双语字幕，超限时保留首尾并均匀采样。结果持久化，重试或重启不重复调用 Pi。
+- 标题和动态里的 hashtag、链接、emoji 在解析时确定性剥掉（YouTube 原标题常带 `#bs #brawlstars`，AI 会照抄）；整条标题都是话题时（如原标题就叫 `#sync`）退让为保词去标记，只有链接这类无词可留的输入才交回 AI 重写。落库旧元数据校验不过时先清洗再复用，清洗后仍不合格才重新生成，不会拿同一份坏元数据失败到死信。其余不合格情况带原因反馈重试，绝不用英文原标题或固定动态投稿。
+- CC 字幕：投稿成功后任务转入 `uploaded_original_pending_subtitle`，字幕 worker 90 秒后开始检查。稿件仍在 B 站处理中（`-404`）按较短基数退避，其余失败按 `min(90 × 2^n, 1h)` 退避，最多 16 次。每次先识别 B 站已有的 `zh`/`zh-CN` 等中文变体；本地素材暂缺时继续等待平台自动字幕，达上限才留给 `subtitle add/all` 手动补。提交前按标点拆分超过 B 站单条 100 字符／300 字节限制的 cue，按字符比例保持原时间轴和全文内容。
+
+</details>
+
+<details>
+<summary><b>投稿参数</b></summary>
+
+- 固定手机游戏分区 `tid=172`、自制 `copyright=1` 并允许转载，不使用 Bilibili 转载来源字段。
+- 标签始终以「荒野乱斗」开头；简介按清理 hashtag 后的原标题、YouTube 来源、原作者和工具地址确定性生成。
+- 所有新投稿都下载 yt-dlp 选定的 YouTube 原封面，转 JPEG 后经 biliup `--cover` 上传；封面失败时任务重试，不会无封面投稿。
+
+</details>
+
+<details>
+<summary><b>队列与容错</b></summary>
+
+- SQLite 持久化频道、任务、阶段、峰值 RSS、Pi token/cost 和认证状态。普通故障连续失败 5 次进 `dead_letter` 并删除大型视频；失败间按 `min(5min × 2^n, 1h)` 退避，首次重试仍是 10 分钟。直播／预约／回放生成中不消耗失败次数。
+- `watch` 使用单个准备 worker + 单个上传 worker + 单个字幕 worker。任务准备完成后持久化为 `ready_to_upload`，投稿冷却期间仍可继续下载和翻译后续任务，实际上传严格串行。CC 字幕补交独立成队列，不占用上传 worker。
+- RSS 轮询／yt-dlp 校对与备份／认证各跑独立任务，长时间 yt-dlp 调用不阻塞队列调度。裸频道 URL 规范化到内容标签页，校对结果中的频道／播放列表条目不会被误当视频。
+- 所有外部命令独占 Unix 进程组；超时或并行分支提前取消都会清理完整后代树，避免 PyInstaller yt-dlp／Node 变成孤儿进程继续写临时分片。
+- 新投稿默认至少间隔 30 分钟；B 站返回 `21566` 时全局冷却 6 小时并自动等待后重试。
+
+</details>
+
+## Pi 集成
+
+所有 Pi 调用固定 `deepseek/deepseek-v4-flash` + `thinking=off`，投稿元数据、分句、翻译和词库审计共用同一配置。每次调用 `--no-session --no-tools`，只加载 `pi/y2b-extension.ts`。配置加载和部署预检会拒绝其他 provider／model／thinking，避免任务间漂移和大 thinking 流式输出带来的成本与 OOM。
+
+批处理支持 `adaptive` 和 `whole_video`：按 256k 上下文、200k 安全阈值估算输入输出，阈值内整条视频只调用一次分句和一次翻译，超限按 token 拆批。自适应分句携带前后 12 条上下文，并在 Pi 返回的自然分句边界衔接批次。
+
+### 荒野乱斗词库
+
+`pi/brawl-stars-glossary.json` 来自国际服客户端英文／简中本地化资源，extension 每次只注入输入中实际出现的词条。运行时四层优先级：
+
+> `policy.json` 人工 `curated` › 动态数值 `patterns` › 当前 `active` › 历史 `legacy`
+
+`legacy` 不常驻上下文，但视频明确提到旧地图时仍使用当年的游戏内官译。被规则折叠或来源排除的模型错误存在 `omitted` 供下次重建，不参与运行时注入。JSON 内的 `audit` 字段只是词库生成时的历史模型溯源，不参与运行时模型选择。
+
+<details>
+<summary><b>词库审计脚本</b></summary>
+
+`scripts/audit_brawl_glossary.py` 从客户端镜像的 `localization/texts`、`localization/cn`、`localization/texts_patch` 及游戏逻辑 TID 引用生成术语集。完整说明句、占位模板、纯数字、一词多译、商店／通知／教程 UI 不进入强制词库；按引用行的 `Disabled` 字段区分 `active` 与 `legacy`，不靠名称或时间猜测。
 
 ```bash
+# 审计模型能力
 python3 scripts/audit_brawl_glossary.py \
   --server azureuser@20.89.60.23 \
   --models deepseek-v4-flash \
   --output /tmp/y2b-brawl-glossary-audit.json
 
-# 使用已有模型错误并集重建分层生产词库
+# 用已有模型错误并集重建分层生产词库
 python3 scripts/audit_brawl_glossary.py \
   --models '' \
   --output /tmp/y2b-brawl-glossary-extract.json \
@@ -92,13 +144,13 @@ python3 scripts/audit_brawl_glossary.py \
   --production-output pi/brawl-stars-glossary.json
 ```
 
-脚本固定使用 `deepseek/deepseek-v4-flash` 和 `thinking=off`，通过服务器的 `/etc/y2b/y2b.env` 注入凭据，默认使用不含任何答案的 `pi/audit-policy.json`；`--server` 不是 `root@` 时远程命令自动加 `sudo -n`（凭据文件和 Pi session 都只有 root 可读）。extension 在此模式下不会加载生产词库，避免污染模型能力测试。脚本支持 `--terms-file` 重用提取结果、`--resume` 断点续跑和 `--shard-index/--shard-count` 分片；单词调用超时或失败会按错误计入并继续。
+脚本固定 `deepseek/deepseek-v4-flash` + `thinking=off`，凭据由服务器 `/etc/y2b/y2b.env` 注入，默认使用不含答案的 `pi/audit-policy.json`；`--server` 不是 `root@` 时远程命令自动加 `sudo -n`。审计模式下 extension 不加载生产词库，避免污染能力测试。支持 `--terms-file` 复用提取结果、`--resume` 断点续跑、`--shard-index/--shard-count` 分片；单词超时或失败计入错误并继续。
 
-生产运行时的四层优先级为：`policy.json` 人工 `curated` > 动态数值 `patterns` > 当前 `active` > 历史 `legacy`。Pi 每次只接收输入中精确命中的词；`legacy` 不会常驻上下文，但视频明确提到旧地图时仍使用当年的游戏内官译。被规则折叠或来源排除的模型错误保存在 `omitted` 供下次重建，不参与运行时注入。
+</details>
 
-## 新服务器部署
+## 部署
 
-目标：Ubuntu 22.04 x86_64，`azureuser@20.89.60.23`。Azure 镜像禁止 root 直接 SSH，所有特权操作走 `azureuser` 的免密 `sudo`。服务器不编译 Rust 或 FFmpeg。
+目标：Ubuntu 22.04 x86_64，`azureuser@20.89.60.23`。Azure 镜像禁止 root 直接 SSH，特权操作走 `azureuser` 免密 `sudo`。服务器不编译 Rust 或 FFmpeg。
 
 ```bash
 # 1. 服务器：2 GiB swap 和预编译依赖
@@ -123,22 +175,24 @@ scp -r pi config.example.toml deploy Cargo.lock azureuser@20.89.60.23:/tmp/y2b-r
 ssh azureuser@20.89.60.23 'sudo bash /tmp/y2b-release/deploy/deploy-app.sh /tmp/y2b'
 ```
 
-`deploy-app.sh` 会先用新二进制执行只读 `config-check`，再停服务、跑迁移和基线，最后 `restart`——迁移需要独占数据库，
-且 `enable --now` 对已在运行的服务是空操作，会出现「装上了但跑的还是旧二进制」。
-部署前确认没有投稿在途（`y2b jobs list` 无 `uploading`），避免中断真实上传。
+> [!IMPORTANT]
+> 第 4 步不能只拷二进制。`/opt/y2b/pi/` 下的 `y2b-extension.ts`、`policy.json`、`audit-policy.json`、`brawl-stars-glossary.json` 由 `deploy-app.sh` 一并安装，缺任何一个都要等第一次真正调用 Pi 才暴露（`config-check` 只校验配置本身）。换机或手工搬运后必须跑一次 `deploy-app.sh` 补齐。
 
-第 4 步不能只拷二进制：`/opt/y2b/pi/` 下的 `y2b-extension.ts`、`policy.json`、`audit-policy.json` 和
-`brawl-stars-glossary.json` 由 `deploy-app.sh` 一并安装，缺任何一个都要等到第一次真正调用 Pi 才会暴露（`config-check`
-只校验配置本身，不检查这些文件是否存在）。换机或手工搬运后必须跑一次 `deploy-app.sh` 补齐。
+> [!WARNING]
+> 部署前确认没有投稿在途（`y2b jobs list` 无 `uploading`），避免中断真实上传。
 
-需要另行放置且权限为 `0600`：
+`deploy-app.sh` 先用新二进制执行只读 `config-check`，再停服务、跑迁移和基线，最后 `restart`——迁移需要独占数据库，且 `enable --now` 对已在运行的服务是空操作，会出现「装上了但跑的还是旧二进制」。
 
-- `/etc/y2b/y2b.env`（`root:root`；仓库和 systemd unit 只引用路径，不保存 Key）
-- `/root/.pi/agent/auth.json`
-- `/var/lib/y2b/youtube_cookies.txt`
-- `/var/lib/y2b/bilibili_cookies.json`
+需另行放置且权限 `0600` 的文件：
 
-systemd 资源限制：`MemoryHigh=1200M`、`MemoryMax=1600M`、`MemorySwapMax=1G`、`TasksMax=256`。查看状态：
+| 路径 | 说明 |
+| --- | --- |
+| `/etc/y2b/y2b.env` | `root:root`；仓库和 systemd unit 只引用路径，不保存 Key |
+| `/root/.pi/agent/auth.json` | Pi 认证 |
+| `/var/lib/y2b/youtube_cookies.txt` | YouTube cookies |
+| `/var/lib/y2b/bilibili_cookies.json` | Bilibili cookies |
+
+systemd 资源限制：`MemoryHigh=1200M`、`MemoryMax=1600M`、`MemorySwapMax=1G`、`TasksMax=256`。
 
 ```bash
 systemctl status y2b-watch
@@ -146,15 +200,15 @@ journalctl -u y2b-watch -f
 systemctl show y2b-watch -p MemoryCurrent -p MemoryPeak -p MemorySwapCurrent
 ```
 
-## 恢复
+## 备份与恢复
 
-1. 在空服务器运行 `bootstrap-server.sh`。
-2. 恢复 `/etc/y2b/config.toml` 和三份认证文件；`/opt/y2b/pi/` 下的 extension、`policy.json`、`audit-policy.json` 和 `brawl-stars-glossary.json` 由 `deploy-app.sh` 从仓库安装，不需要单独备份。
-3. 从 `/var/lib/y2b/backups/daily` 或 `weekly` 选择数据库，执行 `deploy/restore.sh BACKUP.db`。
-4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时会自动升级到 v10（新增超时长视频判定表，幂等）。旧频道和任务的模式均为 `translated`。升级前就停在待补字幕状态的任务会各获得一次自动补交机会；升级前的 `retry_wait` 行沿用固定 10 分钟退避。
-5. SQLite 保存完整任务队列；`queued`/`retry_wait`/`processing` 会在重启后恢复，任务模式和追加目标 BV 不丢失，`dead_letter` 从 TUI 或 CLI 恢复后会重新下载。
+在线备份每 6 小时一次，保留 4 个小时备份、7 个日备份、4 个周备份。数据库迁移前先执行 `y2b backup`。
 
-在线备份每 6 小时执行一次：保留 4 个小时备份、7 个日备份和 4 个周备份。数据库迁移前应先执行 `y2b backup`。
+1. 空服务器运行 `bootstrap-server.sh`。
+2. 恢复 `/etc/y2b/config.toml` 和三份认证文件；`/opt/y2b/pi/` 下的资源由 `deploy-app.sh` 从仓库安装，无需单独备份。
+3. 从 `/var/lib/y2b/backups/daily` 或 `weekly` 选数据库，执行 `deploy/restore.sh BACKUP.db`。
+4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时自动升级到 v10（新增超时长视频判定表，幂等）。旧频道和任务模式均为 `translated`；升级前停在待补字幕的任务各获一次自动补交机会，升级前的 `retry_wait` 行沿用固定 10 分钟退避。
+5. SQLite 保存完整队列：`queued`/`retry_wait`/`processing` 重启后恢复，任务模式和追加目标 BV 不丢失，`dead_letter` 从 TUI 或 CLI 恢复后重新下载。
 
 ## 上线验收
 
@@ -165,4 +219,5 @@ y2b run '用户提供的带英文字幕 URL' --mode translated
 y2b jobs show JOB_ID
 ```
 
-真实投稿会改变 Bilibili 外部状态，只在提供测试 BV 和未搬运视频后执行。
+> [!CAUTION]
+> 真实投稿会改变 Bilibili 外部状态，只在提供测试 BV 和未搬运视频后执行。
