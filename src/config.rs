@@ -18,6 +18,7 @@ pub struct Config {
     pub render: RenderConfig,
     pub storage: StorageConfig,
     pub translation: TranslationConfig,
+    pub websub: WebSubConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +35,19 @@ pub struct RuntimeConfig {
 #[serde(default)]
 pub struct MonitorConfig {
     pub poll_seconds: u64,
+    /// playlistItems.list 单次读取条数。该接口按调用计费，1 与 50 同为 1 单位。
+    pub data_api_max_results: usize,
+    /// 历史发布时间预测热窗的总宽度。
+    pub prediction_window_minutes: u64,
+    /// 预测热窗内的 Data API 轮询间隔。
+    pub prediction_hot_poll_seconds: u64,
+    /// 预测热窗外的 Data API 轮询间隔。
+    pub prediction_cold_poll_minutes: u64,
+    /// 历史样本不足时使用的固定 Data API 轮询间隔。
+    pub prediction_fallback_poll_minutes: u64,
+    /// 启用发布时间预测所需的最少 jobs.published_at 样本数。
+    pub prediction_min_samples: usize,
+    /// API 深扫周期；API 不可用时，同一周期才会触发 yt-dlp 校对兜底。
     pub reconcile_hours: u64,
     pub reconcile_limit: usize,
     pub max_attempts: u32,
@@ -119,6 +133,21 @@ pub struct StorageConfig {
 pub struct TranslationConfig {
     pub source_lang: String,
     pub target_lang: String,
+    /// 已知的 defaultAudioLanguage 不匹配时是否硬拦截；缺失值始终放行。
+    pub enforce_source_lang: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebSubConfig {
+    /// 默认关闭；关闭时不会绑定任何端口或发起订阅。
+    pub enabled: bool,
+    /// 本地 HTTP 监听地址，通常由公网 HTTPS 反向代理转发到这里。
+    pub bind_addr: String,
+    /// 公网 HTTPS 根地址，例如 https://push.example.com。
+    pub callback_base_url: String,
+    /// WebSub 启用后 Data API 的兜底轮询周期。
+    pub data_api_poll_minutes: u64,
 }
 
 fn base_dir() -> PathBuf {
@@ -143,7 +172,13 @@ impl Default for MonitorConfig {
     fn default() -> Self {
         Self {
             poll_seconds: 60,
-            reconcile_hours: 6,
+            data_api_max_results: 50,
+            prediction_window_minutes: 120,
+            prediction_hot_poll_seconds: 60,
+            prediction_cold_poll_minutes: 30,
+            prediction_fallback_poll_minutes: 5,
+            prediction_min_samples: 5,
+            reconcile_hours: 24,
             reconcile_limit: 30,
             max_attempts: 5,
         }
@@ -219,6 +254,17 @@ impl Default for TranslationConfig {
         Self {
             source_lang: "en".into(),
             target_lang: "zh-CN".into(),
+            enforce_source_lang: false,
+        }
+    }
+}
+impl Default for WebSubConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "127.0.0.1:8787".into(),
+            callback_base_url: String::new(),
+            data_api_poll_minutes: 30,
         }
     }
 }
@@ -232,11 +278,15 @@ impl Config {
             Self::default()
         };
         config.validate_ai_profile()?;
+        config.validate_discovery()?;
+        config.validate_websub()?;
         Ok(config)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate_ai_profile()?;
+        self.validate_discovery()?;
+        self.validate_websub()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -264,6 +314,69 @@ impl Config {
             self.ai.provider,
             self.ai.model,
             self.ai.thinking
+        );
+        Ok(())
+    }
+
+    pub fn validate_websub(&self) -> Result<()> {
+        if self.websub.enabled {
+            anyhow::ensure!(
+                self.websub.callback_base_url.starts_with("https://"),
+                "WebSub 启用时 callback_base_url 必须是公网 HTTPS 地址"
+            );
+            anyhow::ensure!(
+                self.websub.data_api_poll_minutes > 0,
+                "WebSub 启用时 data_api_poll_minutes 必须大于 0"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate_discovery(&self) -> Result<()> {
+        self.runtime
+            .timezone
+            .parse::<chrono_tz::Tz>()
+            .with_context(|| {
+                format!(
+                    "runtime.timezone 不是有效 IANA 时区: {}",
+                    self.runtime.timezone
+                )
+            })?;
+        anyhow::ensure!(
+            (1..=50).contains(&self.monitor.data_api_max_results),
+            "monitor.data_api_max_results 必须在 1..=50"
+        );
+        anyhow::ensure!(
+            (1..=24 * 60).contains(&self.monitor.prediction_window_minutes),
+            "monitor.prediction_window_minutes 必须在 1..=1440"
+        );
+        anyhow::ensure!(
+            self.monitor.prediction_hot_poll_seconds > 0,
+            "monitor.prediction_hot_poll_seconds 必须大于 0"
+        );
+        anyhow::ensure!(
+            self.monitor.prediction_cold_poll_minutes > 0,
+            "monitor.prediction_cold_poll_minutes 必须大于 0"
+        );
+        anyhow::ensure!(
+            self.monitor.prediction_fallback_poll_minutes > 0,
+            "monitor.prediction_fallback_poll_minutes 必须大于 0"
+        );
+        anyhow::ensure!(
+            self.monitor.prediction_min_samples > 0,
+            "monitor.prediction_min_samples 必须大于 0"
+        );
+        anyhow::ensure!(
+            self.monitor.reconcile_hours > 0,
+            "monitor.reconcile_hours 必须大于 0"
+        );
+        anyhow::ensure!(
+            self.monitor.reconcile_limit > 0,
+            "monitor.reconcile_limit 必须大于 0"
+        );
+        anyhow::ensure!(
+            !self.translation.source_lang.trim().is_empty(),
+            "translation.source_lang 不能为空"
         );
         Ok(())
     }
@@ -297,6 +410,7 @@ mod tests {
     fn example_uses_the_fixed_ai_profile() {
         let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
         config.validate_ai_profile().unwrap();
+        config.validate_discovery().unwrap();
     }
 
     #[test]
@@ -312,5 +426,32 @@ mod tests {
             config.ai.thinking = thinking.into();
             assert!(config.validate_ai_profile().is_err());
         }
+    }
+
+    #[test]
+    fn websub_is_disabled_by_default_and_requires_https_when_enabled() {
+        let mut config = Config::default();
+        assert!(!config.websub.enabled);
+        config.websub.enabled = true;
+        assert!(config.validate_websub().is_err());
+        config.websub.callback_base_url = "https://push.example.com".into();
+        config.validate_websub().unwrap();
+    }
+
+    #[test]
+    fn discovery_defaults_are_low_latency_and_validated() {
+        let mut config = Config::default();
+        assert_eq!(config.monitor.data_api_max_results, 50);
+        assert_eq!(config.monitor.prediction_window_minutes, 120);
+        assert_eq!(config.monitor.prediction_hot_poll_seconds, 60);
+        assert_eq!(config.monitor.prediction_cold_poll_minutes, 30);
+        assert_eq!(config.monitor.prediction_fallback_poll_minutes, 5);
+        assert_eq!(config.monitor.prediction_min_samples, 5);
+        assert_eq!(config.monitor.reconcile_hours, 24);
+        assert!(!config.translation.enforce_source_lang);
+        config.validate_discovery().unwrap();
+
+        config.monitor.data_api_max_results = 51;
+        assert!(config.validate_discovery().is_err());
     }
 }

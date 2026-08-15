@@ -7,7 +7,17 @@ timezone = "Asia/Shanghai"
 
 [monitor]
 poll_seconds = 60
-reconcile_hours = 6
+# playlistItems.list 按调用计费，默认一次取满 50 条。
+data_api_max_results = 50
+# 历史不少于 5 条时：按 runtime.timezone 聚合星期 + 小时，热窗 2 小时内每 60 秒轮询，窗外每 30 分钟。
+prediction_window_minutes = 120
+prediction_hot_poll_seconds = 60
+prediction_cold_poll_minutes = 30
+# 新频道历史不足时固定每 5 分钟轮询。
+prediction_fallback_poll_minutes = 5
+prediction_min_samples = 5
+# 每 24 小时做一次 API 深扫；只有 API 深扫失败才用 yt-dlp 校对兜底。
+reconcile_hours = 24
 reconcile_limit = 30
 max_attempts = 5
 
@@ -65,3 +75,13 @@ weekly_backups = 4
 [translation]
 source_lang = "en"
 target_lang = "zh-CN"
+# defaultAudioLanguage 已知且不匹配时默认只告警并标记，不硬拦截。
+enforce_source_lang = false
+
+[websub]
+# 默认关闭；只有准备好公网 HTTPS 回调入口后才能开启。
+enabled = false
+bind_addr = "127.0.0.1:8787"
+callback_base_url = ""
+# 推送启用后，Data API 只需每 30 分钟兜底轮询一次。
+data_api_poll_minutes = 30
