@@ -187,12 +187,25 @@ impl Pipeline {
         self.backfill_cc_subtitle_for_job(&job, true).await
     }
 
-    /// CC 字幕队列的一次尝试：只复用已有的翻译缓存，素材缺失时不重新下载。
+    /// CC 字幕队列的一次尝试：素材缺失时**重新下载**，而不是只查本地缓存。
     ///
     /// 由 `watch` 的字幕 worker 驱动，成功时 `backfill_cc_subtitle_for_job`
     /// 会把任务置为 `completed`；失败时退避重试，达到上限后再明确耗尽。
+    ///
+    /// 曾经传 `false`，只复用本地翻译缓存。但那个缓存文件只有在 `subtitle_download`
+    /// 成功时才会生成——而真正会走到这条重试路径的任务，恰恰就是当初
+    /// `subtitle_download` 返回 `missing` 的那些，缓存按定义不存在。于是全部
+    /// 16 次重试都在找一个不可能出现的文件，线上两条任务分别空转了 15 次和 16 次。
+    ///
+    /// 真正的瞬时状态在上游：YouTube 的 ASR 字幕生成有延迟，直播回放尤其明显
+    /// （线上那条 `post_live` 任务入队时无字幕轨，一天后 `en-orig`/`en` 都有了）。
+    /// 这恰恰是最值得重试的情况，却是唯一重试不到的。
+    ///
+    /// 成本可控：上游仍然没有字幕时 `segment_uncached` 直接返回 None，只花一次
+    /// 字幕探测（线上均值约 9 秒），不会触发分句和翻译；一旦拿到字幕则做一次
+    /// 完整流程并写入缓存，后续重试复用缓存。
     pub async fn submit_pending_subtitle(&self, job: Job) -> Result<()> {
-        match self.backfill_cc_subtitle_for_job(&job, false).await {
+        match self.backfill_cc_subtitle_for_job(&job, true).await {
             Ok(message) => {
                 tracing::info!(job_id = %job.id, "{message}");
                 Ok(())
@@ -296,7 +309,12 @@ impl Pipeline {
             fs::create_dir_all(&work)?;
             let segmented = work.join(format!("{}.en.segmented.json", meta.id));
             let Some(cues) = self.segment_uncached(job, &meta, &work, &segmented).await? else {
-                bail!("无法获取英文字幕，跳过 CC 字幕补交")
+                // 必须复用 MISSING_SUBTITLE_MATERIAL_PREFIX：自动重试现在也会走到
+                // 这里，分类错了会让退避和「达到上限」的提示都变成不可操作的泛化
+                // 文案，看不出该手动补交。
+                bail!(
+                    "{MISSING_SUBTITLE_MATERIAL_PREFIX}：上游暂无英文字幕轨（可手动执行 y2b subtitle add {bvid}）"
+                )
             };
             let mut cues = cues;
             self.translate_and_save(&job.id, &mut cues, &translated)
@@ -337,6 +355,9 @@ mod tests {
         // 继续检查 B站是否已经生成平台自动字幕。
         for message in [
             "缺少翻译素材，跳过自动 CC 提交（可手动执行 y2b subtitle add BV1x）",
+            // 自动重试重新下载后，上游仍无字幕轨时走的分支：必须仍然归到
+            // 「素材缺失」，否则达到上限时的提示看不出需要人工补交。
+            "缺少翻译素材，跳过自动 CC 提交：上游暂无英文字幕轨（可手动执行 y2b subtitle add BV1x）",
             "翻译结果为空，没有可提交的中文字幕",
         ] {
             let error = anyhow::anyhow!(message.to_string()).context("submit failed");
