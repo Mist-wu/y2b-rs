@@ -270,6 +270,7 @@ impl Pipeline {
                 thumbnail_url: None,
                 webpage_url: None,
                 live_status: None,
+                default_audio_language: None,
             });
         let client =
             bilibili_api::BiliSubtitleClient::from_cookies_file(&self.config.bilibili.cookies)?;
