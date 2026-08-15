@@ -53,6 +53,28 @@ macro_rules! serde_enum_display_fromstr {
 }
 serde_enum_display_fromstr!(TransferMode);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateSource {
+    Websub,
+    DataApi,
+    Rss,
+    Ytdlp,
+}
+
+serde_enum_display_fromstr!(CandidateSource);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateState {
+    Pending,
+    Deferred,
+    Rejected,
+    Promoted,
+}
+
+serde_enum_display_fromstr!(GateState);
+
 impl JobStatus {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::DeadLetter | Self::Failed)
@@ -71,6 +93,30 @@ pub struct Channel {
     pub transfer_mode: TransferMode,
     pub last_checked_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+    pub next_poll_at: Option<DateTime<Utc>>,
+    pub consecutive_failures: u32,
+    pub uploads_playlist_id: Option<String>,
+    pub next_data_api_poll_at: Option<DateTime<Utc>>,
+    pub data_api_etag: Option<String>,
+    pub websub_lease_expires_at: Option<DateTime<Utc>>,
+    pub websub_last_received_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoCandidate {
+    pub video_id: String,
+    pub channel_id: Option<i64>,
+    pub url: String,
+    pub title: Option<String>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub source: CandidateSource,
+    pub discovered_at: DateTime<Utc>,
+    pub gate_state: GateState,
+    pub gate_attempts: u32,
+    pub next_gate_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub source_language: Option<String>,
+    pub source_language_mismatch: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +215,8 @@ pub struct VideoMetadata {
     pub thumbnail_url: Option<String>,
     pub webpage_url: Option<String>,
     pub live_status: Option<String>,
+    /// YouTube Data API snippet.defaultAudioLanguage；yt-dlp 回退可能拿不到。
+    pub default_audio_language: Option<String>,
 }
 
 /// 2024-10-30 起 YouTube 将 Shorts 时长上限从 60 秒提升到 180 秒。
@@ -216,6 +264,7 @@ mod tests {
             thumbnail_url: None,
             webpage_url: None,
             live_status: None,
+            default_audio_language: None,
         }
     }
     #[test]
