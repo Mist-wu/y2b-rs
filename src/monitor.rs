@@ -1,31 +1,36 @@
 use crate::{
     config::{Config, YoutubeConfig},
-    db::{Database, NewJob},
-    model::{Job, TransferMode, VideoMetadata},
+    db::{Database, NewJob, NewVideoCandidate},
+    model::{CandidateSource, Channel, Job, TransferMode, VideoCandidate, VideoMetadata},
     process::run_monitored,
+    youtube_api::{PlaylistVideo, QuotaDegradation, YoutubeDataApi},
 };
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono_tz::Tz;
 use feed_rs::parser;
+use reqwest::{StatusCode, header::RETRY_AFTER};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{
+    Mutex, Once,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use tokio::process::Command;
+use uuid::Uuid;
 
 pub struct Monitor {
     config: Config,
     db: Database,
     client: reqwest::Client,
-    /// 最近一次确认「本轮不入队」的时间（按 video_id），用于限制重复拉取元数据。
-    ///
-    /// 两类来源：直播内容尚未就绪，以及时长超过上限。前者结束后会变成可搬运的
-    /// 回放，所以不能永久拉黑——否则直播中发现的视频永远等不到回放被入队；
-    /// 后者虽然不会变化，但同一份 TTL 也让 max_duration_seconds 改配置后能在
-    /// 一个复查周期内生效。
-    deferred_videos: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// RSS 故障时的 yt-dlp 回退限流：既限制单频道频率，也限制全局风暴。
     fallback_limiter: Mutex<FallbackLimiter>,
+    /// 整个频道集合的 RSS 结果滑动窗口。打开时刻落库，窗口本身只用于判定。
+    rss_circuit: Mutex<RssCircuitWindow>,
+    data_api: Option<YoutubeDataApi>,
+    uploads_refreshed_this_process: AtomicBool,
 }
 
 /// 构造带公共参数（js 运行时、cookies）的 yt-dlp 命令，供各子命令复用。
@@ -58,6 +63,19 @@ pub struct EnqueueOutcome {
     pub created: bool,
 }
 
+/// 一批闸门处理的结果。
+///
+/// 必须把「处理了多少」和「晋级了多少」分开报：整批候选都被拒（早于 baseline、
+/// 超时长、历史回放）是常态，此时 `promoted` 为 0 但活是干了的。只看晋级数的
+/// 调用方会把这种情况误判成「没活可干」而提前收手，把候选留在表里不动。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GateOutcome {
+    /// 本批实际取出并处理的候选数。只有它为 0 才代表没有到期候选。
+    pub processed: usize,
+    /// 其中晋级为任务的数量。
+    pub promoted: usize,
+}
+
 const LIVE_CONTENT_PENDING_PREFIX: &str = "直播内容尚未就绪，暂不处理";
 
 /// 跳过某个视频后，多久允许重新拉取一次元数据。
@@ -77,10 +95,22 @@ const LIVE_STATUS_NOT_READY: &[&str] = &["is_live", "is_upcoming", "post_live"];
 
 const DURATION_LIMIT_PREFIX: &str = "视频时长超过上限";
 
-const RSS_ATTEMPTS: usize = 3;
+const RSS_MAX_RETRIES: usize = 2;
+const RSS_RETRY_BASE: Duration = Duration::from_secs(1);
 const FALLBACK_CHANNEL_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const FALLBACK_GLOBAL_WINDOW: Duration = Duration::from_secs(10 * 60);
 const FALLBACK_GLOBAL_LIMIT: usize = 3;
+const RSS_CIRCUIT_STATE_KEY: &str = "rss_circuit_open_until";
+const RSS_CIRCUIT_WINDOW: Duration = Duration::from_secs(10 * 60);
+const RSS_CIRCUIT_DURATION: chrono::Duration = chrono::Duration::minutes(10);
+const RSS_CIRCUIT_MIN_SAMPLES: usize = 8;
+const RSS_CIRCUIT_FAILURE_PERCENT: usize = 60;
+const RSS_CIRCUIT_PROBES: usize = 2;
+const CHANNEL_FAILURE_BACKOFF_CAP: Duration = Duration::from_secs(6 * 60 * 60);
+const API_UPLOADS_REFRESHED_AT_KEY: &str = "uploads_playlist_refreshed_at";
+const API_UPLOADS_REFRESH_INTERVAL: chrono::Duration = chrono::Duration::days(1);
+const DEGRADED_COLD_INTERVAL_MULTIPLIER: u32 = 2;
+const DEGRADED_HOT_WINDOW_DIVISOR: u64 = 2;
 
 /// 只让 yt-dlp 输出流水线实际使用的元数据字段。
 ///
@@ -101,6 +131,204 @@ enum FallbackClaim {
 struct FallbackLimiter {
     per_channel: HashMap<i64, Instant>,
     global_starts: VecDeque<Instant>,
+}
+
+#[derive(Default)]
+struct RssCircuitWindow {
+    samples: VecDeque<(Instant, bool)>,
+}
+
+impl RssCircuitWindow {
+    /// 返回当前窗口是否达到开闸阈值。`failed` 表示这次 RSS 样本失败。
+    fn record(&mut self, failed: bool, now: Instant) -> bool {
+        while self
+            .samples
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= RSS_CIRCUIT_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((now, failed));
+        let failures = self.samples.iter().filter(|(_, failed)| *failed).count();
+        self.samples.len() >= RSS_CIRCUIT_MIN_SAMPLES
+            && failures * 100 > self.samples.len() * RSS_CIRCUIT_FAILURE_PERCENT
+    }
+}
+
+#[derive(Debug, Error)]
+enum FeedFetchError {
+    #[error("RSS HTTP {status}")]
+    Http {
+        status: StatusCode,
+        retry_at: Option<DateTime<Utc>>,
+    },
+    #[error("RSS 请求失败: {source}")]
+    Request {
+        #[source]
+        source: reqwest::Error,
+    },
+}
+
+struct PollExecution {
+    result: Result<usize>,
+    rss_failed: bool,
+    retry_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataApiPollMode {
+    WebSubFallback,
+    InsufficientHistory,
+    PredictedHot,
+    PredictedCold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DataApiPollDecision {
+    interval: Duration,
+    mode: DataApiPollMode,
+}
+
+fn prediction_poll_decision(
+    config: &Config,
+    history: &[DateTime<Utc>],
+    now: DateTime<Utc>,
+    timezone: Tz,
+    degradation: QuotaDegradation,
+    websub_active: bool,
+) -> DataApiPollDecision {
+    if websub_active {
+        return DataApiPollDecision {
+            interval: Duration::from_secs(config.websub.data_api_poll_minutes.saturating_mul(60)),
+            mode: DataApiPollMode::WebSubFallback,
+        };
+    }
+    if history.len() < config.monitor.prediction_min_samples {
+        return DataApiPollDecision {
+            interval: Duration::from_secs(
+                config
+                    .monitor
+                    .prediction_fallback_poll_minutes
+                    .saturating_mul(60),
+            ),
+            mode: DataApiPollMode::InsufficientHistory,
+        };
+    }
+
+    let mut counts = [[0_u32; 24]; 7];
+    for published_at in history {
+        let local = published_at.with_timezone(&timezone);
+        let weekday = local.weekday().num_days_from_monday() as usize;
+        counts[weekday][local.hour() as usize] += 1;
+    }
+    let mut predicted_hours = [None; 7];
+    for (weekday, hours) in counts.iter().enumerate() {
+        let mut best_hour = None;
+        let mut best_count = 0;
+        for (hour, count) in hours.iter().copied().enumerate() {
+            if count > best_count {
+                best_count = count;
+                best_hour = Some(hour as i64);
+            }
+        }
+        predicted_hours[weekday] = best_hour;
+    }
+
+    let local_now = now.with_timezone(&timezone);
+    let week_seconds = 7_i64 * 24 * 60 * 60;
+    let now_seconds = i64::from(local_now.weekday().num_days_from_monday()) * 24 * 60 * 60
+        + i64::from(local_now.num_seconds_from_midnight());
+    let mut window_minutes = config.monitor.prediction_window_minutes;
+    if degradation >= QuotaDegradation::NarrowHot {
+        window_minutes = window_minutes
+            .saturating_div(DEGRADED_HOT_WINDOW_DIVISOR)
+            .max(1);
+    }
+    let half_window_seconds =
+        i64::try_from(window_minutes.saturating_mul(60) / 2).unwrap_or(i64::MAX);
+    let predicted_centers = predicted_hours
+        .iter()
+        .enumerate()
+        .filter_map(|(weekday, hour)| hour.map(|hour| (weekday as i64, hour)))
+        .map(|(weekday, hour)| {
+            // 小时桶以 :30 为中心；默认 2 小时窗覆盖完整预测小时并前后各留 30 分钟。
+            weekday * 24 * 60 * 60 + hour * 60 * 60 + 30 * 60
+        })
+        .collect::<Vec<_>>();
+    let hot = predicted_centers.iter().copied().any(|center| {
+        let direct = (now_seconds - center).abs();
+        direct.min(week_seconds - direct) <= half_window_seconds
+    });
+    if hot {
+        DataApiPollDecision {
+            interval: Duration::from_secs(config.monitor.prediction_hot_poll_seconds),
+            mode: DataApiPollMode::PredictedHot,
+        }
+    } else {
+        let mut interval = Duration::from_secs(
+            config
+                .monitor
+                .prediction_cold_poll_minutes
+                .saturating_mul(60),
+        );
+        if degradation >= QuotaDegradation::ExtendCold {
+            interval = interval.saturating_mul(DEGRADED_COLD_INTERVAL_MULTIPLIER);
+        }
+        // 冷区周期不能跨过下一个热窗起点，否则“热窗 60 秒”可能在刚开始时仍睡
+        // 最长 30/60 分钟。必要时提前在边界唤醒，不额外发边界前的 API 请求。
+        if let Some(seconds_until_hot) = predicted_centers
+            .iter()
+            .map(|center| (center - half_window_seconds).rem_euclid(week_seconds))
+            .map(|start| (start - now_seconds).rem_euclid(week_seconds))
+            .filter(|seconds| *seconds > 0)
+            .min()
+        {
+            interval = interval.min(Duration::from_secs(seconds_until_hot as u64));
+        }
+        DataApiPollDecision {
+            interval,
+            mode: DataApiPollMode::PredictedCold,
+        }
+    }
+}
+
+/// 不表示具体语言的 ISO 值：`zxx` = 无语言内容（纯游戏画面／音乐），
+/// `und` = 未确定。它们不是「另一种语言」，当成不符会产生大量误报——线上首轮
+/// 扫描里 `zxx` 一个值就占了 67 条告警。
+const UNKNOWN_LANGUAGE_TAGS: &[&str] = &["zxx", "und"];
+
+fn is_unknown_language(actual: &str) -> bool {
+    let primary = actual.split(['-', '_']).next().unwrap_or(actual).trim();
+    primary.is_empty()
+        || UNKNOWN_LANGUAGE_TAGS
+            .iter()
+            .any(|tag| primary.eq_ignore_ascii_case(tag))
+}
+
+fn source_language_matches(expected: &str, actual: &str) -> bool {
+    // 无法判定语言时一律放行，不算不符。
+    if is_unknown_language(actual) {
+        return true;
+    }
+    let expected = expected.split(['-', '_']).next().unwrap_or(expected).trim();
+    let actual = actual.split(['-', '_']).next().unwrap_or(actual).trim();
+    !expected.is_empty() && expected.eq_ignore_ascii_case(actual)
+}
+
+impl FeedFetchError {
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Http { status, .. } => status.is_server_error(),
+            Self::Request { source } => source.is_timeout() || source.is_connect(),
+        }
+    }
+
+    fn retry_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Http { retry_at, .. } => *retry_at,
+            Self::Request { .. } => None,
+        }
+    }
 }
 
 impl FallbackLimiter {
@@ -127,6 +355,7 @@ impl FallbackLimiter {
         FallbackClaim::Allowed
     }
 
+    #[cfg(test)]
     fn last_attempt(&self, channel_id: i64) -> Option<Instant> {
         self.per_channel.get(&channel_id).copied()
     }
@@ -151,6 +380,32 @@ fn normalize_channel_url(url: &str) -> String {
     } else {
         format!("{trimmed}/videos")
     }
+}
+
+fn random_jitter_factor() -> f64 {
+    let bytes = Uuid::new_v4().into_bytes();
+    let sample = f64::from(u16::from_be_bytes([bytes[0], bytes[1]])) / f64::from(u16::MAX);
+    0.5 + sample
+}
+
+fn jittered_backoff(base: Duration, exponent: u32, jitter: f64) -> Duration {
+    let multiplier = 2_u64.saturating_pow(exponent.min(20));
+    base.saturating_mul(multiplier as u32)
+        .mul_f64(jitter.clamp(0.5, 1.5))
+}
+
+fn parse_retry_after(
+    value: &reqwest::header::HeaderValue,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let raw = value.to_str().ok()?.trim();
+    if let Ok(seconds) = raw.parse::<u64>() {
+        let seconds = i64::try_from(seconds).ok()?;
+        return now.checked_add_signed(chrono::Duration::seconds(seconds));
+    }
+    DateTime::parse_from_rfc2822(raw)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
 }
 
 /// 时长超限的视频永远不会变短，属于永久跳过（区别于直播的「稍后复查」）。
@@ -276,15 +531,119 @@ fn reconcile_after_baseline(
 
 impl Monitor {
     pub fn new(config: Config, db: Database) -> Result<Self> {
+        let api_key = std::env::var("YOUTUBE_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        if api_key.is_none() {
+            static WARN_MISSING_KEY: Once = Once::new();
+            WARN_MISSING_KEY.call_once(|| {
+                tracing::warn!("未设置 YOUTUBE_API_KEY，Data API 已停用，将降级到 RSS 与 yt-dlp");
+            });
+        }
+        Self::build(config, db, api_key, None)
+    }
+
+    fn build(
+        config: Config,
+        db: Database,
+        api_key: Option<String>,
+        api_base_url: Option<&str>,
+    ) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .user_agent("y2b-rs/0.1")
+            .build()?;
+        let data_api = api_key.map(|api_key| match api_base_url {
+            Some(base_url) => {
+                YoutubeDataApi::with_base_url(client.clone(), db.clone(), api_key, base_url)
+            }
+            None => YoutubeDataApi::new(client.clone(), db.clone(), api_key),
+        });
         Ok(Self {
             config,
             db,
-            client: reqwest::Client::builder()
-                .user_agent("y2b-rs/0.1")
-                .build()?,
-            deferred_videos: Mutex::new(std::collections::HashMap::new()),
+            client,
             fallback_limiter: Mutex::new(FallbackLimiter::default()),
+            rss_circuit: Mutex::new(RssCircuitWindow::default()),
+            data_api,
+            uploads_refreshed_this_process: AtomicBool::new(false),
         })
+    }
+
+    #[cfg(test)]
+    fn new_with_data_api(
+        config: Config,
+        db: Database,
+        api_key: Option<&str>,
+        api_base_url: &str,
+    ) -> Result<Self> {
+        Self::build(config, db, api_key.map(str::to_string), Some(api_base_url))
+    }
+
+    pub fn has_data_api(&self) -> bool {
+        self.data_api.is_some()
+    }
+
+    pub fn data_api_primary_enabled(&self) -> Result<bool> {
+        let Some(api) = self.data_api.as_ref() else {
+            return Ok(false);
+        };
+        Ok(api.quota_policy()?.degradation != QuotaDegradation::FallbackOnly)
+    }
+
+    fn data_api_poll_decision(
+        &self,
+        channel: &Channel,
+        now: DateTime<Utc>,
+        degradation: QuotaDegradation,
+    ) -> Result<DataApiPollDecision> {
+        let timezone = self
+            .config
+            .runtime
+            .timezone
+            .parse::<Tz>()
+            .with_context(|| {
+                format!(
+                    "runtime.timezone 不是有效 IANA 时区: {}",
+                    self.config.runtime.timezone
+                )
+            })?;
+        let history = self.db.channel_publication_history(channel.id)?;
+        let websub_active = self.config.websub.enabled
+            && channel
+                .websub_lease_expires_at
+                .is_some_and(|expires_at| expires_at > now);
+        Ok(prediction_poll_decision(
+            &self.config,
+            &history,
+            now,
+            timezone,
+            degradation,
+            websub_active,
+        ))
+    }
+
+    fn schedule_data_api_channel(
+        &self,
+        channel_id: i64,
+        now: DateTime<Utc>,
+        degradation: QuotaDegradation,
+        etag: Option<&str>,
+    ) -> Result<DataApiPollDecision> {
+        let channel = self.db.channel(channel_id)?;
+        let decision = self.data_api_poll_decision(&channel, now, degradation)?;
+        let next_poll_at = now + chrono::Duration::from_std(decision.interval)?;
+        self.db
+            .schedule_data_api_poll(channel.id, next_poll_at, etag)?;
+        if decision.mode == DataApiPollMode::WebSubFallback {
+            tracing::info!(
+                channel_id = channel.id,
+                channel = %channel.name,
+                next_poll_at = %next_poll_at,
+                fallback_minutes = self.config.websub.data_api_poll_minutes,
+                "WebSub 租约生效，Data API 自动降为纯兜底轮询"
+            );
+        }
+        Ok(decision)
     }
 
     pub async fn resolve_channel(&self, url: &str) -> Result<ResolvedChannel> {
@@ -328,6 +687,201 @@ impl Monitor {
         Ok(id)
     }
 
+    /// Data API 主发现：只读取每频道持久化调度中已经到期的频道。
+    pub async fn poll_data_api(&self) -> Result<usize> {
+        let Some(api) = self.data_api.as_ref() else {
+            return Ok(0);
+        };
+        let now = Utc::now();
+        let channels = self.db.list_due_data_api_channels(now)?;
+        if channels.is_empty() {
+            return Ok(0);
+        }
+        let policy = api.quota_policy()?;
+        if policy.degradation == QuotaDegradation::FallbackOnly {
+            for channel in channels {
+                self.db
+                    .schedule_data_api_poll(channel.id, policy.reset_at, None)?;
+            }
+            return Ok(0);
+        }
+        if let Err(error) = self.refresh_upload_playlists(api).await {
+            let current_policy = api.quota_policy()?;
+            for channel in channels {
+                if current_policy.degradation == QuotaDegradation::FallbackOnly {
+                    self.db
+                        .schedule_data_api_poll(channel.id, current_policy.reset_at, None)?;
+                } else {
+                    self.schedule_data_api_channel(
+                        channel.id,
+                        now,
+                        current_policy.degradation,
+                        None,
+                    )?;
+                }
+            }
+            return Err(error);
+        }
+
+        let channels = channels
+            .into_iter()
+            .map(|channel| self.db.channel(channel.id))
+            .collect::<Result<Vec<_>>>()?;
+        let mut discovered = 0;
+        let mut first_error = None;
+        for channel in channels {
+            let before_request = api.quota_policy()?;
+            if before_request.degradation == QuotaDegradation::FallbackOnly {
+                self.db
+                    .schedule_data_api_poll(channel.id, before_request.reset_at, None)?;
+                continue;
+            }
+            let Some(playlist_id) = channel.uploads_playlist_id.as_deref() else {
+                tracing::warn!(
+                    channel = %channel.name,
+                    youtube_channel_id = %channel.youtube_channel_id,
+                    "频道缺少 uploads 播放列表，跳过本轮 Data API 发现"
+                );
+                self.schedule_data_api_channel(
+                    channel.id,
+                    Utc::now(),
+                    before_request.degradation,
+                    None,
+                )?;
+                continue;
+            };
+            match api
+                .playlist_items(
+                    playlist_id,
+                    self.config.monitor.data_api_max_results,
+                    channel.data_api_etag.as_deref(),
+                )
+                .await
+            {
+                Ok(page) => {
+                    if page.not_modified {
+                        tracing::debug!(channel = %channel.name, "playlistItems.list 返回 304，无新内容");
+                    } else {
+                        discovered += self.persist_playlist_candidates(&channel, page.videos)?;
+                    }
+                    let current_policy = api.quota_policy()?;
+                    if current_policy.degradation == QuotaDegradation::FallbackOnly {
+                        self.db.schedule_data_api_poll(
+                            channel.id,
+                            current_policy.reset_at,
+                            page.etag.as_deref(),
+                        )?;
+                    } else {
+                        self.schedule_data_api_channel(
+                            channel.id,
+                            Utc::now(),
+                            current_policy.degradation,
+                            page.etag.as_deref(),
+                        )?;
+                    }
+                }
+                Err(error) => {
+                    let current_policy = api.quota_policy()?;
+                    if current_policy.degradation == QuotaDegradation::FallbackOnly {
+                        self.db.schedule_data_api_poll(
+                            channel.id,
+                            current_policy.reset_at,
+                            None,
+                        )?;
+                    } else {
+                        self.schedule_data_api_channel(
+                            channel.id,
+                            Utc::now(),
+                            current_policy.degradation,
+                            None,
+                        )?;
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::Error::new(error));
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error.context("一个或多个频道的 Data API 主发现失败")),
+            None => Ok(discovered),
+        }
+    }
+
+    fn persist_playlist_candidates(
+        &self,
+        channel: &Channel,
+        videos: Vec<PlaylistVideo>,
+    ) -> Result<usize> {
+        let mut discovered = 0;
+        for video in videos {
+            if !is_youtube_video_id(&video.video_id) {
+                tracing::warn!(video_id = %video.video_id, "Data API 返回非法 video_id，跳过");
+                continue;
+            }
+            if self.db.get_job_by_video_id(&video.video_id)?.is_some()
+                || self.db.is_over_duration_video(
+                    &video.video_id,
+                    self.config.youtube.max_duration_seconds,
+                )?
+            {
+                continue;
+            }
+            let url = format!("https://www.youtube.com/watch?v={}", video.video_id);
+            if self.db.insert_video_candidate(NewVideoCandidate {
+                video_id: &video.video_id,
+                channel_id: Some(channel.id),
+                url: &url,
+                title: video.title.as_deref(),
+                published_at: video.published_at,
+                source: CandidateSource::DataApi,
+            })? {
+                discovered += 1;
+            }
+        }
+        Ok(discovered)
+    }
+
+    async fn refresh_upload_playlists(&self, api: &YoutubeDataApi) -> Result<()> {
+        let now = Utc::now();
+        let refreshed_this_process = self.uploads_refreshed_this_process.load(Ordering::Acquire);
+        let last_refresh = self
+            .db
+            .get_discovery_state(API_UPLOADS_REFRESHED_AT_KEY)?
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        let channels = self.db.list_channels()?;
+        let refresh_due = !refreshed_this_process
+            || last_refresh.is_none_or(|last| now - last >= API_UPLOADS_REFRESH_INTERVAL);
+        if !refresh_due {
+            return Ok(());
+        }
+
+        let channel_ids = channels
+            .iter()
+            .map(|channel| channel.youtube_channel_id.clone())
+            .collect::<Vec<_>>();
+        let uploads = api.channel_upload_playlists(&channel_ids).await?;
+        for channel in &channels {
+            match uploads.get(&channel.youtube_channel_id) {
+                Some(playlist_id) => self
+                    .db
+                    .set_channel_uploads_playlist(&channel.youtube_channel_id, playlist_id)?,
+                None => tracing::warn!(
+                    channel = %channel.name,
+                    youtube_channel_id = %channel.youtube_channel_id,
+                    "channels.list 未返回频道，可能是无效或不可访问频道"
+                ),
+            }
+        }
+        self.db
+            .set_discovery_state(API_UPLOADS_REFRESHED_AT_KEY, &now.to_rfc3339())?;
+        self.uploads_refreshed_this_process
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
     pub async fn enqueue_video(
         &self,
         url: &str,
@@ -361,27 +915,47 @@ impl Monitor {
 
     pub async fn poll_all(&self) -> Result<usize> {
         let mut count = 0;
-        let mut channels = self
-            .db
-            .list_channels()?
-            .into_iter()
-            .filter(|channel| channel.enabled)
-            .collect::<Vec<_>>();
-        // RSS 全面异常时，固定按数据库 id 顺序轮询会让最前面的三个频道每逢
-        // 10 分钟窗口都抢走全部 yt-dlp 名额，其余频道永久饥饿。优先轮询从未
-        // 回退或最久未回退的频道，使有限名额在所有频道间公平轮转。
-        {
-            let limiter = self.fallback_limiter.lock().unwrap();
-            channels.sort_by_key(|channel| limiter.last_attempt(channel.id));
-        }
+        let channels = self.db.list_due_channels(Utc::now())?;
+        let mut circuit_probes = 0;
         for c in channels {
-            match self.poll_channel(c.id, true).await {
+            if let Some(open_until) = self.rss_circuit_open_until()? {
+                if circuit_probes >= RSS_CIRCUIT_PROBES {
+                    self.db.defer_channel_poll_until(c.id, open_until)?;
+                    continue;
+                }
+                circuit_probes += 1;
+            }
+            match self.poll_channel_with_fallback(c.id, true, true).await {
                 Ok(n) => count += n,
                 Err(e) => {
                     let detail = format!("{e:#}");
-                    self.db.mark_channel_checked(c.id, Some(&detail))?;
                     tracing::warn!(channel=%c.name,error=%detail,"频道轮询失败");
                 }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Data API 正常时 RSS 仅作为低频探针；失败不立即拉起 yt-dlp。yt-dlp 深度
+    /// 校对只在每日 API 深扫失败或 Data API 整体不可用时运行。
+    pub async fn poll_rss_probes(&self, limit: usize) -> Result<usize> {
+        let mut count = 0;
+        for channel in self
+            .db
+            .list_due_channels(Utc::now())?
+            .into_iter()
+            .take(limit)
+        {
+            match self
+                .poll_channel_with_fallback(channel.id, true, false)
+                .await
+            {
+                Ok(discovered) => count += discovered,
+                Err(error) => tracing::warn!(
+                    channel = %channel.name,
+                    error = %error,
+                    "RSS 探针失败"
+                ),
             }
         }
         Ok(count)
@@ -405,10 +979,107 @@ impl Monitor {
         Ok(count)
     }
 
+    /// 每日深扫优先使用 playlistItems.list(maxResults=50)。配额降级的第一阶段会
+    /// 主动停掉这项非关键扫描；无 key、配额完全不可用或 API 请求失败时，才调用
+    /// 保留下来的 yt-dlp reconcile 路径。
+    pub async fn deep_scan_all(&self) -> Result<usize> {
+        let Some(api) = self.data_api.as_ref() else {
+            tracing::warn!("Data API 未配置，每日深扫回落到 yt-dlp 校对");
+            return self.reconcile_all().await;
+        };
+        let policy = api.quota_policy()?;
+        match policy.degradation {
+            QuotaDegradation::SkipDeepScan
+            | QuotaDegradation::ExtendCold
+            | QuotaDegradation::NarrowHot => {
+                tracing::debug!(used = policy.used, "配额降级已停止本日 Data API 深扫");
+                return Ok(0);
+            }
+            QuotaDegradation::FallbackOnly => {
+                tracing::warn!(
+                    used = policy.used,
+                    reset_at = %policy.reset_at,
+                    "Data API 配额不可用，每日深扫回落到 yt-dlp 校对"
+                );
+                return self.reconcile_all().await;
+            }
+            QuotaDegradation::Normal => {}
+        }
+
+        if let Err(error) = self.refresh_upload_playlists(api).await {
+            tracing::warn!(error = %error, "Data API 深扫初始化失败，回落到 yt-dlp 校对");
+            return self.reconcile_all().await;
+        }
+
+        let mut added = 0;
+        for channel in self
+            .db
+            .list_channels()?
+            .into_iter()
+            .filter(|channel| channel.enabled)
+        {
+            let current_policy = api.quota_policy()?;
+            if current_policy.degradation != QuotaDegradation::Normal {
+                tracing::debug!(
+                    used = current_policy.used,
+                    "每日 API 深扫途中达到降级阈值，停止剩余频道"
+                );
+                break;
+            }
+            let Some(playlist_id) = channel.uploads_playlist_id.as_deref() else {
+                tracing::warn!(
+                    channel = %channel.name,
+                    "API 深扫缺少 uploads 播放列表，回落到 yt-dlp"
+                );
+                match self.reconcile_channel(channel.id, &channel.url).await {
+                    Ok(count) => {
+                        added += count;
+                        self.db.mark_channel_reconciled(channel.id, None)?;
+                    }
+                    Err(error) => {
+                        let detail = format!("{error:#}");
+                        self.db.mark_channel_reconciled(channel.id, Some(&detail))?;
+                        tracing::warn!(channel = %channel.name, error = %detail, "yt-dlp 深扫兜底失败");
+                    }
+                }
+                continue;
+            };
+            match api
+                .playlist_items(playlist_id, self.config.monitor.data_api_max_results, None)
+                .await
+            {
+                Ok(page) => {
+                    added += self.persist_playlist_candidates(&channel, page.videos)?;
+                    if let Some(etag) = page.etag.as_deref() {
+                        self.db.set_channel_data_api_etag(channel.id, etag)?;
+                    }
+                    self.db.mark_channel_reconciled(channel.id, None)?;
+                }
+                Err(api_error) => {
+                    tracing::warn!(
+                        channel = %channel.name,
+                        error = %api_error,
+                        "Data API 深扫失败，回落到 yt-dlp 校对"
+                    );
+                    match self.reconcile_channel(channel.id, &channel.url).await {
+                        Ok(count) => {
+                            added += count;
+                            self.db.mark_channel_reconciled(channel.id, None)?;
+                        }
+                        Err(error) => {
+                            let detail = format!("API: {api_error}; yt-dlp: {error:#}");
+                            self.db.mark_channel_reconciled(channel.id, Some(&detail))?;
+                            tracing::warn!(channel = %channel.name, error = %detail, "API 与 yt-dlp 深扫均失败");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(added)
+    }
+
     async fn reconcile_channel(&self, id: i64, url: &str) -> Result<usize> {
-        let transfer_mode = self.db.channel_transfer_mode(id)?;
         let baseline = self.db.channel_baseline(id)?;
-        let replay_cutoff = self.db.live_replay_cutoff()?;
         let normalized_url = normalize_channel_url(url);
         let mut cmd = ytdlp_command(&self.config.youtube);
         cmd.args([
@@ -442,6 +1113,13 @@ impl Monitor {
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={video_id}"));
             let title = e.get("title").and_then(Value::as_str);
+            let timestamp = e
+                .get("timestamp")
+                .or_else(|| e.get("release_timestamp"))
+                .and_then(Value::as_i64);
+            if matches!(reconcile_after_baseline(baseline, timestamp), Some(false)) {
+                break;
+            }
             if self.db.get_job_by_video_id(video_id)?.is_some()
                 || self
                     .db
@@ -449,94 +1127,151 @@ impl Monitor {
             {
                 continue;
             }
-            let metadata = match self.fetch_metadata(&link).await {
-                Ok((metadata, _, _)) => metadata,
-                Err(error) if exceeds_duration_limit(&error) => {
-                    self.db.record_over_duration_video(
-                        video_id,
-                        Some(id),
-                        self.config.youtube.max_duration_seconds,
-                        &error.to_string(),
-                    )?;
-                    tracing::info!(video_id, error = %error, "校对候选超过时长上限，持久化跳过");
-                    continue;
-                }
-                Err(error) if is_live_content_pending(&error) => {
-                    tracing::info!(video_id, error = %error, "校对候选直播尚未就绪，跳过");
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!(video_id, error = %error, "校对候选元数据获取失败，跳过");
-                    continue;
-                }
-            };
-            if is_backlog_replay(&metadata, replay_cutoff) {
-                tracing::info!(video_id, "历史直播回放，不自动入队");
-                continue;
-            }
-            match reconcile_after_baseline(baseline, metadata.timestamp) {
-                Some(true) => {}
-                Some(false) => break,
-                None => {
-                    tracing::warn!(video_id, "校对候选缺少发布时间，跳过以避免补录历史视频");
-                    continue;
-                }
-            }
-            let published = metadata
-                .timestamp
-                .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0));
-            if self
-                .db
-                .create_job(NewJob {
-                    channel_id: Some(id),
-                    video_id,
-                    url: &link,
-                    title,
-                    published,
-                    updated: None,
-                    transfer_mode,
-                })?
-                .is_some()
-            {
+            if self.db.insert_video_candidate(NewVideoCandidate {
+                channel_id: Some(id),
+                video_id,
+                url: &link,
+                title,
+                published_at: timestamp.and_then(|value| DateTime::<Utc>::from_timestamp(value, 0)),
+                source: CandidateSource::Ytdlp,
+            })? {
                 added += 1;
             }
         }
         Ok(added)
     }
 
-    async fn fetch_feed_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let mut last_error = None;
-        for attempt in 1..=RSS_ATTEMPTS {
-            let result: Result<Vec<u8>> = async {
-                let response = self.client.get(url).send().await?.error_for_status()?;
-                Ok(response.bytes().await?.to_vec())
-            }
-            .await;
+    async fn fetch_feed_bytes(&self, url: &str) -> std::result::Result<Vec<u8>, FeedFetchError> {
+        for retry in 0..=RSS_MAX_RETRIES {
+            let result = match self.client.get(url).send().await {
+                Ok(response) if response.status().is_success() => response
+                    .bytes()
+                    .await
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(|source| FeedFetchError::Request { source }),
+                Ok(response) => {
+                    let status = response.status();
+                    let retry_at = (status == StatusCode::TOO_MANY_REQUESTS)
+                        .then(|| {
+                            response
+                                .headers()
+                                .get(RETRY_AFTER)
+                                .and_then(|value| parse_retry_after(value, Utc::now()))
+                        })
+                        .flatten();
+                    Err(FeedFetchError::Http { status, retry_at })
+                }
+                Err(source) => Err(FeedFetchError::Request { source }),
+            };
             match result {
                 Ok(bytes) => return Ok(bytes),
-                Err(error) => {
-                    last_error = Some(error);
-                    if attempt < RSS_ATTEMPTS {
-                        let delay = Duration::from_secs(attempt as u64);
-                        tracing::debug!(attempt, ?delay, url, "RSS 拉取失败，短退避后重试");
-                        tokio::time::sleep(delay).await;
-                    }
+                Err(error) if retry < RSS_MAX_RETRIES && error.retryable() => {
+                    let delay = jittered_backoff(
+                        RSS_RETRY_BASE,
+                        u32::try_from(retry).unwrap_or(u32::MAX),
+                        random_jitter_factor(),
+                    );
+                    tracing::debug!(attempt = retry + 1, ?delay, url, error = %error, "RSS 暂时失败，退避后重试");
+                    tokio::time::sleep(delay).await;
                 }
+                Err(error) => return Err(error),
             }
         }
-        Err(last_error.expect("RSS_ATTEMPTS 必须大于 0"))
+        unreachable!("RSS 重试循环至少执行一次")
     }
 
     pub async fn poll_channel(&self, id: i64, enqueue: bool) -> Result<usize> {
+        self.poll_channel_with_fallback(id, enqueue, true).await
+    }
+
+    async fn poll_channel_with_fallback(
+        &self,
+        id: i64,
+        enqueue: bool,
+        allow_fallback: bool,
+    ) -> Result<usize> {
+        let failures = self.db.channel_consecutive_failures(id)?;
+        let execution = match self
+            .poll_channel_unrecorded(id, enqueue, allow_fallback)
+            .await
+        {
+            Ok(execution) => execution,
+            Err(error) => PollExecution {
+                result: Err(error),
+                rss_failed: false,
+                retry_at: None,
+            },
+        };
+        let detail = execution
+            .result
+            .as_ref()
+            .err()
+            .map(|error| format!("{error:#}"));
+        let failed = execution.rss_failed || execution.result.is_err();
+        let now = Utc::now();
+        let next_poll_at = if let Some(retry_at) = execution.retry_at {
+            retry_at
+        } else if failed {
+            let base = Duration::from_secs(self.config.monitor.poll_seconds.max(1));
+            let delay = jittered_backoff(base, failures, random_jitter_factor())
+                .min(CHANNEL_FAILURE_BACKOFF_CAP);
+            now + chrono::Duration::from_std(delay)?
+        } else {
+            now + chrono::Duration::seconds(
+                i64::try_from(self.config.monitor.poll_seconds).unwrap_or(i64::MAX),
+            )
+        };
+        self.db
+            .finish_channel_poll(id, detail.as_deref(), failed, next_poll_at)?;
+        execution.result
+    }
+
+    async fn poll_channel_unrecorded(
+        &self,
+        id: i64,
+        enqueue: bool,
+        allow_fallback: bool,
+    ) -> Result<PollExecution> {
         let url = self.db.channel_feed(id)?;
         let baseline = self.db.channel_baseline(id)?;
-        let transfer_mode = self.db.channel_transfer_mode(id)?;
-        let replay_cutoff = self.db.live_replay_cutoff()?;
         let bytes = match self.fetch_feed_bytes(&url).await {
             Ok(bytes) => bytes,
-            Err(error) => return self.fallback_poll_channel(id, error).await,
+            Err(error) => {
+                let retry_at = error.retry_at();
+                let record_result = self.record_rss_sample(true);
+                let result = match record_result {
+                    Ok(()) if allow_fallback => self.fallback_poll_channel(id, error.into()).await,
+                    Ok(()) => Err(anyhow::Error::new(error).context("RSS 探针不可用")),
+                    Err(record_error) => Err(record_error.context("记录 RSS 熔断样本失败")),
+                };
+                return Ok(PollExecution {
+                    result,
+                    rss_failed: true,
+                    retry_at,
+                });
+            }
         };
-        let feed = parser::parse(bytes.as_slice()).context("YouTube RSS 格式无效")?;
+        let feed = match parser::parse(bytes.as_slice()).context("YouTube RSS 格式无效") {
+            Ok(feed) => feed,
+            Err(error) => {
+                let result = match self.record_rss_sample(true) {
+                    Ok(()) => Err(error),
+                    Err(record_error) => Err(record_error.context(error.to_string())),
+                };
+                return Ok(PollExecution {
+                    result,
+                    rss_failed: true,
+                    retry_at: None,
+                });
+            }
+        };
+        if let Err(error) = self.record_rss_sample(false) {
+            return Ok(PollExecution {
+                result: Err(error.context("记录 RSS 熔断样本失败")),
+                rss_failed: false,
+                retry_at: None,
+            });
+        }
         let mut added = 0;
         for e in feed.entries {
             let published = e.published.or(e.updated);
@@ -555,74 +1290,33 @@ impl Monitor {
                 .map(|l| l.href.clone())
                 .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={video_id}"));
             let title = e.title.as_ref().map(|x| x.content.as_str());
-            if enqueue {
-                if self.recheck_is_throttled(&video_id) {
-                    continue;
-                }
-                if self.db.get_job_by_video_id(&video_id)?.is_some()
+            if enqueue
+                && (self.db.get_job_by_video_id(&video_id)?.is_some()
                     || self.db.is_over_duration_video(
                         &video_id,
                         self.config.youtube.max_duration_seconds,
-                    )?
-                {
-                    continue;
-                }
-                // 先拉元数据筛掉不该入队的内容：尚未就绪的直播、超长视频，
-                // 以及策略生效之前就开播的历史回放。
-                match self.fetch_metadata(&link).await {
-                    Ok((meta, _, _)) if is_backlog_replay(&meta, replay_cutoff) => {
-                        tracing::info!(
-                            video_id,
-                            started = ?meta.timestamp,
-                            "历史直播回放，不自动入队"
-                        );
-                        self.defer_video(&video_id);
-                        continue;
-                    }
-                    Ok(_) => {}
-                    Err(error) if is_live_content_pending(&error) => {
-                        tracing::info!(
-                            video_id,
-                            error = %error,
-                            "直播内容尚未就绪，稍后复查是否已有回放"
-                        );
-                        self.defer_video(&video_id);
-                        continue;
-                    }
-                    Err(error) if exceeds_duration_limit(&error) => {
-                        self.db.record_over_duration_video(
-                            &video_id,
-                            Some(id),
-                            self.config.youtube.max_duration_seconds,
-                            &error.to_string(),
-                        )?;
-                        tracing::info!(video_id, error = %error, "视频超过时长上限，持久化跳过");
-                        continue;
-                    }
-                    Err(_) => {
-                        // 其他错误（网络等）不阻塞入队，交给流水线重试。
-                    }
-                }
+                    )?)
+            {
+                continue;
             }
             if enqueue
-                && self
-                    .db
-                    .create_job(NewJob {
-                        channel_id: Some(id),
-                        video_id: &video_id,
-                        url: &link,
-                        title,
-                        published,
-                        updated: e.updated,
-                        transfer_mode,
-                    })?
-                    .is_some()
+                && self.db.insert_video_candidate(NewVideoCandidate {
+                    channel_id: Some(id),
+                    video_id: &video_id,
+                    url: &link,
+                    title,
+                    published_at: published,
+                    source: CandidateSource::Rss,
+                })?
             {
                 added += 1;
             }
         }
-        self.db.mark_channel_checked(id, None)?;
-        Ok(added)
+        Ok(PollExecution {
+            result: Ok(added),
+            rss_failed: false,
+            retry_at: None,
+        })
     }
 
     /// 领取 yt-dlp 回退名额。锁只覆盖纯内存判定，不跨分钟级 await。
@@ -633,23 +1327,252 @@ impl Monitor {
             .claim(id, Instant::now())
     }
 
-    /// 距上次确认不足 `RECHECK_INTERVAL` 时跳过本轮元数据拉取。
-    ///
-    /// 锁不跨 await：只在这里做一次判断就释放。
-    fn recheck_is_throttled(&self, video_id: &str) -> bool {
-        self.deferred_videos
+    fn record_rss_sample(&self, failed: bool) -> Result<()> {
+        let should_open = self
+            .rss_circuit
             .lock()
             .unwrap()
-            .get(video_id)
-            .is_some_and(|at| at.elapsed() < RECHECK_INTERVAL)
+            .record(failed, Instant::now());
+        if should_open && self.rss_circuit_open_until()?.is_none() {
+            let open_until = Utc::now() + RSS_CIRCUIT_DURATION;
+            self.db
+                .set_discovery_state(RSS_CIRCUIT_STATE_KEY, &open_until.to_rfc3339())?;
+            tracing::warn!(%open_until, "RSS 全局失败率超过阈值，熔断十分钟");
+        }
+        Ok(())
     }
 
-    /// 记录本轮跳过的时间，抑制下一轮的重复元数据拉取。
-    fn defer_video(&self, video_id: &str) {
-        self.deferred_videos
-            .lock()
-            .unwrap()
-            .insert(video_id.to_string(), std::time::Instant::now());
+    fn rss_circuit_open_until(&self) -> Result<Option<DateTime<Utc>>> {
+        let Some(raw) = self.db.get_discovery_state(RSS_CIRCUIT_STATE_KEY)? else {
+            return Ok(None);
+        };
+        let open_until = match DateTime::parse_from_rfc3339(&raw) {
+            Ok(value) => value.with_timezone(&Utc),
+            Err(error) => {
+                tracing::warn!(value = %raw, error = %error, "RSS 熔断时间无效，清除状态");
+                self.db.delete_discovery_state(RSS_CIRCUIT_STATE_KEY)?;
+                return Ok(None);
+            }
+        };
+        if open_until <= Utc::now() {
+            self.db.delete_discovery_state(RSS_CIRCUIT_STATE_KEY)?;
+            Ok(None)
+        } else {
+            Ok(Some(open_until))
+        }
+    }
+
+    /// 处理一批到期候选。发现源只负责写表，所有元数据与策略判断都收敛在这里。
+    pub async fn gate_pending_candidates(&self, limit: usize) -> Result<GateOutcome> {
+        let mut candidates = self.db.due_video_candidates(Utc::now(), limit)?;
+        let processed = candidates.len();
+        let mut promoted = 0;
+        let mut pending = Vec::with_capacity(candidates.len());
+        for candidate in candidates.drain(..) {
+            if self.db.get_job_by_video_id(&candidate.video_id)?.is_some() {
+                if self.db.promote_video_candidate(
+                    &candidate,
+                    candidate.title.as_deref(),
+                    candidate.published_at,
+                )? {
+                    promoted += 1;
+                }
+            } else {
+                pending.push(candidate);
+            }
+        }
+        if pending.is_empty() {
+            return Ok(GateOutcome {
+                processed,
+                promoted,
+            });
+        }
+
+        if let Some(api) = self.data_api.as_ref() {
+            let video_ids = pending
+                .iter()
+                .map(|candidate| candidate.video_id.clone())
+                .collect::<Vec<_>>();
+            match api.videos(&video_ids).await {
+                Ok(mut metadata_by_id) => {
+                    for candidate in pending {
+                        if let Some(metadata) = metadata_by_id.remove(&candidate.video_id) {
+                            if self.gate_candidate_with_metadata(&candidate, metadata)? {
+                                promoted += 1;
+                            }
+                        } else {
+                            self.defer_gate_error(
+                                &candidate,
+                                "videos.list 未返回该视频，稍后复查",
+                            )?;
+                        }
+                    }
+                    return Ok(GateOutcome {
+                        processed,
+                        promoted,
+                    });
+                }
+                Err(error) => {
+                    if error.is_quota_exceeded() {
+                        tracing::warn!(error = %error, "Data API 配额不可用，gate 降级到 yt-dlp");
+                    } else {
+                        tracing::warn!(error = %error, "Data API 元数据不可用，gate 降级到 yt-dlp");
+                    }
+                }
+            }
+        }
+
+        for candidate in pending {
+            if self.gate_candidate_with_ytdlp(&candidate).await? {
+                promoted += 1;
+            }
+        }
+        Ok(GateOutcome {
+            processed,
+            promoted,
+        })
+    }
+
+    async fn gate_candidate_with_ytdlp(&self, candidate: &VideoCandidate) -> Result<bool> {
+        let metadata = match self.fetch_metadata(&candidate.url).await {
+            Ok((metadata, _, _)) => metadata,
+            Err(error) if is_live_content_pending(&error) => {
+                self.defer_gate_error(candidate, &error.to_string())?;
+                return Ok(false);
+            }
+            Err(error) if exceeds_duration_limit(&error) => {
+                self.reject_over_duration(candidate, &error)?;
+                return Ok(false);
+            }
+            Err(error) => {
+                self.defer_gate_error(candidate, &format!("元数据获取失败: {error:#}"))?;
+                tracing::warn!(video_id = %candidate.video_id, error = %error, "候选元数据获取失败，延后重试");
+                return Ok(false);
+            }
+        };
+        self.gate_candidate_with_metadata(candidate, metadata)
+    }
+
+    fn gate_candidate_with_metadata(
+        &self,
+        candidate: &VideoCandidate,
+        metadata: VideoMetadata,
+    ) -> Result<bool> {
+        let source_language_mismatch =
+            metadata
+                .default_audio_language
+                .as_deref()
+                .is_some_and(|actual| {
+                    !source_language_matches(&self.config.translation.source_lang, actual)
+                });
+        self.db.mark_video_candidate_source_language(
+            &candidate.video_id,
+            metadata.default_audio_language.as_deref(),
+            source_language_mismatch,
+        )?;
+        if metadata
+            .live_status
+            .as_deref()
+            .is_some_and(|status| LIVE_STATUS_NOT_READY.contains(&status))
+        {
+            self.defer_gate_error(candidate, LIVE_CONTENT_PENDING_PREFIX)?;
+            return Ok(false);
+        }
+        if let Err(error) =
+            validate_duration(metadata.duration, self.config.youtube.max_duration_seconds)
+        {
+            self.reject_over_duration(candidate, &error)?;
+            return Ok(false);
+        }
+
+        if is_backlog_replay(&metadata, self.db.live_replay_cutoff()?) {
+            self.db
+                .reject_video_candidate(&candidate.video_id, "历史直播回放，不自动入队")?;
+            tracing::info!(video_id = %candidate.video_id, "历史直播回放，不自动入队");
+            return Ok(false);
+        }
+
+        let published_at = metadata
+            .timestamp
+            .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))
+            .or(candidate.published_at);
+        if let Some(channel_id) = candidate.channel_id
+            && let Some(baseline) = self.db.channel_baseline(channel_id)?
+        {
+            match published_at {
+                Some(published_at) if published_at > baseline => {}
+                Some(_) => {
+                    self.db.reject_video_candidate(
+                        &candidate.video_id,
+                        "候选发布时间不晚于频道 baseline",
+                    )?;
+                    return Ok(false);
+                }
+                None => {
+                    self.db.reject_video_candidate(
+                        &candidate.video_id,
+                        "候选缺少发布时间，拒绝补录历史视频",
+                    )?;
+                    return Ok(false);
+                }
+            }
+        }
+
+        // 语言告警和硬闸门放在最后：对一个马上要因为 baseline／时长／历史回放
+        // 被拒的候选报「语言不符」毫无意义，而首轮扫描里这类候选占 99%（线上
+        // 1384 条里 1379 条被拒），早报会刷出几百条 WARN 把真问题淹掉。
+        // 走到这里说明候选确实要入队了，此时语言不符才值得关注。
+        if source_language_mismatch {
+            let actual = metadata
+                .default_audio_language
+                .as_deref()
+                .expect("mismatch=true 时必有语言值");
+            tracing::warn!(
+                video_id = %candidate.video_id,
+                expected = %self.config.translation.source_lang,
+                actual,
+                hard_gate = self.config.translation.enforce_source_lang,
+                "即将入队的视频默认音频语言与配置源语言不符"
+            );
+            if self.config.translation.enforce_source_lang {
+                self.db.reject_video_candidate(
+                    &candidate.video_id,
+                    &format!(
+                        "源语言不匹配: defaultAudioLanguage={actual}, expected={}",
+                        self.config.translation.source_lang
+                    ),
+                )?;
+                return Ok(false);
+            }
+        }
+
+        self.db
+            .promote_video_candidate(candidate, Some(&metadata.title), published_at)
+    }
+
+    fn defer_gate_error(&self, candidate: &VideoCandidate, error: &str) -> Result<()> {
+        let next_gate_at = Utc::now() + chrono::Duration::from_std(RECHECK_INTERVAL)?;
+        self.db
+            .defer_video_candidate(&candidate.video_id, next_gate_at, error)?;
+        tracing::info!(video_id = %candidate.video_id, %next_gate_at, "候选延后复查");
+        Ok(())
+    }
+
+    fn reject_over_duration(
+        &self,
+        candidate: &VideoCandidate,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        self.db.record_over_duration_video(
+            &candidate.video_id,
+            candidate.channel_id,
+            self.config.youtube.max_duration_seconds,
+            &error.to_string(),
+        )?;
+        self.db
+            .reject_video_candidate(&candidate.video_id, &error.to_string())?;
+        tracing::info!(video_id = %candidate.video_id, error = %error, "候选超过时长上限，持久化拒绝");
+        Ok(())
     }
 
     /// RSS 拉取失败时回退到 yt-dlp 频道列表（带每频道冷却，防止高频拉取）。
@@ -736,6 +1659,7 @@ impl Monitor {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 live_status: live,
+                default_audio_language: None,
             },
             out.peak_rss_kib,
             out.duration_ms,
@@ -746,6 +1670,120 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    async fn mock_response(
+        status: u16,
+        extra_headers: &str,
+        body: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let headers = extra_headers.to_string();
+        let body = body.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}/feed"), server)
+    }
+
+    async fn mock_json_sequence(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 16 * 1024];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{address}/youtube/v3"), server)
+    }
+
+    fn empty_ytdlp(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-yt-dlp");
+        std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' '{\"entries\":[]}'\n").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn gate_ytdlp(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("gate-yt-dlp");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+url=""
+for arg in "$@"; do url="$arg"; done
+case "$url" in
+  *livevideo01*) printf '%s\n' '{"_type":"video","id":"livevideo01","title":"live","duration":10,"timestamp":2000000000,"live_status":"is_live"}' ;;
+  *longvideo01*) printf '%s\n' '{"_type":"video","id":"longvideo01","title":"long","duration":8000,"timestamp":2000000000,"live_status":"not_live"}' ;;
+  *oldreplay01*) printf '%s\n' '{"_type":"video","id":"oldreplay01","title":"old replay","duration":10,"timestamp":1600000000,"live_status":"was_live"}' ;;
+  *baseline001*) printf '%s\n' '{"_type":"video","id":"baseline001","title":"old normal","duration":10,"timestamp":1600000000,"live_status":"not_live"}' ;;
+  *) printf '%s\n' '{"_type":"video","id":"normalvid01","title":"normal","duration":10,"timestamp":2000000000,"live_status":"not_live"}' ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn discovery_only_ytdlp(dir: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("discovery-yt-dlp");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+case " $* " in
+  *" --flat-playlist "*) printf '%s\n' '{"entries":[{"id":"normalvid01","title":"normal","url":"https://www.youtube.com/watch?v=normalvid01"}]}' ;;
+  *) exit 97 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn add_test_channel(db: &Database, feed_url: &str, suffix: &str) -> i64 {
+        db.add_channel(
+            &format!("UC-{suffix}"),
+            suffix,
+            &format!("https://www.youtube.com/@{suffix}"),
+            feed_url,
+            TransferMode::Direct,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn manual_queue_rejects_playlists_and_live_content() {
@@ -893,25 +1931,35 @@ mod tests {
     #[test]
     fn live_recheck_throttles_but_does_not_blacklist_forever() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(&dir.path().join("x.db")).unwrap();
-        let monitor = Monitor::new(Config::default(), db).unwrap();
+        let path = dir.path().join("x.db");
+        let db = Database::open(&path).unwrap();
+        db.insert_video_candidate(NewVideoCandidate {
+            video_id: "abcdefghijk",
+            channel_id: None,
+            url: "https://www.youtube.com/watch?v=abcdefghijk",
+            title: None,
+            published_at: None,
+            source: CandidateSource::Rss,
+        })
+        .unwrap();
+        let next_gate_at = Utc::now() + chrono::Duration::from_std(RECHECK_INTERVAL).unwrap();
+        db.defer_video_candidate("abcdefghijk", next_gate_at, "直播尚未就绪")
+            .unwrap();
+        assert!(db.due_video_candidates(Utc::now(), 10).unwrap().is_empty());
+        drop(db);
+
+        // 延后时间跨重启保留，到点后重新进入 gate，而不是永久拉黑。
+        let reopened = Database::open(&path).unwrap();
         assert!(
-            !monitor.recheck_is_throttled("abc"),
-            "没记录过的视频应立即检查"
+            reopened
+                .due_video_candidates(next_gate_at - chrono::Duration::milliseconds(1), 10)
+                .unwrap()
+                .is_empty()
         );
-        monitor
-            .deferred_videos
-            .lock()
-            .unwrap()
-            .insert("abc".into(), std::time::Instant::now());
-        assert!(monitor.recheck_is_throttled("abc"), "刚确认过应节流");
-        // 超过复查间隔后必须重新检查，否则直播中发现的视频永远等不到回放入队。
-        monitor
-            .deferred_videos
-            .lock()
-            .unwrap()
-            .insert("abc".into(), std::time::Instant::now() - RECHECK_INTERVAL);
-        assert!(!monitor.recheck_is_throttled("abc"));
+        assert_eq!(
+            reopened.due_video_candidates(next_gate_at, 10).unwrap()[0].video_id,
+            "abcdefghijk"
+        );
     }
 
     #[test]
@@ -963,6 +2011,273 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, b"feed");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rss_404_is_not_retried() {
+        let (url, server) = mock_response(404, "", "missing").await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("rss.db")).unwrap();
+        let monitor = Monitor::new(Config::default(), db).unwrap();
+        let error = monitor.fetch_feed_bytes(&url).await.unwrap_err();
+        assert!(matches!(
+            error,
+            FeedFetchError::Http {
+                status: StatusCode::NOT_FOUND,
+                ..
+            }
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rss_429_honors_retry_after() {
+        let before = Utc::now();
+        let (url, server) = mock_response(429, "Retry-After: 123\r\n", "limited").await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("rss.db")).unwrap();
+        let monitor = Monitor::new(Config::default(), db).unwrap();
+        let error = monitor.fetch_feed_bytes(&url).await.unwrap_err();
+        let retry_at = error.retry_at().expect("应读取 Retry-After");
+        let seconds = (retry_at - before).num_seconds();
+        assert!((122..=123).contains(&seconds), "实际退避 {seconds}s");
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn channel_backoff_has_jitter_and_is_persisted() {
+        let base = Duration::from_secs(60);
+        assert_eq!(jittered_backoff(base, 0, 0.5), Duration::from_secs(30));
+        assert_eq!(jittered_backoff(base, 0, 1.5), Duration::from_secs(90));
+        assert_eq!(jittered_backoff(base, 2, 1.0), Duration::from_secs(240));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poll-state.db");
+        let db = Database::open(&path).unwrap();
+        let id = add_test_channel(&db, "https://example.invalid/feed", "persist");
+        let next = Utc::now() + chrono::Duration::minutes(5);
+        db.finish_channel_poll(id, Some("failed"), true, next)
+            .unwrap();
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        let channel = reopened.list_channels().unwrap().remove(0);
+        assert_eq!(channel.consecutive_failures, 1);
+        assert_eq!(channel.last_error.as_deref(), Some("failed"));
+        assert!(
+            channel
+                .next_poll_at
+                .is_some_and(|stored| stored.timestamp_millis() == next.timestamp_millis())
+        );
+        assert!(
+            reopened
+                .list_due_channels(next - chrono::Duration::milliseconds(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reopened.list_due_channels(next).unwrap()[0].id, id);
+    }
+
+    #[test]
+    fn predictive_window_uses_timezone_fallback_and_rolling_history() {
+        let mut config = Config::default();
+        config.monitor.prediction_window_minutes = 60;
+        let timezone: Tz = "America/New_York".parse().unwrap();
+        let published = |month, day| {
+            timezone
+                .with_ymd_and_hms(2026, month, day, 10, 10, 0)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let mut history = vec![
+            published(1, 5),
+            published(1, 12),
+            published(1, 19),
+            published(1, 26),
+        ];
+        let now = timezone
+            .with_ymd_and_hms(2026, 7, 6, 10, 30, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let fallback = prediction_poll_decision(
+            &config,
+            &history,
+            now,
+            timezone,
+            QuotaDegradation::Normal,
+            false,
+        );
+        assert_eq!(fallback.mode, DataApiPollMode::InsufficientHistory);
+        assert_eq!(fallback.interval, Duration::from_secs(5 * 60));
+
+        // 第 5 条发布记录加入后不重启、不用缓存重建，下一次计算立即进入热窗。
+        history.push(published(2, 2));
+        let rolled = prediction_poll_decision(
+            &config,
+            &history,
+            now,
+            timezone,
+            QuotaDegradation::Normal,
+            false,
+        );
+        assert_eq!(rolled.mode, DataApiPollMode::PredictedHot);
+        assert_eq!(rolled.interval, Duration::from_secs(60));
+
+        // 冬夏令时下 UTC 小时不同；若忽略 runtime.timezone，这里会被误判为冷区。
+        let wrong_timezone = prediction_poll_decision(
+            &config,
+            &history,
+            now,
+            chrono_tz::UTC,
+            QuotaDegradation::Normal,
+            false,
+        );
+        assert_eq!(wrong_timezone.mode, DataApiPollMode::PredictedCold);
+
+        let just_before_window = timezone
+            .with_ymd_and_hms(2026, 7, 6, 9, 50, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        let boundary_wakeup = prediction_poll_decision(
+            &config,
+            &history,
+            just_before_window,
+            timezone,
+            QuotaDegradation::Normal,
+            false,
+        );
+        assert_eq!(boundary_wakeup.mode, DataApiPollMode::PredictedCold);
+        assert_eq!(boundary_wakeup.interval, Duration::from_secs(10 * 60));
+
+        let hot_window_edge = timezone
+            .with_ymd_and_hms(2026, 7, 6, 10, 10, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            prediction_poll_decision(
+                &config,
+                &history,
+                hot_window_edge,
+                timezone,
+                QuotaDegradation::Normal,
+                false,
+            )
+            .mode,
+            DataApiPollMode::PredictedHot
+        );
+        assert_eq!(
+            prediction_poll_decision(
+                &config,
+                &history,
+                hot_window_edge,
+                timezone,
+                QuotaDegradation::NarrowHot,
+                false,
+            )
+            .mode,
+            DataApiPollMode::PredictedCold
+        );
+
+        let cold_now = timezone
+            .with_ymd_and_hms(2026, 7, 6, 14, 30, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        let cold = prediction_poll_decision(
+            &config,
+            &history,
+            cold_now,
+            timezone,
+            QuotaDegradation::ExtendCold,
+            false,
+        );
+        assert_eq!(cold.mode, DataApiPollMode::PredictedCold);
+        assert_eq!(cold.interval, Duration::from_secs(60 * 60));
+    }
+
+    #[test]
+    fn rss_circuit_uses_sliding_failure_rate_threshold() {
+        let start = Instant::now();
+        let mut circuit = RssCircuitWindow::default();
+        for index in 0..7 {
+            assert!(!circuit.record(index < 5, start + Duration::from_secs(index)));
+        }
+        assert!(circuit.record(false, start + Duration::from_secs(7)));
+
+        let mut below_threshold = RssCircuitWindow::default();
+        for index in 0..8 {
+            assert!(!below_threshold.record(index < 4, start + Duration::from_secs(index)));
+        }
+        // 窗口外的失败样本必须被淘汰，不能永久污染全局判定。
+        assert!(!below_threshold.record(false, start + RSS_CIRCUIT_WINDOW));
+    }
+
+    #[tokio::test]
+    async fn every_poll_exit_path_writes_channel_state() {
+        const EMPTY_FEED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>test</id><title>test</title><updated>2026-08-15T00:00:00Z</updated>
+</feed>"#;
+
+        // 1. RSS 成功。
+        let dir = tempfile::tempdir().unwrap();
+        let (url, server) =
+            mock_response(200, "Content-Type: application/atom+xml\r\n", EMPTY_FEED).await;
+        let db = Database::open(&dir.path().join("success.db")).unwrap();
+        let id = add_test_channel(&db, &url, "success");
+        let monitor = Monitor::new(Config::default(), db.clone()).unwrap();
+        assert_eq!(monitor.poll_channel(id, true).await.unwrap(), 0);
+        server.await.unwrap();
+        let state = db.list_channels().unwrap().remove(0);
+        assert!(state.last_checked_at.is_some());
+        assert!(state.last_error.is_none());
+
+        // 2. RSS 返回无效 Atom。
+        let dir = tempfile::tempdir().unwrap();
+        let (url, server) = mock_response(200, "", "not atom").await;
+        let db = Database::open(&dir.path().join("invalid.db")).unwrap();
+        let id = add_test_channel(&db, &url, "invalid");
+        let monitor = Monitor::new(Config::default(), db.clone()).unwrap();
+        assert!(monitor.poll_channel(id, true).await.is_err());
+        server.await.unwrap();
+        let state = db.list_channels().unwrap().remove(0);
+        assert!(state.last_checked_at.is_some());
+        assert!(state.last_error.is_some());
+
+        // 3. RSS 失败，但获准的 yt-dlp 回退成功；旧错误必须被清掉。
+        let dir = tempfile::tempdir().unwrap();
+        let (url, server) = mock_response(404, "", "missing").await;
+        let db = Database::open(&dir.path().join("fallback-success.db")).unwrap();
+        let id = add_test_channel(&db, &url, "fallback-success");
+        db.mark_channel_checked(id, Some("old error")).unwrap();
+        let mut config = Config::default();
+        config.youtube.yt_dlp = empty_ytdlp(dir.path());
+        let monitor = Monitor::new(config, db.clone()).unwrap();
+        assert_eq!(monitor.poll_channel(id, true).await.unwrap(), 0);
+        server.await.unwrap();
+        let state = db.list_channels().unwrap().remove(0);
+        assert!(state.last_checked_at.is_some());
+        assert!(state.last_error.is_none());
+        assert_eq!(state.consecutive_failures, 1);
+
+        // 4. RSS 与回退都失败（这里用单频道冷却稳定触发）。
+        let dir = tempfile::tempdir().unwrap();
+        let (url, server) = mock_response(404, "", "missing").await;
+        let db = Database::open(&dir.path().join("fallback-error.db")).unwrap();
+        let id = add_test_channel(&db, &url, "fallback-error");
+        let monitor = Monitor::new(Config::default(), db.clone()).unwrap();
+        assert_eq!(monitor.claim_fallback_slot(id), FallbackClaim::Allowed);
+        assert!(monitor.poll_channel(id, true).await.is_err());
+        server.await.unwrap();
+        let state = db.list_channels().unwrap().remove(0);
+        assert!(state.last_checked_at.is_some());
+        assert!(state.last_error.is_some());
+        assert_eq!(state.consecutive_failures, 1);
     }
 
     #[test]
@@ -1018,5 +2333,379 @@ mod tests {
         );
         assert_eq!(reconcile_after_baseline(Some(baseline), None), None);
         assert_eq!(reconcile_after_baseline(None, None), Some(true));
+    }
+
+    #[tokio::test]
+    async fn discovery_sources_only_persist_candidates() {
+        const FEED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:yt="http://www.youtube.com/xml/schemas/2015">
+  <id>test</id><title>test</title><updated>2035-01-01T00:00:00Z</updated>
+  <entry>
+    <id>yt:video:normalvid01</id><yt:videoId>normalvid01</yt:videoId>
+    <title>normal</title>
+    <link rel="alternate" href="https://www.youtube.com/watch?v=normalvid01" />
+    <published>2035-01-01T00:00:00Z</published><updated>2035-01-01T00:00:00Z</updated>
+  </entry>
+</feed>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (url, server) =
+            mock_response(200, "Content-Type: application/atom+xml\r\n", FEED).await;
+        let db = Database::open(&dir.path().join("rss-candidate.db")).unwrap();
+        let id = add_test_channel(&db, &url, "rss-candidate");
+        let mut config = Config::default();
+        config.youtube.yt_dlp = dir
+            .path()
+            .join("must-not-run")
+            .to_string_lossy()
+            .into_owned();
+        let monitor = Monitor::new(config, db.clone()).unwrap();
+        assert_eq!(monitor.poll_channel(id, true).await.unwrap(), 1);
+        server.await.unwrap();
+        let candidate = db.get_video_candidate("normalvid01").unwrap().unwrap();
+        assert_eq!(candidate.source, CandidateSource::Rss);
+        assert_eq!(candidate.gate_state, crate::model::GateState::Pending);
+        assert!(db.get_job_by_video_id("normalvid01").unwrap().is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("ytdlp-candidate.db")).unwrap();
+        let id = add_test_channel(&db, "https://example.invalid/feed", "ytdlp-candidate");
+        let mut config = Config::default();
+        config.youtube.yt_dlp = discovery_only_ytdlp(dir.path());
+        let monitor = Monitor::new(config, db.clone()).unwrap();
+        assert_eq!(
+            monitor
+                .reconcile_channel(id, "https://www.youtube.com/@candidate")
+                .await
+                .unwrap(),
+            1
+        );
+        let candidate = db.get_video_candidate("normalvid01").unwrap().unwrap();
+        assert_eq!(candidate.source, CandidateSource::Ytdlp);
+        assert!(db.get_job_by_video_id("normalvid01").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn gate_worker_covers_every_state_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("gate.db")).unwrap();
+        let channel_id = add_test_channel(&db, "https://example.invalid/feed", "gate");
+        for video_id in [
+            "livevideo01",
+            "longvideo01",
+            "oldreplay01",
+            "baseline001",
+            "normalvid01",
+            "deferred001",
+        ] {
+            db.insert_video_candidate(NewVideoCandidate {
+                video_id,
+                channel_id: Some(channel_id),
+                url: &format!("https://www.youtube.com/watch?v={video_id}"),
+                title: None,
+                published_at: None,
+                source: CandidateSource::Rss,
+            })
+            .unwrap();
+        }
+        db.defer_video_candidate(
+            "deferred001",
+            Utc::now() - chrono::Duration::seconds(1),
+            "先前暂缓",
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.youtube.yt_dlp = gate_ytdlp(dir.path());
+        let monitor =
+            Monitor::new_with_data_api(config, db.clone(), None, "http://127.0.0.1:9/youtube/v3")
+                .unwrap();
+        assert_eq!(
+            monitor.gate_pending_candidates(20).await.unwrap().promoted,
+            2
+        );
+
+        let state = |video_id| db.get_video_candidate(video_id).unwrap().unwrap();
+        let live = state("livevideo01");
+        assert_eq!(live.gate_state, crate::model::GateState::Deferred);
+        assert!(live.next_gate_at.is_some());
+        assert_eq!(live.gate_attempts, 1);
+
+        for video_id in ["longvideo01", "oldreplay01", "baseline001"] {
+            let candidate = state(video_id);
+            assert_eq!(candidate.gate_state, crate::model::GateState::Rejected);
+            assert_eq!(candidate.gate_attempts, 1);
+        }
+        assert!(db.is_over_duration_video("longvideo01", 7200).unwrap());
+
+        for video_id in ["normalvid01", "deferred001"] {
+            let candidate = state(video_id);
+            assert_eq!(candidate.gate_state, crate::model::GateState::Promoted);
+            assert!(db.get_job_by_video_id(video_id).unwrap().is_some());
+        }
+        assert_eq!(state("deferred001").gate_attempts, 2);
+        assert!(db.due_video_candidates(Utc::now(), 20).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn data_api_discovers_upload_playlist_candidates() {
+        let channels = r#"{"items":[{"id":"UC-data-api","contentDetails":{"relatedPlaylists":{"uploads":"UU-data-api"}}}]}"#;
+        let playlist = r#"{"items":[{"snippet":{"title":"from api","publishedAt":"2035-01-01T00:00:00Z","resourceId":{"videoId":"normalvid01"}},"contentDetails":{"videoId":"normalvid01"}}]}"#;
+        let (base_url, server) = mock_json_sequence(vec![(200, channels), (200, playlist)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("data-api.db")).unwrap();
+        add_test_channel(&db, "https://example.invalid/feed", "data-api");
+        let monitor =
+            Monitor::new_with_data_api(Config::default(), db.clone(), Some("test-key"), &base_url)
+                .unwrap();
+        assert_eq!(monitor.poll_data_api().await.unwrap(), 1);
+        server.await.unwrap();
+
+        let channel = db.list_channels().unwrap().remove(0);
+        assert_eq!(channel.uploads_playlist_id.as_deref(), Some("UU-data-api"));
+        let candidate = db.get_video_candidate("normalvid01").unwrap().unwrap();
+        assert_eq!(candidate.source, CandidateSource::DataApi);
+        assert_eq!(candidate.title.as_deref(), Some("from api"));
+        assert!(db.get_job_by_video_id("normalvid01").unwrap().is_none());
+        assert_eq!(
+            db.get_discovery_state("quota_used_today")
+                .unwrap()
+                .as_deref(),
+            Some("2")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_api_deep_scan_falls_back_to_ytdlp_reconcile() {
+        let channels = r#"{"items":[{"id":"UC-deep-scan","contentDetails":{"relatedPlaylists":{"uploads":"UU-deep-scan"}}}]}"#;
+        let (base_url, server) = mock_json_sequence(vec![
+            (200, channels),
+            (500, r#"{"error":{"message":"temporary"}}"#),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("deep-scan.db")).unwrap();
+        add_test_channel(&db, "https://example.invalid/feed", "deep-scan");
+        let mut config = Config::default();
+        config.youtube.yt_dlp = discovery_only_ytdlp(dir.path());
+        let monitor =
+            Monitor::new_with_data_api(config, db.clone(), Some("test-key"), &base_url).unwrap();
+
+        assert_eq!(monitor.deep_scan_all().await.unwrap(), 1);
+        server.await.unwrap();
+        let candidate = db.get_video_candidate("normalvid01").unwrap().unwrap();
+        assert_eq!(candidate.source, CandidateSource::Ytdlp);
+    }
+
+    #[tokio::test]
+    async fn first_quota_degradation_stops_daily_deep_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("skip-deep-scan.db")).unwrap();
+        add_test_channel(&db, "https://example.invalid/feed", "skip-deep-scan");
+        db.set_discovery_state(
+            "quota_used_today",
+            &crate::youtube_api::QUOTA_SKIP_DEEP_SCAN_AT.to_string(),
+        )
+        .unwrap();
+        db.set_discovery_state(
+            "quota_reset_at",
+            &(Utc::now() + chrono::Duration::hours(6)).to_rfc3339(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.youtube.yt_dlp = dir
+            .path()
+            .join("must-not-run")
+            .to_string_lossy()
+            .into_owned();
+        let monitor = Monitor::new_with_data_api(
+            config,
+            db,
+            Some("test-key"),
+            "http://127.0.0.1:9/youtube/v3",
+        )
+        .unwrap();
+        assert_eq!(monitor.deep_scan_all().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn data_api_metadata_drives_gate_without_ytdlp() {
+        let videos = r#"{"items":[
+          {"id":"normalvid01","snippet":{"title":"normal api","publishedAt":"2035-01-01T00:00:00Z","channelId":"UC-api-gate","liveBroadcastContent":"none"},"contentDetails":{"duration":"PT10S"}},
+          {"id":"livevideo01","snippet":{"title":"live api","publishedAt":"2035-01-01T00:00:00Z","channelId":"UC-api-gate","liveBroadcastContent":"live"},"contentDetails":{"duration":"PT10S"},"liveStreamingDetails":{"actualStartTime":"2035-01-01T00:00:00Z"}}
+        ]}"#;
+        let (base_url, server) = mock_json_sequence(vec![(200, videos)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("api-gate.db")).unwrap();
+        let channel_id = add_test_channel(&db, "https://example.invalid/feed", "api-gate");
+        for video_id in ["normalvid01", "livevideo01"] {
+            db.insert_video_candidate(NewVideoCandidate {
+                video_id,
+                channel_id: Some(channel_id),
+                url: &format!("https://www.youtube.com/watch?v={video_id}"),
+                title: None,
+                published_at: None,
+                source: CandidateSource::DataApi,
+            })
+            .unwrap();
+        }
+        let mut config = Config::default();
+        config.youtube.yt_dlp = dir
+            .path()
+            .join("must-not-run")
+            .to_string_lossy()
+            .into_owned();
+        let monitor =
+            Monitor::new_with_data_api(config, db.clone(), Some("test-key"), &base_url).unwrap();
+        assert_eq!(
+            monitor.gate_pending_candidates(10).await.unwrap().promoted,
+            1
+        );
+        server.await.unwrap();
+        assert!(db.get_job_by_video_id("normalvid01").unwrap().is_some());
+        assert_eq!(
+            db.get_video_candidate("livevideo01")
+                .unwrap()
+                .unwrap()
+                .gate_state,
+            crate::model::GateState::Deferred
+        );
+    }
+
+    #[tokio::test]
+    async fn source_language_mismatch_warns_and_marks_but_does_not_block_by_default() {
+        let videos = r#"{"items":[{"id":"language001","snippet":{"title":"language","publishedAt":"2035-01-01T00:00:00Z","channelId":"UC-language","liveBroadcastContent":"none","defaultAudioLanguage":"ja"},"contentDetails":{"duration":"PT10S"},"status":{"privacyStatus":"public"}}]}"#;
+        let (base_url, server) = mock_json_sequence(vec![(200, videos)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("language.db")).unwrap();
+        let channel_id = add_test_channel(&db, "https://example.invalid/feed", "language");
+        db.insert_video_candidate(NewVideoCandidate {
+            video_id: "language001",
+            channel_id: Some(channel_id),
+            url: "https://www.youtube.com/watch?v=language001",
+            title: None,
+            published_at: None,
+            source: CandidateSource::DataApi,
+        })
+        .unwrap();
+        let config = Config::default();
+        assert!(!config.translation.enforce_source_lang);
+        let monitor =
+            Monitor::new_with_data_api(config, db.clone(), Some("test-key"), &base_url).unwrap();
+
+        assert_eq!(
+            monitor.gate_pending_candidates(10).await.unwrap().promoted,
+            1
+        );
+        server.await.unwrap();
+        assert!(db.get_job_by_video_id("language001").unwrap().is_some());
+        let candidate = db.get_video_candidate("language001").unwrap().unwrap();
+        assert_eq!(candidate.source_language.as_deref(), Some("ja"));
+        assert!(candidate.source_language_mismatch);
+        assert!(source_language_matches("en", "en-GB"));
+    }
+
+    /// `zxx`（无语言内容）和 `und`（未确定）不是「另一种语言」，不能算不符。
+    /// 线上首轮扫描里 `zxx` 一个值就刷了 67 条误报告警。
+    #[test]
+    fn unknown_language_tags_are_not_treated_as_mismatch() {
+        for tag in ["zxx", "und", "ZXX", "zxx-ZZ", ""] {
+            assert!(
+                source_language_matches("en", tag),
+                "无法判定语言时应放行: {tag:?}"
+            );
+            assert!(
+                source_language_matches("ja", tag),
+                "与期望语言无关，一律放行: {tag:?}"
+            );
+        }
+        // 地区变体仍然算同一种语言。
+        for tag in ["en-GB", "en-US", "en-CA", "en_AU"] {
+            assert!(source_language_matches("en", tag), "地区变体应匹配: {tag}");
+        }
+        // 真正的外语仍然要报出来。
+        for tag in ["ru", "pt", "de-DE", "ja"] {
+            assert!(
+                !source_language_matches("en", tag),
+                "真实外语不应放行: {tag}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_api_key_gracefully_uses_ytdlp_gate_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("no-key.db")).unwrap();
+        db.insert_video_candidate(NewVideoCandidate {
+            video_id: "normalvid01",
+            channel_id: None,
+            url: "https://www.youtube.com/watch?v=normalvid01",
+            title: None,
+            published_at: None,
+            source: CandidateSource::Rss,
+        })
+        .unwrap();
+        let mut config = Config::default();
+        config.youtube.yt_dlp = gate_ytdlp(dir.path());
+        let monitor =
+            Monitor::new_with_data_api(config, db.clone(), None, "http://127.0.0.1:9/youtube/v3")
+                .unwrap();
+        assert!(!monitor.has_data_api());
+        assert_eq!(monitor.poll_data_api().await.unwrap(), 0);
+        assert_eq!(
+            monitor.gate_pending_candidates(10).await.unwrap().promoted,
+            1
+        );
+        assert!(db.get_job_by_video_id("normalvid01").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn unavailable_data_api_uses_ytdlp_gate_fallback() {
+        let (base_url, server) =
+            mock_json_sequence(vec![(500, r#"{"error":{"message":"temporary"}}"#)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("api-fallback.db")).unwrap();
+        db.insert_video_candidate(NewVideoCandidate {
+            video_id: "normalvid01",
+            channel_id: None,
+            url: "https://www.youtube.com/watch?v=normalvid01",
+            title: None,
+            published_at: None,
+            source: CandidateSource::DataApi,
+        })
+        .unwrap();
+        let mut config = Config::default();
+        config.youtube.yt_dlp = gate_ytdlp(dir.path());
+        let monitor =
+            Monitor::new_with_data_api(config, db.clone(), Some("test-key"), &base_url).unwrap();
+        assert_eq!(
+            monitor.gate_pending_candidates(10).await.unwrap().promoted,
+            1
+        );
+        server.await.unwrap();
+        assert!(db.get_job_by_video_id("normalvid01").unwrap().is_some());
+    }
+
+    #[test]
+    fn active_websub_lease_uses_configurable_thirty_minute_data_api_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("websub-interval.db")).unwrap();
+        let channel_id = add_test_channel(&db, "https://example.invalid/feed", "websub");
+        let now = Utc::now();
+        db.mark_websub_lease(channel_id, now + chrono::Duration::days(1))
+            .unwrap();
+        let mut config = Config::default();
+        config.websub.enabled = true;
+        config.websub.callback_base_url = "https://push.example.com".into();
+        assert_eq!(config.websub.data_api_poll_minutes, 30);
+        let monitor =
+            Monitor::new_with_data_api(config, db.clone(), None, "http://127.0.0.1:9/youtube/v3")
+                .unwrap();
+        let channel = db.channel(channel_id).unwrap();
+        let decision = monitor
+            .data_api_poll_decision(&channel, now, QuotaDegradation::Normal)
+            .unwrap();
+        assert_eq!(decision.mode, DataApiPollMode::WebSubFallback);
+        assert_eq!(decision.interval, Duration::from_secs(30 * 60));
     }
 }
