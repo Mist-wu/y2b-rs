@@ -30,5 +30,6 @@ pub fn metadata() -> VideoMetadata {
         thumbnail_url: Some("https://i.ytimg.com/vi/video/maxresdefault.jpg".into()),
         webpage_url: Some("https://www.youtube.com/watch?v=video".into()),
         live_status: Some("not_live".into()),
+        default_audio_language: Some("en".into()),
     }
 }
