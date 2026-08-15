@@ -8,6 +8,8 @@ pub mod pipeline;
 pub mod process;
 pub mod subtitle;
 pub mod tui;
+pub mod websub;
+pub mod youtube_api;
 
 pub use config::Config;
 pub use db::{Database, NewJob};

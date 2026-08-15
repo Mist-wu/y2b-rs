@@ -1,9 +1,16 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::process::Command;
+
+/// 单批闸门处理的候选数。
+///
+/// 取 50 是为了对齐 `videos.list` 的批量上限：闸门每轮最多发一次 videos.list，
+/// 一次 1 个配额单位。取小于 50（此前是 25）会让同样的候选量多花一倍配额。
+const GATE_BATCH: usize = 50;
 use y2b_rs::{
     Database, check,
     config::{AI_MODEL, AI_PROVIDER, AI_THINKING, Config},
@@ -11,7 +18,7 @@ use y2b_rs::{
     monitor::Monitor,
     pipeline::{self, AiCircuitBreaker, Pipeline},
     process::run_monitored,
-    tui,
+    tui, websub,
 };
 
 #[derive(Parser)]
@@ -54,6 +61,8 @@ enum Cmd {
     Model(ModelCmd),
     #[command(subcommand)]
     Login(LoginCmd),
+    #[command(subcommand)]
+    Websub(WebSubCmd),
 }
 #[derive(Subcommand)]
 enum ChannelCmd {
@@ -116,6 +125,20 @@ enum ModelCmd {
 enum LoginCmd {
     Bilibili,
     Youtube { cookies_file: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum WebSubCmd {
+    /// 列出每个频道的订阅、租约和最近推送状态。
+    Status,
+    /// 手动强制向 hub 提交订阅请求，供首次启用和排障使用。
+    Subscribe {
+        #[arg(long, conflicts_with = "channel", required_unless_present = "channel")]
+        all: bool,
+        /// y2b 内部数字 id 或 YouTube UC... channel id。
+        #[arg(long, value_name = "ID", conflicts_with = "all")]
+        channel: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -212,12 +235,43 @@ async fn main() -> Result<()> {
             ChannelCmd::Enable { id } => db.set_channel_enabled(id, true)?,
             ChannelCmd::Disable { id } => db.set_channel_enabled(id, false)?,
             ChannelCmd::Sync { id } => {
-                let m = Monitor::new(config, db)?;
-                if let Some(id) = id {
-                    println!("新增 {} 条", m.poll_channel(id, true).await?)
-                } else {
-                    println!("新增 {} 条", m.poll_all().await?)
+                // 手动 sync 的语义是「立刻同步一次」，所以要走和 discovery_loop
+                // 相同的源选择（Data API 优先），并把目标频道的调度提前到现在——
+                // 否则 next_data_api_poll_at 未到期时这条命令会静默什么都不做，
+                // 排障时完全看不出发生了什么。发现之后再跑一次闸门，让候选真正
+                // 变成任务，而不是停在 video_candidates 里。
+                let m = Monitor::new(config, db.clone())?;
+                let now = Utc::now();
+                let targets: Vec<i64> = match id {
+                    Some(id) => vec![id],
+                    None => db
+                        .list_channels()?
+                        .into_iter()
+                        .filter(|channel| channel.enabled)
+                        .map(|channel| channel.id)
+                        .collect(),
+                };
+                for channel_id in &targets {
+                    db.schedule_data_api_poll(*channel_id, now, None)?;
                 }
+                let discovered = if m.data_api_primary_enabled()? {
+                    m.poll_data_api().await?
+                } else if let Some(id) = id {
+                    m.poll_channel(id, true).await?
+                } else {
+                    m.poll_all().await?
+                };
+                let mut promoted = 0;
+                loop {
+                    let outcome = m.gate_pending_candidates(GATE_BATCH).await?;
+                    promoted += outcome.promoted;
+                    // 按 processed 判断是否还有活，不能看 promoted——整批被拒时
+                    // promoted 是 0，但候选确实处理了。
+                    if outcome.processed == 0 {
+                        break;
+                    }
+                }
+                println!("发现 {discovered} 条候选，入队 {promoted} 条");
             }
         },
         Cmd::Jobs(c) => match c {
@@ -341,11 +395,74 @@ async fn main() -> Result<()> {
                 run_monitored(c, Duration::from_secs(600)).await?;
             }
         },
+        Cmd::Websub(c) => match c {
+            WebSubCmd::Status => {
+                println!(
+                    "WebSub\t{}\t{}",
+                    if config.websub.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    if config.websub.callback_base_url.is_empty() {
+                        "-"
+                    } else {
+                        &config.websub.callback_base_url
+                    }
+                );
+                println!(
+                    "id\tyoutube_channel_id\tname\tstatus\tlease_expires_at\tlast_received_at"
+                );
+                let now = chrono::Utc::now();
+                for channel in db.list_websub_channels()? {
+                    let status = if !channel.enabled {
+                        "channel_disabled"
+                    } else {
+                        match channel.lease_expires_at {
+                            Some(expires_at) if expires_at > now => "active",
+                            Some(_) => "expired",
+                            None if channel.callback_path.is_some() => "pending_verification",
+                            None => "not_subscribed",
+                        }
+                    };
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        channel.id,
+                        channel.youtube_channel_id,
+                        channel.name,
+                        status,
+                        channel
+                            .lease_expires_at
+                            .map(|value| value.to_rfc3339())
+                            .unwrap_or_else(|| "-".into()),
+                        channel
+                            .last_received_at
+                            .map(|value| value.to_rfc3339())
+                            .unwrap_or_else(|| "-".into())
+                    );
+                }
+            }
+            WebSubCmd::Subscribe { all, channel } => {
+                anyhow::ensure!(
+                    config.websub.enabled,
+                    "请先在配置中设置 [websub] enabled = true 和公网 callback_base_url"
+                );
+                let service = websub::WebSubService::new(config.websub.clone(), db)?;
+                if all {
+                    let accepted = service.subscribe_all().await?;
+                    println!("已提交 {accepted} 个 WebSub 订阅请求，等待异步验证");
+                } else {
+                    let identifier = channel.context("缺少 --all 或 --channel <id>")?;
+                    service.subscribe_identifier(&identifier).await?;
+                    println!("频道 {identifier} 的 WebSub 订阅请求已提交，等待异步验证");
+                }
+            }
+        },
     }
     Ok(())
 }
 
-/// `watch` 的三条循环各自独立成任务。
+/// `watch` 的发现、闸门、维护和队列调度循环彼此独立。
 ///
 /// 此前发现（RSS 轮询、yt-dlp 校对）、维护（备份、认证）和队列调度共用一个
 /// `select!`：`select!` 选中某个分支后，该分支 `await` 期间其他分支不会被轮询，
@@ -363,13 +480,44 @@ async fn watch(config_path: PathBuf, config: Config, db: Database) -> Result<()>
         config.monitor.poll_seconds,
         config.monitor.reconcile_hours,
     ));
+    let gate = tokio::spawn(gate_loop(Monitor::new(config.clone(), db.clone())?));
     let maintenance = tokio::spawn(maintenance_loop(config.clone(), db.clone()));
+    let mut tasks = vec![discovery, gate, maintenance];
+    if config.websub.enabled {
+        let websub_config = config.websub.clone();
+        let websub_db = db.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(error) = websub::run(websub_config, websub_db).await {
+                tracing::error!(error = %error, "WebSub 服务退出");
+            }
+        }));
+    }
     let result = schedule_loop(&config_path, &config, &db).await;
-    for task in [discovery, maintenance] {
+    for task in tasks {
         task.abort();
         let _ = task.await;
     }
     result
+}
+
+/// 候选闸门独立运行，逐条拉元数据不会再阻塞 RSS/Data API 等轻量发现源。
+async fn gate_loop(monitor: Monitor) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        match monitor.gate_pending_candidates(GATE_BATCH).await {
+            Ok(outcome) if outcome.promoted > 0 => {
+                tracing::info!(
+                    promoted = outcome.promoted,
+                    processed = outcome.processed,
+                    "候选闸门晋级完成"
+                )
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(error = %error, "候选闸门处理失败"),
+        }
+    }
 }
 
 /// 每秒推进准备/上传队列，并在 Ctrl-C 时收尾。
@@ -448,12 +596,17 @@ async fn schedule_loop(
     outcome
 }
 
-/// RSS 轮询与 yt-dlp 校对。
+/// Data API 预测主发现、RSS 探针与每日深扫。
 ///
 /// 两者共用一个任务而不是各占一个：它们都会拉起 yt-dlp，并发执行会在 2 GiB
 /// 服务器上叠加内存压力。串行执行保持了原有的资源占用特征，同时不再阻塞调度。
 async fn discovery_loop(monitor: Monitor, poll_seconds: u64, reconcile_hours: u64) {
-    let mut poll = tokio::time::interval(Duration::from_secs(poll_seconds));
+    let data_api_enabled = monitor.has_data_api();
+    // 每秒只做一次轻量到期查询；实际请求间隔由 channels.next_data_api_poll_at
+    // 持久化控制，热窗 60 秒不会因为进程重启而变成无界满速。
+    let mut data_api_tick = tokio::time::interval(Duration::from_secs(1));
+    data_api_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut poll = tokio::time::interval(Duration::from_secs(poll_seconds.max(1)));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let reconcile_period = Duration::from_secs(reconcile_hours * 3600);
     let mut reconcile = tokio::time::interval_at(
@@ -463,14 +616,36 @@ async fn discovery_loop(monitor: Monitor, poll_seconds: u64, reconcile_hours: u6
     reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = data_api_tick.tick(), if data_api_enabled => {
+                match monitor.poll_data_api().await {
+                    Ok(discovered) if discovered > 0 => {
+                        tracing::info!(discovered, "Data API 主发现发现新候选")
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Data API 主发现失败，尝试 RSS/yt-dlp 降级");
+                        if let Err(fallback_error) = monitor.poll_all().await {
+                            tracing::error!(error = %fallback_error, "Data API 降级发现失败");
+                        }
+                    }
+                }
+            }
             _ = poll.tick() => {
-                if let Err(e) = monitor.poll_all().await {
+                let result = match monitor.data_api_primary_enabled() {
+                    Ok(true) => monitor.poll_rss_probes(2).await,
+                    Ok(false) => monitor.poll_all().await,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "读取 Data API 配额状态失败，回落到 RSS/yt-dlp");
+                        monitor.poll_all().await
+                    }
+                };
+                if let Err(e) = result {
                     tracing::error!(error = %e, "轮询失败");
                 }
             }
-            _ = reconcile.tick() => match monitor.reconcile_all().await {
-                Ok(n) => tracing::info!(added = n, "yt-dlp 校对完成"),
-                Err(e) => tracing::error!(error = %e, "yt-dlp 校对失败"),
+            _ = reconcile.tick() => match monitor.deep_scan_all().await {
+                Ok(n) => tracing::info!(added = n, "每日频道深扫完成"),
+                Err(e) => tracing::error!(error = %e, "每日频道深扫失败"),
             },
         }
     }
