@@ -289,12 +289,18 @@ impl Pipeline {
             bilibili_api::BiliSubtitleClient::from_cookies_file(&self.config.bilibili.cookies)?;
         let view = client.view(bvid).await?;
         if client.has_subtitle_lan(view.cid, "zh").await? {
-            // 已有中文字幕：待补状态的任务标记完成。
+            // `zh` 是投稿者提交的中文 CC；平台自动翻译使用 `zh-CN`，不能在这里
+            // 当成已完成，否则待补任务会被静默跳过。
             if job.status == JobStatus::UploadedOriginalPendingSubtitle {
                 self.db
                     .update_job_status(&job.id, JobStatus::Completed, None)?;
+                self.db.event(
+                    Some(&job.id),
+                    "info",
+                    "检测到已提交中文 CC 字幕（zh），补字幕任务完成",
+                )?;
             }
-            return Ok(format!("{bvid} 已有中文字幕，跳过"));
+            return Ok(format!("{bvid} 已有已提交中文 CC 字幕（zh），跳过"));
         }
         let work = self.config.runtime.download_dir.join(&meta.id);
         let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
