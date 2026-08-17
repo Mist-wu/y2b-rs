@@ -55,12 +55,10 @@ struct Cookie {
 }
 
 fn language_matches(actual: &str, requested: &str) -> bool {
-    let actual = actual.to_ascii_lowercase();
-    let requested = requested.to_ascii_lowercase();
-    actual == requested
-        || actual
-            .strip_prefix(&requested)
-            .is_some_and(|suffix| suffix.starts_with('-'))
+    // B站的 lan 不是可以按语言族折叠的普通 BCP 47 标签：`zh` 表示投稿者
+    // 提交的中文 CC，`zh-CN` 表示平台自动翻译。若用前缀匹配，自动翻译会被
+    // 误判成我们已经提交了 CC，字幕队列因而提前结束。
+    actual.eq_ignore_ascii_case(requested)
 }
 
 impl BiliSubtitleClient {
@@ -213,11 +211,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base_language_matches_bilibili_region_variants() {
+    fn submitted_language_does_not_match_bilibili_auto_translation() {
         assert!(language_matches("zh", "zh"));
-        assert!(language_matches("zh-CN", "zh"));
-        assert!(language_matches("zh-Hans", "zh"));
-        assert!(language_matches("ZH-cn", "zh"));
+        assert!(language_matches("ZH", "zh"));
+        assert!(!language_matches("zh-CN", "zh"));
+        assert!(!language_matches("zh-Hans", "zh"));
         assert!(!language_matches("en-US", "zh"));
         assert!(!language_matches("zho", "zh"));
     }
