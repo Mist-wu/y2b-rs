@@ -77,7 +77,7 @@ fn parse_ts(s: &str) -> Result<f64> {
 }
 
 fn clean_vtt_text(raw: &str, tags: &Regex) -> String {
-    sanitize_caption_text(&tags.replace_all(raw, ""))
+    normalize_caption_text(&tags.replace_all(raw, ""), false)
 }
 
 fn music_marker_regex() -> &'static Regex {
@@ -92,10 +92,10 @@ fn music_marker_regex() -> &'static Regex {
 
 /// 清理不应出现在成品字幕里的传输层和无障碍字幕标记。
 ///
-/// YouTube WebVTT 会把说话人提示写成 `&gt;&gt;`，如果不先解码并移除，
-/// 翻译模型会原样保留，B站最终就会显示成奇怪的 HTML 实体。背景音乐提示同理：
-/// 只删除方括号/括号形式的标签和音乐符号，不删除正常语句中的“音乐”一词。
-pub fn sanitize_caption_text(raw: &str) -> String {
+/// YouTube WebVTT 会把说话人提示写成 `&gt;&gt;`。源字幕先解码但保留 `>>`，
+/// 让分句和翻译仍能识别说话人切换；成品字幕再移除，避免 B站显示 HTML 实体或
+/// 箭头。背景音乐只删除方括号/括号形式的标签和音符，不删除正常语句中的“音乐”。
+fn normalize_caption_text(raw: &str, remove_speaker_markers: bool) -> String {
     // `&amp;` 必须最后解码，避免把 `&amp;gt;` 错误地二次解码成 `>`。
     let decoded = raw
         .replace("&lt;", "<")
@@ -107,9 +107,12 @@ pub fn sanitize_caption_text(raw: &str) -> String {
         .replace("&apos;", "'")
         .replace("&amp;", "&");
     let without_music = music_marker_regex().replace_all(&decoded, "");
-    let printable = without_music
-        .replace(">>", "")
-        .replace("＞＞", "")
+    let speaker_cleaned = if remove_speaker_markers {
+        without_music.replace(">>", "").replace("＞＞", "")
+    } else {
+        without_music.into_owned()
+    };
+    let printable = speaker_cleaned
         .chars()
         .filter(|c| !c.is_control() || *c == '\n')
         .filter(|c| {
@@ -120,6 +123,11 @@ pub fn sanitize_caption_text(raw: &str) -> String {
         })
         .collect::<String>();
     printable.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 生成成品字幕文本，移除内部保留的说话人标记。
+pub fn sanitize_caption_text(raw: &str) -> String {
+    normalize_caption_text(raw, true)
 }
 
 fn parse_inline_parts(
@@ -328,6 +336,18 @@ fn strip_rolling_overlap(carry: &str, text: &str, min_chars: usize) -> String {
         return text.to_string();
     }
     let limit = text.len().min(carry.len());
+    // YouTube 会在滚动窗口之间插入 0.01 秒的短快照，例如上一条以 `match?`
+    // 结尾，下一条只含 `match?`，再下一条又以 `match?` 开头。短词达不到常规
+    // 10 字符阈值，但“较短一侧被完整包含”足以证明它是滚动重叠。
+    if text.is_char_boundary(limit)
+        && carry.is_char_boundary(carry.len() - limit)
+        && text[..limit] == carry[carry.len() - limit..]
+    {
+        let rest = &text[limit..];
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            return rest.trim_start().to_string();
+        }
+    }
     if limit < min_chars {
         return text.to_string();
     }
@@ -457,7 +477,7 @@ Nice.
     }
 
     #[test]
-    fn vtt_cleanup_decodes_entities_and_removes_music_and_speaker_markers() {
+    fn vtt_cleanup_decodes_entities_and_removes_music_markers() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("captions.vtt");
         fs::write(
@@ -481,7 +501,10 @@ Brown noise and chill music.
             cues.iter()
                 .map(|cue| cue.source.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Looks good. Are you ready?", "Brown noise and chill music."]
+            vec![
+                ">> Looks good. Are you ready?",
+                "Brown noise and chill music."
+            ]
         );
     }
 
@@ -604,6 +627,23 @@ Brown noise and chill music.
         dedup_rolling(&mut cues);
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[1].source, "today ♪");
+    }
+
+    #[test]
+    fn rolling_dedup_removes_complete_short_snapshot_overlap() {
+        assert_eq!(strip_rolling_overlap("question match?", "match?", 10), "");
+        assert_eq!(
+            strip_rolling_overlap("Brown.", "Brown. Brown noise.", 10),
+            "Brown noise."
+        );
+        assert_eq!(
+            strip_rolling_overlap("Like", "Like Amazing.", 10),
+            "Amazing."
+        );
+        assert_eq!(
+            strip_rolling_overlap("No one expected this", "No, that's wrong.", 10),
+            "No, that's wrong."
+        );
     }
 
     #[test]
