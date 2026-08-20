@@ -173,14 +173,16 @@ fn source_ends_sentence(source: &str) -> bool {
 }
 
 /// 模型偶发把句末单词切成极短的孤儿 cue（如 `... feel` / `pressure.`）。若右侧
-/// 小于 0.75 秒、没有换说话人或静音，并且合并后仍满足全部硬上限，就接回上一句。
+/// 小于 0.75 秒且没有换说话人或静音，优先直接接回上一句；合并会超限时，把
+/// 前一范围末尾的原子 cue 移到右侧，避免在满足硬上限的代价下留下半句话。
 pub(super) fn merge_orphaned_short_ranges(
     cues: &[Cue],
     ranges: &[(usize, usize)],
 ) -> Result<Vec<(usize, usize)>> {
     validate_ranges_cover(cues.len(), ranges)?;
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(start, end) in ranges {
+    for &(range_start, end) in ranges {
+        let mut start = range_start;
         let Some(previous) = merged.last_mut() else {
             merged.push((start, end));
             continue;
@@ -188,16 +190,30 @@ pub(super) fn merge_orphaned_short_ranges(
         let right_duration = cues[end].end - cues[start].start;
         let gap = cues[start].start - cues[previous.1].end;
         let starts_speaker = cues[start].source.trim_start().starts_with(">>");
-        if right_duration <= 0.75
+        let orphaned = right_duration <= 0.75
             && gap < SEGMENT_REQUIRED_GAP_SECONDS
             && !starts_speaker
-            && !source_ends_sentence(&cues[previous.1].source)
-            && source_range_within_limits(cues, previous.0, end)
-        {
+            && !source_ends_sentence(&cues[previous.1].source);
+        if orphaned && source_range_within_limits(cues, previous.0, end) {
             previous.1 = end;
-        } else {
-            merged.push((start, end));
+            continue;
         }
+        if orphaned {
+            while previous.0 < previous.1 {
+                let shifted = previous.1;
+                if !source_range_within_limits(cues, previous.0, shifted - 1)
+                    || !source_range_within_limits(cues, shifted, end)
+                {
+                    break;
+                }
+                previous.1 = shifted - 1;
+                start = shifted;
+                if cues[end].end - cues[start].start > 0.75 {
+                    break;
+                }
+            }
+        }
+        merged.push((start, end));
     }
     validate_ranges_cover(cues.len(), &merged)?;
     Ok(merged)
@@ -1162,6 +1178,29 @@ mod tests {
         assert_eq!(
             merge_orphaned_short_ranges(&cues, &[(0, 0), (1, 1)]).unwrap(),
             vec![(0, 0), (1, 1)]
+        );
+    }
+
+    #[test]
+    fn orphaned_short_fragment_rebalances_when_direct_merge_exceeds_limit() {
+        let mut cues = vec![
+            cue(
+                0,
+                "one two three four five six seven eight nine ten eleven twelve",
+            ),
+            cue(1, "usually do not feel"),
+            cue(2, "pressure."),
+        ];
+        cues[0].start = 0.0;
+        cues[0].end = 3.0;
+        cues[1].start = 3.0;
+        cues[1].end = 4.0;
+        cues[2].start = 4.0;
+        cues[2].end = 4.4;
+        assert!(!source_range_within_limits(&cues, 0, 2));
+        assert_eq!(
+            merge_orphaned_short_ranges(&cues, &[(0, 1), (2, 2)]).unwrap(),
+            vec![(0, 0), (1, 2)]
         );
     }
 
