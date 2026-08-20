@@ -5,7 +5,8 @@
     "Natural contemporary Simplified Chinese",
     "Concise enough for two-line hard subtitles",
     "Avoid documentary narration tone",
-    "Preserve jokes, emphasis, uncertainty and speaker intent"
+    "Preserve jokes, emphasis, uncertainty and speaker intent",
+    "Render speaker turns with natural Chinese punctuation; never output >>, HTML entities, [music], or [音乐]"
   ],
   "glossary": {
     "Ash": "阿拾",
