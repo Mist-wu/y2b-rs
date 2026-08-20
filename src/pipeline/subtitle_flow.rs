@@ -164,6 +164,45 @@ pub(super) fn enforce_segment_limits(
     Ok(repaired)
 }
 
+fn source_ends_sentence(source: &str) -> bool {
+    source
+        .trim_end_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '"' | '\'' | '”' | '’' | ')' | ']')
+        })
+        .ends_with(['.', '!', '?'])
+}
+
+/// 模型偶发把句末单词切成极短的孤儿 cue（如 `... feel` / `pressure.`）。若右侧
+/// 小于 0.75 秒、没有换说话人或静音，并且合并后仍满足全部硬上限，就接回上一句。
+pub(super) fn merge_orphaned_short_ranges(
+    cues: &[Cue],
+    ranges: &[(usize, usize)],
+) -> Result<Vec<(usize, usize)>> {
+    validate_ranges_cover(cues.len(), ranges)?;
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for &(start, end) in ranges {
+        let Some(previous) = merged.last_mut() else {
+            merged.push((start, end));
+            continue;
+        };
+        let right_duration = cues[end].end - cues[start].start;
+        let gap = cues[start].start - cues[previous.1].end;
+        let starts_speaker = cues[start].source.trim_start().starts_with(">>");
+        if right_duration <= 0.75
+            && gap < SEGMENT_REQUIRED_GAP_SECONDS
+            && !starts_speaker
+            && !source_ends_sentence(&cues[previous.1].source)
+            && source_range_within_limits(cues, previous.0, end)
+        {
+            previous.1 = end;
+        } else {
+            merged.push((start, end));
+        }
+    }
+    validate_ranges_cover(cues.len(), &merged)?;
+    Ok(merged)
+}
+
 pub(super) fn validate_translation_indexes(
     len: usize,
     translations: &[(usize, String)],
@@ -692,13 +731,16 @@ impl Pipeline {
         let model_range_count = ranges.len();
         ranges = enforce_segment_limits(cues, &ranges)?;
         let hard_splits = ranges.len().saturating_sub(model_range_count);
+        let before_orphan_merge = ranges.len();
+        ranges = merge_orphaned_short_ranges(cues, &ranges)?;
+        let orphan_merges = before_orphan_merge.saturating_sub(ranges.len());
         let result = subtitle::apply_ranges(cues, &ranges)?;
         stage.finish(
             "completed",
             duration,
             peak,
             Some(&format!(
-                "{} -> {} cues; mode={}; estimated_tokens={estimated}; estimated_bytes={estimated_bytes}; calls={calls}; hard_splits={hard_splits}",
+                "{} -> {} cues; mode={}; estimated_tokens={estimated}; estimated_bytes={estimated_bytes}; calls={calls}; hard_splits={hard_splits}; orphan_merges={orphan_merges}",
                 cues.len(),
                 result.len(),
                 batch_mode_name(self.config.ai.batch_mode)
@@ -1102,6 +1144,25 @@ mod tests {
         let repaired = enforce_segment_limits(&cues, &[(0, 1)]).unwrap();
         assert_eq!(repaired, vec![(0, 0), (1, 1)]);
         assert!(!source_range_within_limits(&cues, 0, 0));
+    }
+
+    #[test]
+    fn orphaned_short_fragment_merges_back_when_limits_allow() {
+        let mut cues = vec![cue(0, "because I usually do not feel"), cue(1, "pressure.")];
+        cues[0].start = 10.0;
+        cues[0].end = 14.0;
+        cues[1].start = 14.0;
+        cues[1].end = 14.4;
+        assert_eq!(
+            merge_orphaned_short_ranges(&cues, &[(0, 0), (1, 1)]).unwrap(),
+            vec![(0, 1)]
+        );
+
+        cues[1].source = ">> Yes.".into();
+        assert_eq!(
+            merge_orphaned_short_ranges(&cues, &[(0, 0), (1, 1)]).unwrap(),
+            vec![(0, 0), (1, 1)]
+        );
     }
 
     #[test]
