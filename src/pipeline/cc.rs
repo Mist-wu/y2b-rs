@@ -1,5 +1,5 @@
 //! B站中文 CC 字幕补交（软字幕，提交后走平台审核）。
-use super::Pipeline;
+use super::{Pipeline, subtitle_flow::load_segmented_cache};
 use crate::bilibili_api::{self, CcCue};
 use crate::model::{Job, JobStatus, VideoMetadata};
 use crate::subtitle::{self, Cue};
@@ -314,15 +314,37 @@ impl Pipeline {
         } else if redownload_if_missing {
             fs::create_dir_all(&work)?;
             let segmented = work.join(format!("{}.en.segmented.json", meta.id));
-            let Some(cues) = self.segment_uncached(job, &meta, &work, &segmented).await? else {
-                // 必须复用 MISSING_SUBTITLE_MATERIAL_PREFIX：自动重试现在也会走到
-                // 这里，分类错了会让退避和「达到上限」的提示都变成不可操作的泛化
-                // 文案，看不出该手动补交。
-                bail!(
-                    "{MISSING_SUBTITLE_MATERIAL_PREFIX}：上游暂无英文字幕轨（可手动执行 y2b subtitle add {bvid}）"
-                )
+            let cached = match load_segmented_cache(&segmented) {
+                Ok(Some(cues)) => {
+                    self.db.event(
+                        Some(&job.id),
+                        "info",
+                        &format!("复用分句缓存: {} cues", cues.len()),
+                    )?;
+                    Some(cues)
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    self.db
+                        .event(Some(&job.id), "warn", &format!("忽略无效分句缓存: {error}"))?;
+                    None
+                }
             };
-            let mut cues = cues;
+            let mut cues = match cached {
+                Some(cues) => cues,
+                None => {
+                    let Some(cues) = self.segment_uncached(job, &meta, &work, &segmented).await?
+                    else {
+                        // 必须复用 MISSING_SUBTITLE_MATERIAL_PREFIX：自动重试现在也会走到
+                        // 这里，分类错了会让退避和「达到上限」的提示都变成不可操作的泛化
+                        // 文案，看不出该手动补交。
+                        bail!(
+                            "{MISSING_SUBTITLE_MATERIAL_PREFIX}：上游暂无英文字幕轨（可手动执行 y2b subtitle add {bvid}）"
+                        )
+                    };
+                    cues
+                }
+            };
             self.translate_and_save(&job.id, &mut cues, &translated)
                 .await?;
             cues
