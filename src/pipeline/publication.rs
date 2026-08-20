@@ -181,12 +181,57 @@ pub(super) fn parse_publication_metadata(value: &Value) -> Result<PublicationMet
 /// 对已落库的元数据重新跑一遍解析期的清洗，尽量把它救回可投稿状态。
 pub(super) fn repair_publication_metadata(metadata: &PublicationMetadata) -> PublicationMetadata {
     PublicationMetadata {
-        title: sanitize_publication_text(&metadata.title),
-        dynamic: sanitize_publication_text(&metadata.dynamic),
+        title: shorten_to_chinese_width(
+            &sanitize_publication_text(&metadata.title),
+            MAX_TITLE_WIDTH,
+        ),
+        dynamic: shorten_to_chinese_width(
+            &sanitize_publication_text(&metadata.dynamic),
+            MAX_DYNAMIC_WIDTH,
+        ),
         tags: sanitize_tags(&metadata.tags),
         tid: BILIBILI_TID,
         raw_json: metadata.raw_json.clone(),
     }
+}
+
+/// AI 已经收到宽度反馈却仍可能连续输出超限文本。最后一次反馈失败后使用确定性
+/// 裁剪兜底，避免同一条任务在外层重试中反复调用 AI，最终仅因文案过长进入死信。
+///
+/// 中文/全角字符按 2 宽度、ASCII 按 1 宽度；发生裁剪时预留一个全角省略号，
+/// 因而返回值始终不会超过 `max_width`。
+pub(super) fn shorten_to_chinese_width(text: &str, max_width: usize) -> String {
+    let text = text.trim();
+    if chinese_width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    const ELLIPSIS: char = '…';
+    let ellipsis_width = 2;
+    let content_limit = max_width.saturating_sub(ellipsis_width);
+    let mut shortened = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = if ch.is_ascii() { 1 } else { 2 };
+        if width + ch_width > content_limit {
+            break;
+        }
+        shortened.push(ch);
+        width += ch_width;
+    }
+    let shortened = shortened.trim_end();
+    if shortened.is_empty() {
+        return text
+            .chars()
+            .next()
+            .filter(|ch| (if ch.is_ascii() { 1 } else { 2 }) <= max_width)
+            .map(String::from)
+            .unwrap_or_default();
+    }
+    format!("{shortened}{ELLIPSIS}")
 }
 
 pub(super) fn validate_publication_metadata(metadata: &PublicationMetadata) -> Result<()> {
@@ -481,7 +526,26 @@ impl Pipeline {
                     ));
                     continue;
                 }
-                return Err(stage.fail(error, r.output.duration_ms, r.output.peak_rss_kib));
+                // 模型已经用尽反馈重写机会。对可确定修复的清洗/宽度问题做一次
+                // 本地兜底，避免外层把整条视频重新跑 5 次、重复消耗 AI 调用。
+                let repaired = repair_publication_metadata(&metadata);
+                if let Err(repair_error) = validate_publication_metadata(&repaired) {
+                    return Err(stage.fail(
+                        repair_error.context(format!("AI 最终输出校验失败: {error}")),
+                        r.output.duration_ms,
+                        r.output.peak_rss_kib,
+                    ));
+                }
+                if let Err(error) = self.db.save_publication_metadata(job_id, &repaired) {
+                    return Err(stage.fail(error, r.output.duration_ms, r.output.peak_rss_kib));
+                }
+                stage.finish(
+                    "completed",
+                    r.output.duration_ms,
+                    r.output.peak_rss_kib,
+                    Some(&format!("{} 次 AI 尝试后由确定性清洗通过校验", attempt + 1)),
+                )?;
+                return Ok(repaired);
             }
             if let Err(error) = self.db.save_publication_metadata(job_id, &metadata) {
                 return Err(stage.fail(error, r.output.duration_ms, r.output.peak_rss_kib));
@@ -542,6 +606,34 @@ mod tests {
         }))
         .unwrap();
         assert!(validate_publication_metadata(&parsed).is_err());
+    }
+
+    #[test]
+    fn publication_metadata_repairs_overwide_ai_text_without_exceeding_limits() {
+        let metadata = PublicationMetadata {
+            title: "世界第一冲分实录".repeat(8),
+            dynamic: "本期展示职业段位冲分全过程，包括阵容选择、关键团战和最后一局极限翻盘。"
+                .repeat(5),
+            tags: vec!["荒野乱斗".into()],
+            tid: BILIBILI_TID,
+            raw_json: "{}".into(),
+        };
+
+        let repaired = repair_publication_metadata(&metadata);
+        assert!(chinese_width(&repaired.title) <= MAX_TITLE_WIDTH);
+        assert!(chinese_width(&repaired.dynamic) <= MAX_DYNAMIC_WIDTH);
+        assert!(repaired.title.ends_with('…'));
+        assert!(repaired.dynamic.ends_with('…'));
+        validate_publication_metadata(&repaired).unwrap();
+    }
+
+    #[test]
+    fn width_shortening_handles_mixed_ascii_and_unicode_at_exact_boundary() {
+        assert_eq!(shorten_to_chinese_width("abc中文", 7), "abc中文");
+        assert_eq!(shorten_to_chinese_width("abcdef中文", 7), "abcde…");
+        assert_eq!(chinese_width(&shorten_to_chinese_width("abcdef中文", 7)), 7);
+        assert_eq!(shorten_to_chinese_width("中文", 1), "");
+        assert_eq!(shorten_to_chinese_width("abc", 0), "");
     }
 
     #[test]
