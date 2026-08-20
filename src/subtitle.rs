@@ -3,6 +3,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Cue {
@@ -76,12 +77,49 @@ fn parse_ts(s: &str) -> Result<f64> {
 }
 
 fn clean_vtt_text(raw: &str, tags: &Regex) -> String {
-    tags.replace_all(raw, "")
-        .replace("&amp;", "&")
+    sanitize_caption_text(&tags.replace_all(raw, ""))
+}
+
+fn music_marker_regex() -> &'static Regex {
+    static MUSIC_MARKERS: OnceLock<Regex> = OnceLock::new();
+    MUSIC_MARKERS.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:\[\s*(?:music|音乐)\s*\]|【\s*音乐\s*】|[（(]\s*(?:music|音乐)\s*[）)]|[♪♫♬♩]+)",
+        )
+        .expect("音乐字幕标记正则必须有效")
+    })
+}
+
+/// 清理不应出现在成品字幕里的传输层和无障碍字幕标记。
+///
+/// YouTube WebVTT 会把说话人提示写成 `&gt;&gt;`，如果不先解码并移除，
+/// 翻译模型会原样保留，B站最终就会显示成奇怪的 HTML 实体。背景音乐提示同理：
+/// 只删除方括号/括号形式的标签和音乐符号，不删除正常语句中的“音乐”一词。
+pub fn sanitize_caption_text(raw: &str) -> String {
+    // `&amp;` 必须最后解码，避免把 `&amp;gt;` 错误地二次解码成 `>`。
+    let decoded = raw
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
         .replace("&nbsp;", " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+        .replace("&lrm;", "\u{200e}")
+        .replace("&rlm;", "\u{200f}")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    let without_music = music_marker_regex().replace_all(&decoded, "");
+    let printable = without_music
+        .replace(">>", "")
+        .replace("＞＞", "")
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .filter(|c| {
+            !matches!(
+                *c,
+                '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'
+            )
+        })
+        .collect::<String>();
+    printable.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn parse_inline_parts(
@@ -347,12 +385,7 @@ pub fn apply_translations(cues: &mut [Cue], translations: &[(usize, String)]) ->
         if *i >= cues.len() {
             bail!("翻译索引越界: {i}")
         }
-        let clean = text
-            .chars()
-            .filter(|c| !c.is_control() || *c == '\n')
-            .collect::<String>()
-            .trim()
-            .to_string();
+        let clean = sanitize_caption_text(text);
         // 单条空翻译直接跳过（保留 translation=None），避免整批失败；
         // 后续 CC 提交会过滤无翻译的 cue。
         if clean.is_empty() {
@@ -421,6 +454,47 @@ Nice.
         assert!(cues[1].end <= 5.0);
         assert_eq!(cues[2].start, 12.0);
         assert!(cues[2].end - cues[2].start <= 0.8 + 1e-6);
+    }
+
+    #[test]
+    fn vtt_cleanup_decodes_entities_and_removes_music_and_speaker_markers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captions.vtt");
+        fs::write(
+            &path,
+            r#"WEBVTT
+
+00:00:01.000 --> 00:00:03.000
+&gt;&gt; Looks good. [music] Are you ready?
+
+00:00:03.000 --> 00:00:04.000
+[MUSIC]
+
+00:00:04.000 --> 00:00:06.000
+Brown noise and chill music.
+"#,
+        )
+        .unwrap();
+
+        let cues = parse_vtt(&path).unwrap();
+        assert_eq!(
+            cues.iter()
+                .map(|cue| cue.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Looks good. Are you ready?", "Brown noise and chill music."]
+        );
+    }
+
+    #[test]
+    fn caption_cleanup_only_removes_music_labels_not_normal_words() {
+        assert_eq!(
+            sanitize_caption_text("&gt;&gt; 棕色噪音。[音乐] 也许听点舒缓音乐。♪"),
+            "棕色噪音。 也许听点舒缓音乐。"
+        );
+        assert_eq!(
+            sanitize_caption_text("A &amp; B &amp;gt; C"),
+            "A & B &gt; C"
+        );
     }
 
     #[test]
