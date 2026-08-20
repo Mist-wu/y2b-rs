@@ -43,6 +43,7 @@ extension = "/opt/y2b/pi/y2b-extension.ts"
 policy = "/opt/y2b/pi/policy.json"
 provider = "deepseek"
 model = "deepseek-v4-flash"
+translation_model = "deepseek-v4-pro"
 # 投稿元数据、分句和翻译统一关闭 thinking，避免成本和流式输出量失控。
 thinking = "off"
 timeout_seconds = 300
@@ -54,7 +55,8 @@ safe_context_tokens = 200000
 segment_overlap_cues = 12
 # 单次分句调用的最大 cue 数，防止超大调用超时/失败重来代价大。
 segment_max_cues = 400
-translation_batch_cues = 50
+# 小批次可减少长列表中的索引错位、空译和跨句译意漂移。
+translation_batch_cues = 25
 # Pi 翻译批次并发。2 GiB 服务器实测 3 路仅约 320–380 MiB，默认提高到 4；继续受 systemd 内存上限保护。
 translation_concurrency = 4
 # 单批输出不是有效 JSON、索引校验失败或 Pi 调用失败时的额外重试次数。

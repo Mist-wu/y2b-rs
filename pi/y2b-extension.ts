@@ -139,10 +139,12 @@ Task translate:
 - Input: {"task":"translate","source_lang":"en","target_lang":"zh-CN","items":[{"i":0,"text":"..."}]}
 - Output: {"translations":[{"i":0,"text":"译文"}]}
 - Return every i exactly once and in input order. Never merge or split items.
+- Translate each item from that item's own text. Neighboring items are context only: never move a fact, name, number, joke, or clause into an earlier or later item's translation. If an item starts or ends mid-sentence, return the matching Chinese fragment at the same i so adjacent subtitles connect naturally; never complete it using words that belong to another item.
 - Use natural concise Simplified Chinese suitable for Bilibili, not documentary-style Chinese.
 - Keep each translation suitable for one visual line, targeting at most 32 Chinese-width characters when possible and never exceeding 64 Chinese-width characters. 中文宽度计法：中文/全角字符按 2，ASCII 字母数字与空格按 1（32 宽度 ≈ 16 个汉字，64 宽度 ≈ 32 个汉字）。Shorten syntax without dropping facts, jokes, names, numbers, or intent.
 - Drop meaningless English filler words (uh, um, so, yeah, you know, I mean, like, right) when they add no meaning; never drop facts, jokes, names, numbers, or intent.
 - Preserve code, API names, numbers, usernames, game terminology, and proper nouns accurately.
+- Project glossary values are mandatory and case-insensitive for terms used with their Brawl Stars meaning. Put the required glossary translation in the same item's output; never omit it, replace it with another transliteration, or move it to a neighboring item.
 - Do not add notes or punctuation that is absent unless natural Chinese readability requires it.
 - If the input contains a "feedback" field: the previous output was rejected for the given reason (typically invalid JSON or index mismatch). Fix exactly that issue and re-output only the JSON.
 

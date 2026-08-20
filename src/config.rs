@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 pub const AI_PROVIDER: &str = "deepseek";
 pub const AI_MODEL: &str = "deepseek-v4-flash";
+pub const AI_TRANSLATION_MODEL: &str = "deepseek-v4-pro";
 pub const AI_THINKING: &str = "off";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -87,6 +88,8 @@ pub struct AiConfig {
     pub policy: PathBuf,
     pub provider: String,
     pub model: String,
+    /// 长列表翻译需要更强的逐条对齐能力，与分句/元数据模型分开固定。
+    pub translation_model: String,
     /// 所有 AI 阶段共用同一个思考级别，避免任务间配置漂移。
     pub thinking: String,
     pub timeout_seconds: u64,
@@ -216,6 +219,7 @@ impl Default for AiConfig {
             policy: "/opt/y2b/pi/policy.json".into(),
             provider: AI_PROVIDER.into(),
             model: AI_MODEL.into(),
+            translation_model: AI_TRANSLATION_MODEL.into(),
             thinking: AI_THINKING.into(),
             timeout_seconds: 300,
             batch_mode: BatchMode::Adaptive,
@@ -223,7 +227,7 @@ impl Default for AiConfig {
             safe_context_tokens: 200_000,
             segment_overlap_cues: 12,
             segment_max_cues: 400,
-            translation_batch_cues: 50,
+            translation_batch_cues: 25,
             translation_concurrency: 4,
             translation_batch_retries: 2,
             daily_token_limit: None,
@@ -309,10 +313,12 @@ impl Config {
         anyhow::ensure!(
             self.ai.provider == AI_PROVIDER
                 && self.ai.model == AI_MODEL
+                && self.ai.translation_model == AI_TRANSLATION_MODEL
                 && self.ai.thinking == AI_THINKING,
-            "AI 配置必须统一为 provider={AI_PROVIDER}, model={AI_MODEL}, thinking={AI_THINKING}；当前为 provider={}, model={}, thinking={}",
+            "AI 配置必须固定为 provider={AI_PROVIDER}, model={AI_MODEL}, translation_model={AI_TRANSLATION_MODEL}, thinking={AI_THINKING}；当前为 provider={}, model={}, translation_model={}, thinking={}",
             self.ai.provider,
             self.ai.model,
+            self.ai.translation_model,
             self.ai.thinking
         );
         Ok(())
@@ -392,11 +398,12 @@ mod tests {
         assert_eq!(adaptive.batch_mode, BatchMode::Adaptive);
         assert_eq!(adaptive.context_window_tokens, 256_000);
         assert_eq!(adaptive.safe_context_tokens, 200_000);
-        assert_eq!(adaptive.translation_batch_cues, 50);
+        assert_eq!(adaptive.translation_batch_cues, 25);
         assert_eq!(adaptive.translation_concurrency, 4);
         assert_eq!(adaptive.translation_batch_retries, 2);
         assert_eq!(adaptive.provider, AI_PROVIDER);
         assert_eq!(adaptive.model, AI_MODEL);
+        assert_eq!(adaptive.translation_model, AI_TRANSLATION_MODEL);
         assert_eq!(adaptive.thinking, AI_THINKING);
 
         let legacy: AiConfig = toml::from_str("batch_size = 25").unwrap();
@@ -415,14 +422,21 @@ mod tests {
 
     #[test]
     fn rejects_ai_profile_drift() {
-        for (provider, model, thinking) in [
-            ("openai-codex", AI_MODEL, AI_THINKING),
-            (AI_PROVIDER, "deepseek-v4-pro", AI_THINKING),
-            (AI_PROVIDER, AI_MODEL, "high"),
+        for (provider, model, translation_model, thinking) in [
+            ("openai-codex", AI_MODEL, AI_TRANSLATION_MODEL, AI_THINKING),
+            (
+                AI_PROVIDER,
+                "deepseek-v4-pro",
+                AI_TRANSLATION_MODEL,
+                AI_THINKING,
+            ),
+            (AI_PROVIDER, AI_MODEL, "deepseek-v4-flash", AI_THINKING),
+            (AI_PROVIDER, AI_MODEL, AI_TRANSLATION_MODEL, "high"),
         ] {
             let mut config = Config::default();
             config.ai.provider = provider.into();
             config.ai.model = model.into();
+            config.ai.translation_model = translation_model.into();
             config.ai.thinking = thinking.into();
             assert!(config.validate_ai_profile().is_err());
         }

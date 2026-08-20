@@ -13,7 +13,7 @@ use tokio::process::Command;
 const GATE_BATCH: usize = 50;
 use y2b_rs::{
     Database, check,
-    config::{AI_MODEL, AI_PROVIDER, AI_THINKING, Config},
+    config::{AI_MODEL, AI_PROVIDER, AI_THINKING, AI_TRANSLATION_MODEL, Config},
     model::{JobStatus, TransferMode},
     monitor::Monitor,
     pipeline::{self, AiCircuitBreaker, Pipeline},
@@ -151,7 +151,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut config = Config::load(&cli.config)?;
     if matches!(cli.command, Cmd::ConfigCheck) {
-        println!("AI profile: {AI_PROVIDER}/{AI_MODEL} thinking={AI_THINKING}");
+        println!(
+            "AI profile: {AI_PROVIDER}/{AI_MODEL} translate={AI_TRANSLATION_MODEL} thinking={AI_THINKING}"
+        );
         return Ok(());
     }
     if matches!(cli.command, Cmd::Init) {
@@ -363,8 +365,11 @@ async fn main() -> Result<()> {
         Cmd::Model(c) => match c {
             ModelCmd::List => {
                 println!(
-                    "{}/{}\tthinking={}",
-                    config.ai.provider, config.ai.model, config.ai.thinking
+                    "{}/{}\ttranslate={}\tthinking={}",
+                    config.ai.provider,
+                    config.ai.model,
+                    config.ai.translation_model,
+                    config.ai.thinking
                 );
             }
             ModelCmd::Set { model, provider } => {

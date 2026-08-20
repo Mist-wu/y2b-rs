@@ -714,7 +714,7 @@ impl Pipeline {
             job_id,
             "translation",
             Some(&self.config.ai.provider),
-            Some(&self.config.ai.model),
+            Some(&self.config.ai.translation_model),
             Some(&self.config.ai.thinking),
         )?;
         let budget = self.ai_token_budget()?;
@@ -834,7 +834,7 @@ impl Pipeline {
                         stage,
                         "translate",
                         &self.config.ai.provider,
-                        &self.config.ai.model,
+                        &self.config.ai.translation_model,
                         &self.config.ai.thinking,
                         &result.usage,
                         result.output.duration_ms,
