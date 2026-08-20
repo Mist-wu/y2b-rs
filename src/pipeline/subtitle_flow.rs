@@ -397,6 +397,12 @@ impl Pipeline {
         let mut stage = StageGuard::start(&self.db, job_id, "subtitle_download", None, None, None)?;
         let mut cmd = ytdlp_command(&self.config.youtube);
         cmd.args([
+            // 2026-07 起默认的 web_safari 客户端会把需要 subtitles PO Token 的
+            // 自动字幕静默丢弃，yt-dlp 仍以 0 退出，最终被误判成“没有字幕”。
+            // web_creator 可在现有账号 cookies 下读取同一条字幕轨；这里只下载
+            // 字幕，不受它缺少 GVS 视频格式 PO Token 的影响。
+            "--extractor-args",
+            "youtube:player_client=web_creator",
             "--skip-download",
             "--write-subs",
             "--write-auto-subs",
