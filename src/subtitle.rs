@@ -12,12 +12,23 @@ pub struct Cue {
     pub translation: Option<String>,
 }
 
+#[derive(Debug)]
+struct VttBlock {
+    cue: Cue,
+    inline_parts: Vec<Cue>,
+}
+
+const INLINE_ATOM_MAX_DURATION_SECONDS: f64 = 4.0;
+const INLINE_ATOM_MAX_CHARS: usize = 40;
+const INLINE_ATOM_MAX_WORDS: usize = 8;
+
 pub fn parse_vtt(path: &Path) -> Result<Vec<Cue>> {
     let raw = fs::read_to_string(path)?;
     let timing =
         Regex::new(r"(?m)^(\d{2}:)?\d{2}:\d{2}\.\d{3}\s+-->\s+(\d{2}:)?\d{2}:\d{2}\.\d{3}")?;
     let tags = Regex::new(r"<[^>]+>")?;
-    let mut cues = Vec::new();
+    let inline_timing = Regex::new(r"<(?:(?:\d{2}):)?\d{2}:\d{2}\.\d{3}>")?;
+    let mut blocks = Vec::new();
     for block in raw.replace("\r\n", "\n").split("\n\n") {
         let lines: Vec<_> = block.lines().collect();
         let Some(i) = lines.iter().position(|l| timing.is_match(l)) else {
@@ -28,22 +39,26 @@ pub fn parse_vtt(path: &Path) -> Result<Vec<Cue>> {
         };
         let start = parse_ts(a)?;
         let end = parse_ts(b.split_whitespace().next().unwrap_or(b))?;
-        let source = tags
-            .replace_all(&lines[i + 1..].join(" "), "")
-            .replace("&amp;", "&")
-            .replace("&nbsp;", " ");
-        let source = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        let raw_source = lines[i + 1..].join("\n");
+        let source = clean_vtt_text(&raw_source, &tags);
         if !source.is_empty() {
-            cues.push(Cue {
-                start,
-                end,
-                source,
-                translation: None,
+            blocks.push(VttBlock {
+                cue: Cue {
+                    start,
+                    end,
+                    source,
+                    translation: None,
+                },
+                inline_parts: parse_inline_parts(&raw_source, start, end, &tags, &inline_timing)?,
             });
         }
     }
-    dedup_overlaps(&mut cues);
-    dedup_rolling(&mut cues);
+    blocks.sort_by(|a, b| a.cue.start.total_cmp(&b.cue.start));
+    blocks
+        .dedup_by(|a, b| (a.cue.start - b.cue.start).abs() < 0.01 && a.cue.source == b.cue.source);
+    let mut cues = refine_rolling_blocks(blocks);
+    normalize_inline_ends(&mut cues);
+    cues = group_inline_atoms(cues);
     if cues.is_empty() {
         bail!("字幕文件没有有效 cue: {}", path.display())
     }
@@ -59,14 +74,192 @@ fn parse_ts(s: &str) -> Result<f64> {
     };
     Ok(h * 3600.0 + m * 60.0 + sec)
 }
-fn dedup_overlaps(c: &mut Vec<Cue>) {
-    c.sort_by(|a, b| a.start.total_cmp(&b.start));
-    c.dedup_by(|a, b| (a.start - b.start).abs() < 0.01 && a.source == b.source);
+
+fn clean_vtt_text(raw: &str, tags: &Regex) -> String {
+    tags.replace_all(raw, "")
+        .replace("&amp;", "&")
+        .replace("&nbsp;", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_inline_parts(
+    raw: &str,
+    block_start: f64,
+    block_end: f64,
+    tags: &Regex,
+    inline_timing: &Regex,
+) -> Result<Vec<Cue>> {
+    let tagged = raw
+        .lines()
+        .filter(|line| inline_timing.is_match(line))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let matches = inline_timing.find_iter(&tagged).collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut parts: Vec<(f64, String)> = Vec::new();
+    let leading = clean_vtt_text(&tagged[..matches[0].start()], tags);
+    if !leading.is_empty() {
+        parts.push((block_start, leading));
+    }
+    for (index, timing) in matches.iter().enumerate() {
+        let end = matches
+            .get(index + 1)
+            .map_or(tagged.len(), |next| next.start());
+        let source = clean_vtt_text(&tagged[timing.end()..end], tags);
+        if source.is_empty() {
+            continue;
+        }
+        let start = parse_ts(&tagged[timing.start() + 1..timing.end() - 1])?;
+        if let Some((previous_start, previous_source)) = parts.last_mut()
+            && (start - *previous_start).abs() < 0.001
+        {
+            previous_source.push(' ');
+            previous_source.push_str(&source);
+        } else {
+            parts.push((start, source));
+        }
+    }
+    let mut cues = Vec::with_capacity(parts.len());
+    for (index, (start, source)) in parts.iter().enumerate() {
+        let end = parts
+            .get(index + 1)
+            .map(|next| next.0)
+            .unwrap_or_else(|| block_end.min(start + 1.0));
+        cues.push(Cue {
+            start: *start,
+            end: end.max(start + 0.01),
+            source: source.clone(),
+            translation: None,
+        });
+    }
+    Ok(cues)
+}
+
+fn fallback_cue_end(cue: &Cue, rolling_overlap_removed: bool) -> f64 {
+    if !rolling_overlap_removed && cue.end - cue.start <= 8.0 {
+        return cue.end;
+    }
+    let estimated_speech = (cue.source.split_whitespace().count() as f64 * 0.45).clamp(0.8, 8.0);
+    cue.end.min(cue.start + estimated_speech)
+}
+
+fn refine_rolling_blocks(blocks: Vec<VttBlock>) -> Vec<Cue> {
+    const MIN_OVERLAP_CHARS: usize = 10;
+    let mut carry = String::new();
+    let mut out = Vec::new();
+    for block in blocks {
+        let original = block.cue.source.trim().to_string();
+        let stripped = strip_rolling_overlap(&carry, &original, MIN_OVERLAP_CHARS);
+        carry = original.clone();
+        if stripped.is_empty() {
+            continue;
+        }
+        let inline_source = block
+            .inline_parts
+            .iter()
+            .map(|cue| cue.source.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !block.inline_parts.is_empty() && inline_source == stripped {
+            out.extend(block.inline_parts);
+            continue;
+        }
+        let mut cue = Cue {
+            source: stripped,
+            ..block.cue
+        };
+        cue.end = fallback_cue_end(&cue, cue.source != original);
+        if cue.end > cue.start {
+            out.push(cue);
+        }
+    }
+    out
+}
+
+fn normalize_inline_ends(cues: &mut [Cue]) {
+    cues.sort_by(|a, b| a.start.total_cmp(&b.start));
+    for index in 0..cues.len().saturating_sub(1) {
+        if cues[index].end > cues[index + 1].start {
+            cues[index].end = cues[index + 1].start.max(cues[index].start + 0.01);
+        }
+    }
+}
+
+fn inline_atom_metrics(cues: &[Cue]) -> (f64, usize, usize) {
+    let duration = cues.last().unwrap().end - cues[0].start;
+    let chars = cues
+        .iter()
+        .map(|cue| cue.source.chars().count())
+        .sum::<usize>()
+        + cues.len().saturating_sub(1);
+    let words = cues
+        .iter()
+        .map(|cue| cue.source.split_whitespace().count())
+        .sum();
+    (duration, chars, words)
+}
+
+fn ends_inline_atom(source: &str) -> bool {
+    source
+        .trim_end_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(character, '"' | '\'' | '”' | '’' | ')' | ']' | '}')
+        })
+        .ends_with(['.', '!', '?', ',', ';', ':'])
+}
+
+fn merge_atom(cues: &[Cue]) -> Cue {
+    Cue {
+        start: cues[0].start,
+        end: cues.last().unwrap().end,
+        source: cues
+            .iter()
+            .map(|cue| cue.source.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        translation: None,
+    }
+}
+
+fn group_inline_atoms(cues: Vec<Cue>) -> Vec<Cue> {
+    let mut output = Vec::new();
+    let mut current: Vec<Cue> = Vec::new();
+    for cue in cues {
+        if !current.is_empty() {
+            let mut candidate = current.clone();
+            candidate.push(cue.clone());
+            let (duration, chars, words) = inline_atom_metrics(&candidate);
+            let gap = cue.start - current.last().unwrap().end;
+            if gap >= 0.8
+                || duration > INLINE_ATOM_MAX_DURATION_SECONDS
+                || chars > INLINE_ATOM_MAX_CHARS
+                || words > INLINE_ATOM_MAX_WORDS
+            {
+                output.push(merge_atom(&current));
+                current.clear();
+            }
+        }
+        let boundary = ends_inline_atom(&cue.source);
+        current.push(cue);
+        if boundary {
+            output.push(merge_atom(&current));
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        output.push(merge_atom(&current));
+    }
+    output
 }
 
 /// YouTube 自动字幕按“滚动窗口”生成：每条 cue 重复上一条的尾部文本再追加新词，
 /// 相邻 cue 间存在大量前缀/后缀重叠。这里把每条 cue 裁剪为“相对上一条新增的内容”，
 /// 使每个句子只出现一次，避免分句/翻译 token 浪费和译文重复结巴。
+#[cfg(test)]
 fn dedup_rolling(c: &mut Vec<Cue>) {
     const MIN_OVERLAP_CHARS: usize = 10;
     if c.len() < 2 {
@@ -190,6 +383,45 @@ pub fn load_json(path: &Path) -> Result<Vec<Cue>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn youtube_inline_timestamps_create_natural_short_atoms() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captions.vtt");
+        fs::write(
+            &path,
+            r#"WEBVTT
+
+00:00:01.000 --> 00:00:03.000 align:start position:0%
+Hello<00:00:01.400><c> friends.</c><00:00:02.000><c> Today</c>
+
+00:00:03.000 --> 00:00:03.010 align:start position:0%
+Hello friends. Today
+
+00:00:03.010 --> 00:00:05.000 align:start position:0%
+Hello friends. Today
+we<00:00:03.400><c> will</c><00:00:03.800><c> go.</c>
+
+00:00:12.000 --> 00:00:30.000 align:start position:0%
+Nice.
+"#,
+        )
+        .unwrap();
+
+        let cues = parse_vtt(&path).unwrap();
+        assert_eq!(
+            cues.iter()
+                .map(|cue| cue.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Hello friends.", "Today we will go.", "Nice."]
+        );
+        assert_eq!(cues[0].start, 1.0);
+        assert_eq!(cues[0].end, 2.0);
+        assert_eq!(cues[1].start, 2.0);
+        assert!(cues[1].end <= 5.0);
+        assert_eq!(cues[2].start, 12.0);
+        assert!(cues[2].end - cues[2].start <= 0.8 + 1e-6);
+    }
 
     #[test]
     fn rolling_dedup_keeps_only_new_words() {
