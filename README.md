@@ -112,7 +112,7 @@ y2b backup | auth-check | check --write-baseline
 
 ## Pi 集成
 
-所有 Pi 调用固定 `deepseek/deepseek-v4-flash` + `thinking=off`，投稿元数据、分句、翻译和词库审计共用同一配置。每次调用 `--no-session --no-tools`，只加载 `pi/y2b-extension.ts`。配置加载和部署预检会拒绝其他 provider／model／thinking，避免任务间漂移和大 thinking 流式输出带来的成本与 OOM。
+Pi 调用固定为 `deepseek` + `thinking=off`：分句、投稿元数据和词库审计使用 `deepseek-v4-flash`，长列表逐条翻译使用对齐更稳定的 `deepseek-v4-pro`。每次调用 `--no-session --no-tools`，只加载 `pi/y2b-extension.ts`。配置加载和部署预检会拒绝其他 provider／model／thinking，避免任务间漂移和大 thinking 流式输出带来的成本与 OOM。
 
 批处理支持 `adaptive` 和 `whole_video`：按 256k 上下文、200k 安全阈值估算输入输出，阈值内整条视频只调用一次分句和一次翻译，超限按 token 拆批。自适应分句携带前后 12 条上下文，并在 Pi 返回的自然分句边界衔接批次。
 

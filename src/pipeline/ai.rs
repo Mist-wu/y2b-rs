@@ -277,6 +277,11 @@ pub(super) fn batch_mode_name(mode: BatchMode) -> &'static str {
 
 impl Pipeline {
     pub(super) async fn call_pi(&self, payload: Value) -> Result<PiResult> {
+        let model = if payload.get("task").and_then(Value::as_str) == Some("translate") {
+            &self.config.ai.translation_model
+        } else {
+            &self.config.ai.model
+        };
         let mut cmd = Command::new(&self.config.ai.pi);
         cmd.args([
             "--mode",
@@ -295,7 +300,7 @@ impl Pipeline {
             "--provider",
             &self.config.ai.provider,
             "--model",
-            &self.config.ai.model,
+            model,
             "--thinking",
             &self.config.ai.thinking,
             "--no-approve",
