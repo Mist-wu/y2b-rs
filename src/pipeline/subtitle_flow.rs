@@ -32,6 +32,7 @@ pub(super) const SEGMENT_REQUIRED_GAP_SECONDS: f64 = 0.8;
 pub(super) const SEGMENT_MAX_DURATION_SECONDS: f64 = 8.0;
 pub(super) const SEGMENT_MAX_SOURCE_CHARS: usize = 72;
 pub(super) const SEGMENT_MAX_SOURCE_WORDS: usize = 16;
+pub(super) const SEGMENT_ORPHAN_MAX_DURATION_SECONDS: f64 = 1.0;
 
 /// 译文以 32 中文宽度为目标；64 是防止整段串入单句等异常输出的硬上限。
 /// 这里允许目标值两倍的余量，避免为了机械缩短而丢失名字、数字或事实。
@@ -173,7 +174,7 @@ fn source_ends_sentence(source: &str) -> bool {
 }
 
 /// 模型偶发把句末单词切成极短的孤儿 cue（如 `... feel` / `pressure.`）。若右侧
-/// 小于 0.75 秒且没有换说话人或静音，优先直接接回上一句；合并会超限时，把
+/// 不超过 1 秒且没有换说话人或静音，优先直接接回上一句；合并会超限时，把
 /// 前一范围末尾的原子 cue 移到右侧，避免在满足硬上限的代价下留下半句话。
 pub(super) fn merge_orphaned_short_ranges(
     cues: &[Cue],
@@ -190,7 +191,7 @@ pub(super) fn merge_orphaned_short_ranges(
         let right_duration = cues[end].end - cues[start].start;
         let gap = cues[start].start - cues[previous.1].end;
         let starts_speaker = cues[start].source.trim_start().starts_with(">>");
-        let orphaned = right_duration <= 0.75
+        let orphaned = right_duration <= SEGMENT_ORPHAN_MAX_DURATION_SECONDS
             && gap < SEGMENT_REQUIRED_GAP_SECONDS
             && !starts_speaker
             && !source_ends_sentence(&cues[previous.1].source);
@@ -208,7 +209,7 @@ pub(super) fn merge_orphaned_short_ranges(
                 }
                 previous.1 = shifted - 1;
                 start = shifted;
-                if cues[end].end - cues[start].start > 0.75 {
+                if cues[end].end - cues[start].start > SEGMENT_ORPHAN_MAX_DURATION_SECONDS {
                     break;
                 }
             }
