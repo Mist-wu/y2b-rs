@@ -236,6 +236,31 @@ pub(super) fn validate_translation_glossary(
             }
         }
     }
+    // 硬分句可能恰好切在多词术语中间（例如 `draft` / `diff`）。逐 cue
+    // 校验看不到完整术语，模型就可能把它译成“阵容压制”。额外检查相邻 cue，
+    // 要求跨边界的源术语在两条译文拼接后仍出现规定译名。
+    for pair in translations.windows(2) {
+        let (left_index, left_translation) = &pair[0];
+        let (right_index, right_translation) = &pair[1];
+        if *right_index != *left_index + 1 {
+            continue;
+        }
+        let left_source = &source[*left_index].source;
+        let right_source = &source[*right_index].source;
+        let joined_source = format!("{left_source} {right_source}");
+        let joined_translation = format!("{left_translation}{right_translation}");
+        for (term, required) in glossary {
+            if !source_contains_glossary_term(left_source, term)?
+                && !source_contains_glossary_term(right_source, term)?
+                && source_contains_glossary_term(&joined_source, term)?
+                && !joined_translation.contains(required)
+            {
+                bail!(
+                    "Pi 翻译第 {left_index}/{right_index} 条跨句术语未按词库使用 {term} => {required}"
+                )
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1102,6 +1127,27 @@ mod tests {
         assert!(
             validate_translation_glossary(&unrelated, &[(0, "最高速度".into())], &glossary).is_ok()
         );
+    }
+
+    #[test]
+    fn translation_output_requires_glossary_across_a_cue_boundary() {
+        let source = vec![cue(0, "ranked no draft"), cue(1, "diff beats mechanics")];
+        let glossary = vec![("draft diff".into(), "BP差距".into())];
+        assert!(
+            validate_translation_glossary(
+                &source,
+                &[(0, "排位，不，BP".into()), (1, "差距比操作重要".into())],
+                &glossary
+            )
+            .is_ok()
+        );
+        let error = validate_translation_glossary(
+            &source,
+            &[(0, "排位，不，阵容".into()), (1, "压制比操作重要".into())],
+            &glossary,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("跨句术语"));
     }
 
     #[test]
