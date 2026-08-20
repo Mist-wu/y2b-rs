@@ -15,6 +15,7 @@ use crate::process::run_monitored;
 use crate::subtitle::{self, Cue};
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream};
+use regex::Regex;
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -191,6 +192,48 @@ pub(super) fn validate_translation_output(
         let width = chinese_width(text);
         if width > TRANSLATION_MAX_WIDTH {
             bail!("Pi 翻译第 {index} 条中文宽度 {width} 超过硬上限 {TRANSLATION_MAX_WIDTH}")
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn load_curated_glossary(path: &Path) -> Result<Vec<(String, String)>> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)
+        .with_context(|| format!("读取翻译策略词库失败: {}", path.display()))?;
+    let glossary = value["glossary"]
+        .as_object()
+        .with_context(|| format!("翻译策略缺少 glossary: {}", path.display()))?;
+    Ok(glossary
+        .iter()
+        .filter_map(|(term, translation)| {
+            translation
+                .as_str()
+                .filter(|translation| !term.trim().is_empty() && !translation.trim().is_empty())
+                .map(|translation| (term.clone(), translation.to_string()))
+        })
+        .collect())
+}
+
+fn source_contains_glossary_term(source: &str, term: &str) -> Result<bool> {
+    let pattern = format!(
+        "(?i)(?:^|[^A-Za-z0-9]){}(?:$|[^A-Za-z0-9])",
+        regex::escape(term.trim())
+    );
+    Ok(Regex::new(&pattern)?.is_match(source))
+}
+
+pub(super) fn validate_translation_glossary(
+    source: &[Cue],
+    translations: &[(usize, String)],
+    glossary: &[(String, String)],
+) -> Result<()> {
+    for (index, text) in translations {
+        for (term, required) in glossary {
+            if source_contains_glossary_term(&source[*index].source, term)?
+                && !text.contains(required)
+            {
+                bail!("Pi 翻译第 {index} 条未按词库使用 {term} => {required}")
+            }
         }
     }
     Ok(())
@@ -812,6 +855,7 @@ impl Pipeline {
             "target_lang":self.config.translation.target_lang,
             "items":items
         });
+        let glossary = load_curated_glossary(&self.config.ai.policy)?;
         // 每次尝试都会带上不同的 feedback，审计用的 input_json 在循环内单独构造。
         let attempts = self.config.ai.translation_batch_retries.saturating_add(1);
         let mut aggregate_duration_ms = 0;
@@ -843,6 +887,7 @@ impl Pipeline {
                     )?;
                     match parse_translations(&result.value).and_then(|translations| {
                         validate_translation_output(chunk, &translations)?;
+                        validate_translation_glossary(chunk, &translations, &glossary)?;
                         Ok(translations)
                     }) {
                         Ok(translations) => {
@@ -1030,6 +1075,33 @@ mod tests {
         assert!(validate_translation_output(&source, &[(0, "你好".into())]).is_ok());
         assert!(validate_translation_output(&source, &[(0, "".into())]).is_err());
         assert!(validate_translation_output(&source, &[(0, "中".repeat(33))]).is_err());
+    }
+
+    #[test]
+    fn translation_output_requires_curated_glossary_in_the_same_cue() {
+        let source = vec![cue(0, "Max gives Rico her Hypercharge.")];
+        let glossary = vec![
+            ("Max".into(), "麦克斯".into()),
+            ("Rico".into(), "瑞科".into()),
+            ("Hypercharge".into(), "极限充能".into()),
+        ];
+        assert!(
+            validate_translation_glossary(
+                &source,
+                &[(0, "麦克斯把极限充能给了瑞科。".into())],
+                &glossary
+            )
+            .is_ok()
+        );
+        let error =
+            validate_translation_glossary(&source, &[(0, "她把充能给了瑞科。".into())], &glossary)
+                .unwrap_err();
+        assert!(error.to_string().contains("Max => 麦克斯"));
+
+        let unrelated = vec![cue(0, "maximum speed")];
+        assert!(
+            validate_translation_glossary(&unrelated, &[(0, "最高速度".into())], &glossary).is_ok()
+        );
     }
 
     #[test]
