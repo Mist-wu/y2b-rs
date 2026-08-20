@@ -5,6 +5,7 @@ use super::ai::{
     is_ai_global_fault, parse_ranges, parse_translations, segment_cue_argument_bytes,
     segment_cue_tokens, translation_cue_tokens,
 };
+use super::publication::chinese_width;
 use super::{Pipeline, StageGuard};
 use crate::config::BatchMode;
 use crate::model::Job;
@@ -24,6 +25,16 @@ use tokio::time::sleep;
 pub(super) struct PreparedSubtitle {
     pub(super) cues: Vec<Cue>,
 }
+
+/// Pi 负责选择语义边界，但这些可读性限制必须由程序兜底，不能只依赖提示词。
+pub(super) const SEGMENT_REQUIRED_GAP_SECONDS: f64 = 0.8;
+pub(super) const SEGMENT_MAX_DURATION_SECONDS: f64 = 8.0;
+pub(super) const SEGMENT_MAX_SOURCE_CHARS: usize = 72;
+pub(super) const SEGMENT_MAX_SOURCE_WORDS: usize = 16;
+
+/// 译文以 32 中文宽度为目标；64 是防止整段串入单句等异常输出的硬上限。
+/// 这里允许目标值两倍的余量，避免为了机械缩短而丢失名字、数字或事实。
+pub(super) const TRANSLATION_MAX_WIDTH: usize = 64;
 
 pub(super) fn max_segment_window_end(
     cues: &[Cue],
@@ -105,6 +116,53 @@ pub(super) fn validate_ranges_cover(len: usize, ranges: &[(usize, usize)]) -> Re
     Ok(())
 }
 
+fn source_range_metrics(cues: &[Cue], start: usize, end: usize) -> (f64, usize, usize) {
+    let duration = cues[end].end - cues[start].start;
+    let chars = cues[start..=end]
+        .iter()
+        .map(|cue| cue.source.chars().count())
+        .sum::<usize>()
+        + end.saturating_sub(start);
+    let words = cues[start..=end]
+        .iter()
+        .map(|cue| cue.source.split_whitespace().count())
+        .sum();
+    (duration, chars, words)
+}
+
+fn source_range_within_limits(cues: &[Cue], start: usize, end: usize) -> bool {
+    let (duration, chars, words) = source_range_metrics(cues, start, end);
+    duration <= SEGMENT_MAX_DURATION_SECONDS
+        && chars <= SEGMENT_MAX_SOURCE_CHARS
+        && words <= SEGMENT_MAX_SOURCE_WORDS
+}
+
+/// 在 Pi 返回的语义范围内做确定性细分：遇到静音间隔或加入下一条后超过任一
+/// 硬限制，就在原始 cue 边界处断开。单个原始 cue 本身无法再精确拆时按提示词
+/// 约定保留，不能伪造词级时间戳。
+pub(super) fn enforce_segment_limits(
+    cues: &[Cue],
+    model_ranges: &[(usize, usize)],
+) -> Result<Vec<(usize, usize)>> {
+    validate_ranges_cover(cues.len(), model_ranges)?;
+    let mut repaired = Vec::new();
+    for &(model_start, model_end) in model_ranges {
+        let mut start = model_start;
+        for current in (model_start + 1)..=model_end {
+            let gap = cues[current].start - cues[current - 1].end;
+            if gap >= SEGMENT_REQUIRED_GAP_SECONDS
+                || !source_range_within_limits(cues, start, current)
+            {
+                repaired.push((start, current - 1));
+                start = current;
+            }
+        }
+        repaired.push((start, model_end));
+    }
+    validate_ranges_cover(cues.len(), &repaired)?;
+    Ok(repaired)
+}
+
 pub(super) fn validate_translation_indexes(
     len: usize,
     translations: &[(usize, String)],
@@ -115,6 +173,24 @@ pub(super) fn validate_translation_indexes(
     for (expected, (index, _)) in translations.iter().enumerate() {
         if *index != expected {
             bail!("Pi 翻译索引无序或缺失: index={index}, expected={expected}")
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_translation_output(
+    source: &[Cue],
+    translations: &[(usize, String)],
+) -> Result<()> {
+    validate_translation_indexes(source.len(), translations)?;
+    for (index, text) in translations {
+        let text = text.trim();
+        if text.is_empty() && source[*index].source.chars().any(char::is_alphanumeric) {
+            bail!("Pi 翻译第 {index} 条译文为空")
+        }
+        let width = chinese_width(text);
+        if width > TRANSLATION_MAX_WIDTH {
+            bail!("Pi 翻译第 {index} 条中文宽度 {width} 超过硬上限 {TRANSLATION_MAX_WIDTH}")
         }
     }
     Ok(())
@@ -154,6 +230,10 @@ pub(super) fn load_translation_checkpoint(path: &Path, source: &[Cue]) -> Result
             }
             if translation.chars().any(|ch| ch.is_control() && ch != '\n') {
                 bail!("翻译缓存第 {index} 条含非法控制字符")
+            }
+            let width = chinese_width(translation.trim());
+            if width > TRANSLATION_MAX_WIDTH {
+                bail!("翻译缓存第 {index} 条中文宽度 {width} 超过硬上限 {TRANSLATION_MAX_WIDTH}")
             }
         }
     }
@@ -531,13 +611,16 @@ impl Pipeline {
                 calls += 1;
             }
         }
+        let model_range_count = ranges.len();
+        ranges = enforce_segment_limits(cues, &ranges)?;
+        let hard_splits = ranges.len().saturating_sub(model_range_count);
         let result = subtitle::apply_ranges(cues, &ranges)?;
         stage.finish(
             "completed",
             duration,
             peak,
             Some(&format!(
-                "{} -> {} cues; mode={}; estimated_tokens={estimated}; estimated_bytes={estimated_bytes}; calls={calls}",
+                "{} -> {} cues; mode={}; estimated_tokens={estimated}; estimated_bytes={estimated_bytes}; calls={calls}; hard_splits={hard_splits}",
                 cues.len(),
                 result.len(),
                 batch_mode_name(self.config.ai.batch_mode)
@@ -759,7 +842,7 @@ impl Pipeline {
                         &result.value.to_string(),
                     )?;
                     match parse_translations(&result.value).and_then(|translations| {
-                        validate_translation_indexes(chunk.len(), &translations)?;
+                        validate_translation_output(chunk, &translations)?;
                         Ok(translations)
                     }) {
                         Ok(translations) => {
@@ -772,7 +855,7 @@ impl Pipeline {
                             // 反馈仍无效则减半拆分重试，定位问题批次，避免整批 token 白烧。
                             if attempt < attempts {
                                 feedback = Some(format!(
-                                    "上一轮输出未通过解析/校验：{error_message}。请只输出符合要求的 JSON，不要输出解释、Markdown 或额外字段。"
+                                    "上一轮输出未通过解析/校验：{error_message}。请只输出符合要求的 JSON，不要输出解释、Markdown 或额外字段；每条译文必须完整保留原意、名字和数字，同时将中文宽度压缩到 {TRANSLATION_MAX_WIDTH} 以内。"
                                 ));
                                 self.db.event(
                                     Some(job_id),
@@ -892,6 +975,62 @@ impl Pipeline {
 mod tests {
     use super::*;
     use crate::pipeline::testing::cue;
+
+    #[test]
+    fn hard_segment_limits_split_model_ranges_deterministically() {
+        let mut cues = vec![
+            cue(0, "one two three four five six seven eight"),
+            cue(
+                1,
+                "nine ten eleven twelve thirteen fourteen fifteen sixteen",
+            ),
+            cue(2, "short sentence"),
+            cue(3, "another short sentence"),
+        ];
+        // 2..3 单独都很短，但 2 与 3 之间的静音间隔达到 0.8 秒，必须断开。
+        cues[3].start = cues[2].end + SEGMENT_REQUIRED_GAP_SECONDS;
+        cues[3].end = cues[3].start + 1.0;
+
+        let repaired = enforce_segment_limits(&cues, &[(0, 3)]).unwrap();
+        assert_eq!(repaired, vec![(0, 0), (1, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn hard_segment_limits_split_ranges_over_eight_seconds() {
+        let mut cues = vec![cue(0, "one"), cue(1, "two"), cue(2, "three")];
+        cues[0].start = 0.0;
+        cues[0].end = 3.0;
+        cues[1].start = 3.1;
+        cues[1].end = 6.0;
+        cues[2].start = 6.1;
+        cues[2].end = 9.0;
+
+        let repaired = enforce_segment_limits(&cues, &[(0, 2)]).unwrap();
+        assert_eq!(repaired, vec![(0, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn hard_segment_limits_preserve_valid_model_boundaries() {
+        let cues = vec![cue(0, "hello"), cue(1, "world"), cue(2, "again")];
+        let repaired = enforce_segment_limits(&cues, &[(0, 1), (2, 2)]).unwrap();
+        assert_eq!(repaired, vec![(0, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn hard_segment_limits_keep_unavoidable_oversize_input_cue() {
+        let cues = vec![cue(0, &"word ".repeat(20)), cue(1, "next")];
+        let repaired = enforce_segment_limits(&cues, &[(0, 1)]).unwrap();
+        assert_eq!(repaired, vec![(0, 0), (1, 1)]);
+        assert!(!source_range_within_limits(&cues, 0, 0));
+    }
+
+    #[test]
+    fn translation_output_rejects_empty_and_overwide_text() {
+        let source = vec![cue(0, "hello")];
+        assert!(validate_translation_output(&source, &[(0, "你好".into())]).is_ok());
+        assert!(validate_translation_output(&source, &[(0, "".into())]).is_err());
+        assert!(validate_translation_output(&source, &[(0, "中".repeat(33))]).is_err());
+    }
 
     #[test]
     fn adaptive_translation_batches_are_contiguous() {
