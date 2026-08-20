@@ -93,16 +93,19 @@ fn split_cc_content(content: &str) -> Vec<String> {
     chunks
 }
 
-/// 把双语 cue 转成 B站 CC 字幕条目：只保留有非空翻译且时间合法（end > start）的。
+/// 把双语 cue 转成 B站 CC 字幕条目：清理传输层/音乐标记，只保留有非空翻译且
+/// 时间合法（end > start）的。这里保留最后一道清理，旧翻译缓存也不会把脏字符
+/// 再次提交到 B站。
 pub(super) fn cc_cues_from(cues: &[Cue], max_to: Option<f64>) -> Vec<CcCue> {
     cues.iter()
-        .filter(|c| {
-            c.translation
-                .as_deref()
-                .is_some_and(|t| !t.trim().is_empty())
-                && c.end > c.start
-        })
         .filter_map(|c| {
+            if c.end <= c.start {
+                return None;
+            }
+            let content = subtitle::sanitize_caption_text(c.translation.as_deref()?);
+            if content.is_empty() {
+                return None;
+            }
             let from = c.start;
             let mut to = c.end;
             if let Some(max) = max_to {
@@ -114,15 +117,7 @@ pub(super) fn cc_cues_from(cues: &[Cue], max_to: Option<f64>) -> Vec<CcCue> {
             if to <= from {
                 return None;
             }
-            Some((
-                from,
-                to,
-                c.translation
-                    .as_deref()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string(),
-            ))
+            Some((from, to, content))
         })
         .flat_map(|(from, to, content)| {
             let chunks = split_cc_content(&content);
@@ -479,6 +474,28 @@ mod tests {
         assert_eq!(cc[0].content, "你好");
         assert_eq!(cc[0].from, 0.0);
         assert_eq!(cc[0].to, 1.5);
+    }
+
+    #[test]
+    fn cc_cues_clean_old_cached_entities_and_music_labels() {
+        let cues = vec![
+            Cue {
+                start: 0.0,
+                end: 2.0,
+                source: "source".into(),
+                translation: Some("&gt;&gt; 看起来不错。[音乐] 准备好了吗？".into()),
+            },
+            Cue {
+                start: 2.0,
+                end: 3.0,
+                source: "music only".into(),
+                translation: Some("【音乐】♪".into()),
+            },
+        ];
+
+        let cc = cc_cues_from(&cues, None);
+        assert_eq!(cc.len(), 1);
+        assert_eq!(cc[0].content, "看起来不错。 准备好了吗？");
     }
 
     #[test]
