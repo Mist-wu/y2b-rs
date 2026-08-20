@@ -158,11 +158,30 @@ fn classify_prepare_failure(error: &anyhow::Error) -> PrepareFailureClass {
         PrepareFailureClass::GlobalAi
     } else if is_live_content_pending(error) {
         PrepareFailureClass::DeferredLive
-    } else if exceeds_duration_limit(error) {
+    } else if exceeds_duration_limit(error) || is_permanently_unavailable_source(error) {
         PrepareFailureClass::PermanentSkip
     } else {
         PrepareFailureClass::Retryable
     }
+}
+
+/// yt-dlp 对已删除、私享或因账号终止而永久不可用的视频会返回稳定错误。
+/// 这些状态不会因数分钟退避而恢复，继续下载只会制造多条相同失败记录。
+fn is_permanently_unavailable_source(error: &anyhow::Error) -> bool {
+    const PERMANENT_MARKERS: &[&str] = &[
+        "has been removed by the uploader",
+        "This video has been removed",
+        "Private video",
+        "This video is private",
+        "account associated with this video has been terminated",
+        "This video is no longer available",
+    ];
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        PERMANENT_MARKERS
+            .iter()
+            .any(|marker| message.contains(marker))
+    })
 }
 
 impl StageGuard {
@@ -806,6 +825,26 @@ mod tests {
         assert_eq!(
             classify_prepare_failure(&anyhow::anyhow!("视频时长超过上限: 7201s > 7200s")),
             PrepareFailureClass::PermanentSkip
+        );
+    }
+
+    #[test]
+    fn uploader_removed_video_is_permanent_but_transient_network_errors_retry() {
+        let removed = anyhow::anyhow!(
+            "ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader"
+        )
+        .context("子进程退出码 Some(1)");
+        assert!(is_permanently_unavailable_source(&removed));
+        assert_eq!(
+            classify_prepare_failure(&removed),
+            PrepareFailureClass::PermanentSkip
+        );
+
+        let timeout = anyhow::anyhow!("ERROR: [youtube] abc: timed out while downloading");
+        assert!(!is_permanently_unavailable_source(&timeout));
+        assert_eq!(
+            classify_prepare_failure(&timeout),
+            PrepareFailureClass::Retryable
         );
     }
 
