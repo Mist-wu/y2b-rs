@@ -184,10 +184,20 @@ pub(super) fn validate_translation_output(
     translations: &[(usize, String)],
 ) -> Result<()> {
     validate_translation_indexes(source.len(), translations)?;
+    let speaker_marker = Regex::new(r"(?:^|\s)(?:>>|＞＞)(?:\s|$)")?;
     for (index, text) in translations {
         let text = text.trim();
         if text.is_empty() && source[*index].source.chars().any(char::is_alphanumeric) {
             bail!("Pi 翻译第 {index} 条译文为空")
+        }
+        let lower = text.to_ascii_lowercase();
+        let has_speaker_marker = speaker_marker.is_match(text);
+        let has_music_marker = lower.contains("[music]")
+            || text.contains("[音乐]")
+            || text.contains("【音乐】")
+            || text.contains("（音乐）");
+        if has_speaker_marker || text.contains("&gt;") || has_music_marker {
+            bail!("Pi 翻译第 {index} 条含有禁止显示的说话人/音乐标记")
         }
         let width = chinese_width(text);
         if width > TRANSLATION_MAX_WIDTH {
@@ -925,7 +935,7 @@ impl Pipeline {
                             // 反馈仍无效则减半拆分重试，定位问题批次，避免整批 token 白烧。
                             if attempt < attempts {
                                 feedback = Some(format!(
-                                    "上一轮输出未通过解析/校验：{error_message}。请只输出符合要求的 JSON，不要输出解释、Markdown 或额外字段；每条译文必须完整保留原意、名字和数字，同时将中文宽度压缩到 {TRANSLATION_MAX_WIDTH} 以内。"
+                                    "上一轮输出未通过解析/校验：{error_message}。请只输出符合要求的 JSON，不要输出解释、Markdown 或额外字段；每条译文必须完整保留原意、名字和数字，同时将中文宽度压缩到 {TRANSLATION_MAX_WIDTH} 以内。说话人切换请改写为自然中文标点，不得输出 >>、&gt;、[music] 或 [音乐]。"
                                 ));
                                 self.db.event(
                                     Some(job_id),
@@ -1100,6 +1110,9 @@ mod tests {
         assert!(validate_translation_output(&source, &[(0, "你好".into())]).is_ok());
         assert!(validate_translation_output(&source, &[(0, "".into())]).is_err());
         assert!(validate_translation_output(&source, &[(0, "中".repeat(33))]).is_err());
+        assert!(validate_translation_output(&source, &[(0, ">> 你好".into())]).is_err());
+        assert!(validate_translation_output(&source, &[(0, "你好 [音乐]".into())]).is_err());
+        assert!(validate_translation_output(&source, &[(0, "你好。世界。".into())]).is_ok());
     }
 
     #[test]
