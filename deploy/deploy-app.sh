@@ -31,10 +31,13 @@ env_file=/etc/y2b/y2b.env
   echo "credential file must have mode 600: $env_file" >&2
   exit 1
 }
-grep -Eq '^DEEPSEEK_API_KEY=sk-[A-Za-z0-9_-]+$' "$env_file" || {
-  echo "credential file has invalid DEEPSEEK_API_KEY syntax: $env_file" >&2
+if grep -Eq '^[[:space:]]*(export[[:space:]]+)?DEEPSEEK_API_KEY[[:space:]]*=' "$env_file"; then
+  echo "DeepSeek key must not be stored in $env_file" >&2
   exit 1
-}
+fi
+
+command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
+python3 "$root_dir/deploy/y2b-set-deepseek-key.py" --check
 
 database=/var/lib/y2b/state.db
 assert_idle() {
@@ -58,6 +61,8 @@ install -m 0644 "$root_dir/pi/brawl-stars-glossary.json" /opt/y2b/pi/brawl-stars
 install -m 0644 "$root_dir/Cargo.lock" /opt/y2b/Cargo.lock
 install -d /opt/y2b/deploy
 install -m 0755 "$root_dir/deploy/restore.sh" /opt/y2b/deploy/restore.sh
+install -m 0755 "$root_dir/deploy/y2b-set-deepseek-key.py" /usr/local/sbin/y2b-set-deepseek-key
+install -m 0755 "$root_dir/deploy/y2b-set-deepseek-key.py" /opt/y2b/deploy/y2b-set-deepseek-key.py
 install -m 0644 "$root_dir/deploy/y2b-watch.service" /opt/y2b/deploy/y2b-watch.service
 install -m 0644 "$root_dir/deploy/y2b-watch.service" /etc/systemd/system/y2b-watch.service
 systemctl daemon-reload

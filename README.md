@@ -144,7 +144,7 @@ python3 scripts/audit_brawl_glossary.py \
   --production-output pi/brawl-stars-glossary.json
 ```
 
-脚本固定 `deepseek/deepseek-v4-flash` + `thinking=off`，凭据由服务器 `/etc/y2b/y2b.env` 注入，默认使用不含答案的 `pi/audit-policy.json`；`--server` 不是 `root@` 时远程命令自动加 `sudo -n`。审计模式下 extension 不加载生产词库，避免污染能力测试。支持 `--terms-file` 复用提取结果、`--resume` 断点续跑、`--shard-index/--shard-count` 分片；单词超时或失败计入错误并继续。
+脚本固定 `deepseek/deepseek-v4-flash` + `thinking=off`，与生产服务一样只从服务器 `/var/lib/y2b/pi-agent/auth.json` 读取 DeepSeek 凭据，默认使用不含答案的 `pi/audit-policy.json`；`--server` 不是 `root@` 时远程命令自动加 `sudo -n`。审计模式下 extension 不加载生产词库，避免污染能力测试。支持 `--terms-file` 复用提取结果、`--resume` 断点续跑、`--shard-index/--shard-count` 分片；单词超时或失败计入错误并继续。
 
 </details>
 
@@ -163,20 +163,23 @@ cargo install cargo-zigbuild --locked
 rustup target add x86_64-unknown-linux-musl
 cargo zigbuild --release --target x86_64-unknown-linux-musl
 
-# 3. 通过安全通道放置 DeepSeek 凭据；文件只包含 DEEPSEEK_API_KEY=<value>
-ssh azureuser@20.89.60.23 'sudo install -d -o root -g root -m 700 /etc/y2b'
-scp /path/to/y2b.env azureuser@20.89.60.23:/tmp/y2b.env
-ssh azureuser@20.89.60.23 'sudo install -o root -g root -m 600 /tmp/y2b.env /etc/y2b/y2b.env && rm /tmp/y2b.env'
-
-# 4. 上传二进制和运行资源
+# 3. 上传二进制、运行资源和安全换钥工具
 scp target/x86_64-unknown-linux-musl/release/y2b azureuser@20.89.60.23:/tmp/y2b
 ssh azureuser@20.89.60.23 'mkdir -p /tmp/y2b-release'
 scp -r pi config.example.toml deploy Cargo.lock azureuser@20.89.60.23:/tmp/y2b-release/
+ssh azureuser@20.89.60.23 'sudo install -o root -g root -m 755 /tmp/y2b-release/deploy/y2b-set-deepseek-key.py /usr/local/sbin/y2b-set-deepseek-key'
+
+# 4. 在 Mac 终端输入新 Key；输入不回显，Key 只经 stdin 发送且不会出现在命令历史
+(read -r -s 'Y2B_DEEPSEEK_KEY?请输入新的 DeepSeek API Key: '; printf '\n'; printf '%s' "$Y2B_DEEPSEEK_KEY" | ssh azureuser@20.89.60.23 'sudo /usr/local/sbin/y2b-set-deepseek-key')
+
+# 5. 部署应用
 ssh azureuser@20.89.60.23 'sudo bash /tmp/y2b-release/deploy/deploy-app.sh /tmp/y2b'
 ```
 
+换钥工具会原子写入专用认证文件，并删除 `/etc/y2b/y2b.env` 和全局 Pi 认证中的旧 DeepSeek 条目；它不会打印明文 Key。部署前可用 `sudo y2b-set-deepseek-key --check` 只读检查单一路径约束。
+
 > [!IMPORTANT]
-> 第 4 步不能只拷二进制。`/opt/y2b/pi/` 下的 `y2b-extension.ts`、`policy.json`、`audit-policy.json`、`brawl-stars-glossary.json` 由 `deploy-app.sh` 一并安装，缺任何一个都要等第一次真正调用 Pi 才暴露（`config-check` 只校验配置本身）。换机或手工搬运后必须跑一次 `deploy-app.sh` 补齐。
+> 第 3 步不能只拷二进制。`/opt/y2b/pi/` 下的 `y2b-extension.ts`、`policy.json`、`audit-policy.json`、`brawl-stars-glossary.json` 由 `deploy-app.sh` 一并安装，缺任何一个都要等第一次真正调用 Pi 才暴露（`config-check` 只校验配置本身）。换机或手工搬运后必须跑一次 `deploy-app.sh` 补齐。
 
 > [!WARNING]
 > 部署前确认没有投稿在途（`y2b jobs list` 无 `uploading`），避免中断真实上传。
@@ -187,8 +190,9 @@ ssh azureuser@20.89.60.23 'sudo bash /tmp/y2b-release/deploy/deploy-app.sh /tmp/
 
 | 路径 | 说明 |
 | --- | --- |
-| `/etc/y2b/y2b.env` | `root:root`；仓库和 systemd unit 只引用路径，不保存 Key |
-| `/root/.pi/agent/auth.json` | Pi 认证 |
+| `/var/lib/y2b/pi-agent/auth.json` | `root:root`、`0600`；y2b 唯一的 DeepSeek Key 路径，只含 `deepseek` provider |
+| `/etc/y2b/y2b.env` | `root:root`、`0600`；可保存 YouTube 等环境变量，禁止保存 `DEEPSEEK_API_KEY` |
+| `/root/.pi/agent/auth.json` | 全局 Pi 认证；可保留其他 provider，禁止保存 `deepseek` 条目 |
 | `/var/lib/y2b/youtube_cookies.txt` | YouTube cookies |
 | `/var/lib/y2b/bilibili_cookies.json` | Bilibili cookies |
 
@@ -205,7 +209,7 @@ systemctl show y2b-watch -p MemoryCurrent -p MemoryPeak -p MemorySwapCurrent
 在线备份每 6 小时一次，保留 4 个小时备份、7 个日备份、4 个周备份。数据库迁移前先执行 `y2b backup`。
 
 1. 空服务器运行 `bootstrap-server.sh`。
-2. 恢复 `/etc/y2b/config.toml` 和三份认证文件；`/opt/y2b/pi/` 下的资源由 `deploy-app.sh` 从仓库安装，无需单独备份。
+2. 恢复 `/etc/y2b/config.toml`、`/etc/y2b/y2b.env`、两个 cookies 文件，并用 `y2b-set-deepseek-key` 重新注入 DeepSeek Key；`/opt/y2b/pi/` 下的资源由 `deploy-app.sh` 从仓库安装，无需单独备份。
 3. 从 `/var/lib/y2b/backups/daily` 或 `weekly` 选数据库，执行 `deploy/restore.sh BACKUP.db`。
 4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时自动升级到 v10（新增超时长视频判定表，幂等）。旧频道和任务模式均为 `translated`；升级前停在待补字幕的任务各获一次自动补交机会，升级前的 `retry_wait` 行沿用固定 10 分钟退避。
 5. SQLite 保存完整队列：`queued`/`retry_wait`/`processing` 重启后恢复，任务模式和追加目标 BV 不丢失，`dead_letter` 从 TUI 或 CLI 恢复后重新下载。
