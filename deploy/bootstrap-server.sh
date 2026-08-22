@@ -5,7 +5,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-apt-get install -y ca-certificates curl jq xz-utils tar fontconfig gnupg
+apt-get install -y ca-certificates curl jq xz-utils tar fontconfig gnupg python3
 
 if ! swapon --show=NAME --noheadings | grep -qx /swapfile; then
   if [[ ! -f /swapfile ]]; then fallocate -l 2G /swapfile; fi
@@ -57,6 +57,10 @@ bili_bin=$(find "$tmp_dir" -type f -name biliup | head -1)
 install -m 0755 "$bili_bin" /usr/local/bin/biliup
 
 install -d /opt/y2b/pi /var/lib/y2b/{downloads,backups} /etc/y2b
+install -d -o root -g root -m 0700 /var/lib/y2b/pi-agent
+if [[ ! -f /etc/y2b/y2b.env ]]; then
+  install -o root -g root -m 0600 /dev/null /etc/y2b/y2b.env
+fi
 
 echo "node=$(node --version)"
 echo "pi=$(pi --version)"

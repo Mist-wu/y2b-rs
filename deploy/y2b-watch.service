@@ -7,8 +7,10 @@ After=network-online.target
 Type=simple
 WorkingDirectory=/var/lib/y2b
 Environment=HOME=/root
-Environment=PI_CODING_AGENT_DIR=/root/.pi/agent
+# DeepSeek 只从此专用 Pi 目录的 auth.json 读取；环境文件不保存 DeepSeek Key。
+Environment=PI_CODING_AGENT_DIR=/var/lib/y2b/pi-agent
 EnvironmentFile=/etc/y2b/y2b.env
+UnsetEnvironment=DEEPSEEK_API_KEY
 Environment=RUST_LOG=y2b_rs=info
 ExecStart=/usr/local/bin/y2b --config /etc/y2b/config.toml watch
 Restart=on-failure

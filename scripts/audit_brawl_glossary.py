@@ -24,7 +24,7 @@ USER_AGENT = "y2b-rs-glossary-audit/2.0"
 PI_PROVIDER = "deepseek"
 PI_MODEL = "deepseek-v4-flash"
 PI_THINKING = "off"
-PI_ENV_FILE = "/etc/y2b/y2b.env"
+PI_AUTH_DIR = "/var/lib/y2b/pi-agent"
 PATTERN_RULES = [
     {
         "id": "numeric-gems",
@@ -335,6 +335,10 @@ def call_pi(
     )
     args = [
         "env",
+        "-u",
+        "DEEPSEEK_API_KEY",
+        "HOME=/root",
+        f"PI_CODING_AGENT_DIR={PI_AUTH_DIR}",
         f"Y2B_PI_POLICY_PATH={policy}",
         "/usr/local/bin/pi",
         "--mode",
@@ -357,9 +361,7 @@ def call_pi(
         "--no-approve",
         payload,
     ]
-    remote_command = (
-        f"set -a; . {shlex.quote(PI_ENV_FILE)}; set +a; exec {shlex.join(args)}"
-    )
+    remote_command = f"exec {shlex.join(args)}"
     if not server.startswith("root@"):
         # 凭据文件和 Pi session 只有 root 可读，非 root 登录时提权执行。
         remote_command = f"sudo -n bash -c {shlex.quote(remote_command)}"
