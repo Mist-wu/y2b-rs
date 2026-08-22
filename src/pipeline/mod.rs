@@ -30,6 +30,10 @@ mod upload;
 
 pub use cc::{CC_INITIAL_DELAY_SECONDS, CC_MAX_ATTEMPTS};
 
+/// YouTube 的整数秒元数据与容器时长会有轻微舍入差异；超过这个范围通常意味着
+/// HLS 分片被跳过或合并出的文件不完整。
+const MAX_VIDEO_DURATION_DRIFT_SECONDS: f64 = 3.0;
+
 #[derive(Clone, Debug, Default)]
 pub struct AiCircuitBreaker {
     open: Arc<AtomicBool>,
@@ -68,6 +72,44 @@ struct StageGuard {
     id: i64,
     started: Instant,
     finished: bool,
+}
+
+/// 下载未正常完成（包括并行字幕分支失败导致 future 被取消）时，清掉本次留下的
+/// 最终文件和 `.part`/分格式临时文件。否则下次重试只凭最终文件名存在就会把残片
+/// 当成完整原片上传。
+struct DownloadOutputGuard {
+    work: PathBuf,
+    video_id: String,
+    armed: bool,
+}
+
+impl DownloadOutputGuard {
+    fn new(work: &Path, video_id: &str) -> Self {
+        Self {
+            work: work.to_path_buf(),
+            video_id: video_id.to_string(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DownloadOutputGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = remove_raw_video_outputs(&self.work, &self.video_id)
+        {
+            tracing::warn!(
+                video_id = %self.video_id,
+                work = %self.work.display(),
+                error = %error,
+                "清理未完成的视频下载缓存失败"
+            );
+        }
+    }
 }
 
 fn download_format_selector(meta: &VideoMetadata, max_pixels: u64, max_fps: f64) -> String {
@@ -115,6 +157,59 @@ fn find_video(work: &Path, video_id: &str) -> Option<PathBuf> {
         .find(|path| path.extension().is_some_and(|extension| extension == "mp4"))
         .cloned()
         .or_else(|| candidates.into_iter().next())
+}
+
+fn remove_raw_video_outputs(work: &Path, video_id: &str) -> Result<usize> {
+    let prefix = format!("{video_id}.raw.");
+    let mut removed = 0;
+    let entries = match fs::read_dir(work) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let matches = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&prefix));
+        if matches && path.is_file() {
+            fs::remove_file(&path)
+                .with_context(|| format!("删除不完整视频缓存失败: {}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn media_duration_from_probe(output: &str) -> Result<f64> {
+    let value: Value = serde_json::from_str(output).context("ffprobe 输出不是 JSON")?;
+    let duration = value
+        .pointer("/format/duration")
+        .and_then(|duration| {
+            duration
+                .as_f64()
+                .or_else(|| duration.as_str()?.parse::<f64>().ok())
+        })
+        .context("ffprobe 输出缺少 format.duration")?;
+    if !duration.is_finite() || duration <= 0.0 {
+        bail!("ffprobe 返回无效视频时长: {duration}")
+    }
+    Ok(duration)
+}
+
+fn validate_video_duration(actual: f64, expected: Option<f64>) -> Result<()> {
+    let Some(expected) = expected.filter(|duration| duration.is_finite() && *duration > 0.0) else {
+        return Ok(());
+    };
+    let drift = (actual - expected).abs();
+    if drift > MAX_VIDEO_DURATION_DRIFT_SECONDS {
+        bail!(
+            "下载视频时长不完整: 成片 {actual:.3}s，源元数据 {expected:.3}s，相差 {drift:.3}s（允许 {:.3}s）",
+            MAX_VIDEO_DURATION_DRIFT_SECONDS
+        )
+    }
+    Ok(())
 }
 
 async fn try_join_branches<A, B, FA, FB>(left: FA, right: FB) -> Result<(A, B)>
@@ -423,11 +518,11 @@ impl Pipeline {
             return self.run_direct(job, &meta, &work).await;
         }
 
-        // 投稿失败重试（如 21566 冷却）：发布元数据已存在时直接复用下载好的
-        // 原片和翻译缓存，跳过重复翻译。
-        if self.db.publication_metadata(&job.id)?.is_some()
-            && let Some(video) = find_video(&work, &meta.id)
-        {
+        // 投稿失败重试（如 21566 冷却）：发布元数据已存在时复用完整原片和翻译
+        // 缓存，跳过重复翻译。仍须经过 download_video 的时长校验；此前只检查
+        // 文件名存在，会把 yt-dlp 跳过 HLS 分片后生成的残片直接上传。
+        if self.db.publication_metadata(&job.id)?.is_some() {
+            let video = self.download_video(&job.id, &job.url, &meta, &work).await?;
             self.db.event(
                 Some(&job.id),
                 "info",
@@ -594,9 +689,26 @@ impl Pipeline {
     ) -> Result<PathBuf> {
         let video_id = &meta.id;
         if let Some(p) = find_video(work, video_id) {
-            return Ok(p);
+            match self
+                .validate_downloaded_video(job_id, &p, meta.duration, "video_cache_probe")
+                .await
+            {
+                Ok(()) => return Ok(p),
+                Err(error) => {
+                    self.db.event(
+                        Some(job_id),
+                        "warn",
+                        &format!("丢弃未通过完整性校验的视频缓存: {error:#}"),
+                    )?;
+                    remove_raw_video_outputs(work, video_id)?;
+                }
+            }
         }
+        // 没有最终文件时也可能残留 `.part` 或单独音视频流；从干净目录重下，
+        // 避免继续使用曾返回短读/503 的分片。
+        remove_raw_video_outputs(work, video_id)?;
         let mut stage = StageGuard::start(&self.db, job_id, "video_download", None, None, None)?;
+        let mut output_guard = DownloadOutputGuard::new(work, video_id);
         let mut cmd = ytdlp_command(&self.config.youtube);
         let format = download_format_selector(
             meta,
@@ -605,6 +717,7 @@ impl Pipeline {
         );
         cmd.args([
             "--no-playlist",
+            "--abort-on-unavailable-fragments",
             "--concurrent-fragments",
             "1",
             "--merge-output-format",
@@ -615,8 +728,29 @@ impl Pipeline {
         cmd.arg("-o")
             .arg(work.join(format!("{video_id}.raw.%(ext)s")));
         cmd.arg(url);
-        let out = run_monitored(cmd, Duration::from_secs(7200)).await?;
-        let path = find_video(work, video_id).context("yt-dlp 完成但未找到视频")?;
+        let out = match run_monitored(cmd, Duration::from_secs(7200)).await {
+            Ok(out) => out,
+            Err(error) => {
+                let elapsed = stage.elapsed_ms();
+                return Err(stage.fail(error, elapsed, 0)).context("下载 YouTube 原片失败");
+            }
+        };
+        let Some(path) = find_video(work, video_id) else {
+            let elapsed = stage.elapsed_ms();
+            return Err(stage.fail(
+                anyhow::anyhow!("yt-dlp 完成但未找到视频"),
+                elapsed,
+                out.peak_rss_kib,
+            ));
+        };
+        if let Err(error) = self
+            .validate_downloaded_video(job_id, &path, meta.duration, "video_download_probe")
+            .await
+        {
+            let elapsed = stage.elapsed_ms();
+            return Err(stage.fail(error, elapsed, out.peak_rss_kib));
+        }
+        output_guard.disarm();
         stage.finish(
             "completed",
             out.duration_ms,
@@ -624,6 +758,57 @@ impl Pipeline {
             Some(&path.to_string_lossy()),
         )?;
         Ok(path)
+    }
+
+    async fn validate_downloaded_video(
+        &self,
+        job_id: &str,
+        path: &Path,
+        expected_duration: Option<f64>,
+        stage_name: &str,
+    ) -> Result<()> {
+        let mut stage = StageGuard::start(&self.db, job_id, stage_name, None, None, None)?;
+        let mut cmd = Command::new(&self.config.render.ffprobe);
+        cmd.args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(path);
+        let out = match run_monitored(cmd, Duration::from_secs(60)).await {
+            Ok(out) => out,
+            Err(error) => {
+                let elapsed = stage.elapsed_ms();
+                return Err(stage.fail(error, elapsed, 0));
+            }
+        };
+        let actual_duration = match media_duration_from_probe(&out.stdout).and_then(|actual| {
+            validate_video_duration(actual, expected_duration)?;
+            Ok(actual)
+        }) {
+            Ok(duration) => duration,
+            Err(error) => {
+                return Err(stage.fail(error, out.duration_ms, out.peak_rss_kib));
+            }
+        };
+        let detail = match expected_duration {
+            Some(expected) => format!(
+                "{}; duration={actual_duration:.3}s; expected={expected:.3}s; drift={:.3}s",
+                path.display(),
+                (actual_duration - expected).abs()
+            ),
+            None => format!("{}; duration={actual_duration:.3}s", path.display()),
+        };
+        stage.finish(
+            "completed",
+            out.duration_ms,
+            out.peak_rss_kib,
+            Some(&detail),
+        )?;
+        Ok(())
     }
 
     async fn probe_media(&self, job_id: &str, path: &Path, label: &str) -> Result<()> {
@@ -731,6 +916,45 @@ mod tests {
         let mp4 = temp.path().join(format!("{video_id}.raw.mp4"));
         std::fs::write(&mp4, vec![1; 2048]).unwrap();
         assert_eq!(find_video(temp.path(), video_id), Some(mp4));
+    }
+
+    #[test]
+    fn failed_download_guard_removes_only_raw_video_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let video_id = "cancelled-video";
+        let final_video = temp.path().join(format!("{video_id}.raw.mp4"));
+        let fragment = temp
+            .path()
+            .join(format!("{video_id}.raw.mp4.part-Frag33.part"));
+        let subtitle = temp.path().join(format!("{video_id}.en.vtt"));
+        std::fs::write(&final_video, vec![1; 2048]).unwrap();
+        std::fs::write(&fragment, vec![1; 2048]).unwrap();
+        std::fs::write(&subtitle, "WEBVTT\n").unwrap();
+
+        {
+            let _guard = DownloadOutputGuard::new(temp.path(), video_id);
+        }
+        assert!(!final_video.exists());
+        assert!(!fragment.exists());
+        assert!(subtitle.exists());
+
+        std::fs::write(&final_video, vec![1; 2048]).unwrap();
+        {
+            let mut guard = DownloadOutputGuard::new(temp.path(), video_id);
+            guard.disarm();
+        }
+        assert!(final_video.exists());
+    }
+
+    #[test]
+    fn downloaded_video_duration_rejects_skipped_fragments() {
+        let output = r#"{"format":{"duration":"1493.947000"}}"#;
+        let actual = media_duration_from_probe(output).unwrap();
+        validate_video_duration(actual, Some(1494.0)).unwrap();
+
+        let error = validate_video_duration(1439.0, Some(1494.0)).unwrap_err();
+        assert!(error.to_string().contains("相差 55.000s"));
+        assert!(media_duration_from_probe(r#"{"format":{}}"#).is_err());
     }
 
     #[test]
