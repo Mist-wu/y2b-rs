@@ -540,6 +540,26 @@ impl Database {
         Ok(())
     }
 
+    /// 最近一次全量刷新后新增的频道不能等到次日才获得 uploads 播放列表。
+    ///
+    /// 手工 CLI 可能没有 Data API Key，只能先用 yt-dlp 建立频道记录；常驻服务
+    /// 随后看到这类新记录时，应立即触发一次补刷新。用 `created_at` 与全局刷新
+    /// 时间比较，可保证无效频道不会每轮都重复消耗 channels.list 配额。
+    pub fn has_missing_uploads_playlist_created_after(
+        &self,
+        refreshed_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM channels
+               WHERE uploads_playlist_id IS NULL
+                 AND julianday(created_at) > julianday(?)
+             )",
+            [format_timestamp(refreshed_at)],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
     pub fn due_websub_channels(&self, renew_before: DateTime<Utc>) -> Result<Vec<WebSubChannel>> {
         let c = self.conn();
         let mut q = c.prepare(&format!(
