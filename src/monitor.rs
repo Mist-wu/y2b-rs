@@ -851,13 +851,18 @@ impl Monitor {
             .as_deref()
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
             .map(|value| value.with_timezone(&Utc));
-        let channels = self.db.list_channels()?;
-        let refresh_due = !refreshed_this_process
+        let periodic_refresh_due = !refreshed_this_process
             || last_refresh.is_none_or(|last| now - last >= API_UPLOADS_REFRESH_INTERVAL);
+        let new_channel_missing_uploads = match last_refresh {
+            Some(last) => self.db.has_missing_uploads_playlist_created_after(last)?,
+            None => false,
+        };
+        let refresh_due = periodic_refresh_due || new_channel_missing_uploads;
         if !refresh_due {
             return Ok(());
         }
 
+        let channels = self.db.list_channels()?;
         let channel_ids = channels
             .iter()
             .map(|channel| channel.youtube_channel_id.clone())
@@ -2472,6 +2477,74 @@ esac
                 .unwrap()
                 .as_deref(),
             Some("2")
+        );
+    }
+
+    #[tokio::test]
+    async fn data_api_refreshes_channel_added_after_recent_playlist_refresh() {
+        let channels = r#"{"items":[{"id":"UC-late-channel","contentDetails":{"relatedPlaylists":{"uploads":"UU-late-channel"}}}]}"#;
+        let playlist = r#"{"items":[{"snippet":{"title":"late upload","publishedAt":"2035-01-01T00:00:00Z","resourceId":{"videoId":"latevideo01"}},"contentDetails":{"videoId":"latevideo01"}}]}"#;
+        let (base_url, server) = mock_json_sequence(vec![(200, channels), (200, playlist)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("late-channel.db")).unwrap();
+        db.set_discovery_state(
+            API_UPLOADS_REFRESHED_AT_KEY,
+            &(Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+        )
+        .unwrap();
+        add_test_channel(&db, "https://example.invalid/feed", "late-channel");
+        let monitor =
+            Monitor::new_with_data_api(Config::default(), db.clone(), Some("test-key"), &base_url)
+                .unwrap();
+        monitor
+            .uploads_refreshed_this_process
+            .store(true, Ordering::Release);
+
+        assert_eq!(monitor.poll_data_api().await.unwrap(), 1);
+        server.await.unwrap();
+
+        let channel = db.list_channels().unwrap().remove(0);
+        assert_eq!(
+            channel.uploads_playlist_id.as_deref(),
+            Some("UU-late-channel")
+        );
+        assert_eq!(
+            db.get_video_candidate("latevideo01")
+                .unwrap()
+                .unwrap()
+                .source,
+            CandidateSource::DataApi
+        );
+    }
+
+    #[tokio::test]
+    async fn data_api_does_not_repeat_recent_refresh_for_still_missing_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("missing-channel.db")).unwrap();
+        add_test_channel(&db, "https://example.invalid/feed", "missing-channel");
+        db.set_discovery_state(
+            API_UPLOADS_REFRESHED_AT_KEY,
+            &(Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
+        )
+        .unwrap();
+        let monitor = Monitor::new_with_data_api(
+            Config::default(),
+            db.clone(),
+            Some("test-key"),
+            "http://127.0.0.1:9/youtube/v3",
+        )
+        .unwrap();
+        monitor
+            .uploads_refreshed_this_process
+            .store(true, Ordering::Release);
+
+        assert_eq!(monitor.poll_data_api().await.unwrap(), 0);
+        assert!(db.list_channels().unwrap()[0].uploads_playlist_id.is_none());
+        assert_eq!(
+            db.get_discovery_state("quota_used_today")
+                .unwrap()
+                .as_deref(),
+            Some("0")
         );
     }
 
