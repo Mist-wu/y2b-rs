@@ -4,6 +4,7 @@ use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessesToUpdate, System};
+use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
@@ -41,6 +42,24 @@ pub struct ProcessOutput {
     pub stderr: String,
     pub duration_ms: i64,
     pub peak_rss_kib: u64,
+}
+
+/// 子进程已经退出、且 stdout/stderr 已完整回收时的失败。
+///
+/// 调用方通常只需要把它当作普通错误处理；Pi 审计则会读取其中的 JSONL 尾部，
+/// 尽可能回收供应商已经返回的 token/费用，避免“请求已计费但本地只看到退出码”。
+#[derive(Debug, Error)]
+#[error("子进程退出码 {code:?}: {detail}")]
+pub struct ProcessFailure {
+    code: Option<i32>,
+    detail: String,
+    output: ProcessOutput,
+}
+
+impl ProcessFailure {
+    pub fn output(&self) -> &ProcessOutput {
+        &self.output
+    }
 }
 
 /// `run_monitored` future 被 `try_join!` 等调用方取消时，Tokio 的
@@ -124,19 +143,21 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
     process_group.disarm();
     let stdout = String::from_utf8_lossy(&out).to_string();
     let stderr = String::from_utf8_lossy(&err).to_string();
-    if !status.success() {
-        bail!(
-            "子进程退出码 {:?}: {}",
-            status.code(),
-            tail(&(stdout.clone() + "\n" + &stderr), 80)
-        );
-    }
-    Ok(ProcessOutput {
+    let output = ProcessOutput {
         stdout,
         stderr,
         duration_ms: started.elapsed().as_millis() as i64,
         peak_rss_kib: peak,
-    })
+    };
+    if !status.success() {
+        return Err(ProcessFailure {
+            code: status.code(),
+            detail: tail(&(output.stdout.clone() + "\n" + &output.stderr), 80),
+            output,
+        }
+        .into());
+    }
+    Ok(output)
 }
 
 /// 向整组发 SIGKILL。进程组 leader 即使已经退出，组内 PyInstaller/Node 后代
@@ -182,6 +203,22 @@ pub fn tail(s: &str, lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn nonzero_exit_preserves_captured_output_for_audit() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '{\"type\":\"agent_end\"}'; printf 'provider error' >&2; exit 7",
+        ]);
+        let error = run_monitored(command, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        let failure = error.downcast_ref::<ProcessFailure>().unwrap();
+        assert_eq!(failure.output().stdout, r#"{"type":"agent_end"}"#);
+        assert_eq!(failure.output().stderr, "provider error");
+        assert!(error.to_string().contains("子进程退出码 Some(7)"));
+    }
 
     #[tokio::test]
     async fn timeout_kills_the_whole_process_group() {

@@ -786,13 +786,12 @@ impl Pipeline {
                 "text":c.source
             })).collect::<Vec<_>>()
         });
-        let input_json = payload.to_string();
         // 分句输出偶发 JSON 截断（deepseek 输出限制），失败时复用翻译的重试次数退避重试。
         let attempts = self.config.ai.translation_batch_retries.saturating_add(1);
         let mut last_error = None;
         let mut result = None;
         for attempt in 1..=attempts {
-            let r = self.call_pi(payload.clone()).await;
+            let r = self.call_pi(job_id, stage, payload.clone()).await;
             match r {
                 Ok(r) => match parse_ranges(&r.value).and_then(|local| {
                     validate_ranges_cover(cues.len(), &local)?;
@@ -825,18 +824,6 @@ impl Pipeline {
             last_error
                 .unwrap_or_else(|| anyhow::anyhow!("分句窗口 {core_start}..{preferred_end} 失败"))
         })?;
-        self.db.record_ai_call(
-            job_id,
-            stage,
-            "segment",
-            &self.config.ai.provider,
-            &self.config.ai.model,
-            &self.config.ai.thinking,
-            &r.usage,
-            r.output.duration_ms,
-            &input_json,
-            &r.value.to_string(),
-        )?;
         Ok((local, r.output.duration_ms, r.output.peak_rss_kib))
     }
 
@@ -950,7 +937,7 @@ impl Pipeline {
             "items":items
         });
         let glossary = load_curated_glossary(&self.config.ai.policy)?;
-        // 每次尝试都会带上不同的 feedback，审计用的 input_json 在循环内单独构造。
+        // 每次尝试都会带上不同的 feedback；call_pi 在调用边界统一登记审计行。
         let attempts = self.config.ai.translation_batch_retries.saturating_add(1);
         let mut aggregate_duration_ms = 0;
         let mut peak_rss_kib = 0;
@@ -962,23 +949,10 @@ impl Pipeline {
             if let Some(message) = &feedback {
                 call_payload["feedback"] = json!(message);
             }
-            let input_json = call_payload.to_string();
-            match self.call_pi(call_payload).await {
+            match self.call_pi(job_id, stage, call_payload).await {
                 Ok(result) => {
                     aggregate_duration_ms += result.output.duration_ms;
                     peak_rss_kib = peak_rss_kib.max(result.output.peak_rss_kib);
-                    self.db.record_ai_call(
-                        job_id,
-                        stage,
-                        "translate",
-                        &self.config.ai.provider,
-                        &self.config.ai.translation_model,
-                        &self.config.ai.thinking,
-                        &result.usage,
-                        result.output.duration_ms,
-                        &input_json,
-                        &result.value.to_string(),
-                    )?;
                     match parse_translations(&result.value).and_then(|translations| {
                         validate_translation_output(chunk, &translations)?;
                         validate_translation_glossary(chunk, &translations, &glossary)?;
