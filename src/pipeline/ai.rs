@@ -1,8 +1,9 @@
 //! Pi 调用与 token 预算：子进程调用、事件流解析和输入规模估算。
 use super::Pipeline;
 use crate::config::BatchMode;
+use crate::db::Database;
 use crate::model::AiUsage;
-use crate::process::{ProcessOutput, run_monitored};
+use crate::process::{ProcessFailure, ProcessOutput, run_monitored};
 use crate::subtitle::Cue;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -13,8 +14,69 @@ use tokio::process::Command;
 #[derive(Debug)]
 pub(super) struct PiResult {
     pub(super) value: Value,
-    pub(super) usage: AiUsage,
     pub(super) output: ProcessOutput,
+}
+
+struct PiStreamOutcome {
+    value: Result<Value>,
+    usage: AiUsage,
+    raw_text: Option<String>,
+}
+
+/// 每次实际启动 Pi 前先落一条 `started`，所有正常返回和错误路径再原位收尾。
+/// future 被并发失败取消时 Drop 会留下 `interrupted`，保证调用次数不静默丢失。
+struct AiCallGuard {
+    db: Database,
+    id: i64,
+    finished: bool,
+}
+
+impl AiCallGuard {
+    #[allow(clippy::too_many_arguments)]
+    fn begin(
+        db: &Database,
+        job_id: &str,
+        stage_id: i64,
+        task: &str,
+        provider: &str,
+        model: &str,
+        thinking: &str,
+        input_json: &str,
+    ) -> Result<Self> {
+        Ok(Self {
+            db: db.clone(),
+            id: db.begin_ai_call(
+                job_id, stage_id, task, provider, model, thinking, input_json,
+            )?,
+            finished: false,
+        })
+    }
+
+    fn finish(
+        &mut self,
+        status: &str,
+        usage: &AiUsage,
+        duration_ms: i64,
+        output_json: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.db
+            .finish_ai_call(self.id, status, usage, duration_ms, output_json, error)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for AiCallGuard {
+    fn drop(&mut self) {
+        if !self.finished
+            && let Err(error) = self
+                .db
+                .interrupt_ai_call(self.id, "Pi 调用未正常收尾（future 被取消或审计写回失败）")
+        {
+            tracing::error!(ai_call_id = self.id, error = %error, "AI 调用中断状态写入失败");
+        }
+    }
 }
 
 pub(super) const PI_PROMPT_OVERHEAD_TOKENS: usize = 2_048;
@@ -120,7 +182,7 @@ fn classify_process_error(error: anyhow::Error) -> anyhow::Error {
         .unwrap_or(error)
 }
 
-pub(super) fn parse_pi_stream(stream: &str) -> Result<(Value, AiUsage)> {
+fn inspect_pi_stream(stream: &str) -> PiStreamOutcome {
     let mut text = None;
     let mut usage = AiUsage {
         input: 0,
@@ -131,19 +193,18 @@ pub(super) fn parse_pi_stream(stream: &str) -> Result<(Value, AiUsage)> {
         total: 0,
         cost: None,
     };
+    let mut terminal_error = None;
     for line in stream.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         if v["type"] == "agent_end" {
-            if let Some(error) = pi_event_error(&v) {
-                return Err(error);
-            }
+            let mut current_error = pi_event_error(&v);
             if let Some(messages) = v["messages"].as_array()
                 && let Some(m) = messages.iter().rev().find(|m| m["role"] == "assistant")
             {
-                if let Some(error) = pi_event_error(m) {
-                    return Err(error);
+                if current_error.is_none() {
+                    current_error = pi_event_error(m);
                 }
                 text = m["content"]
                     .as_array()
@@ -155,19 +216,35 @@ pub(super) fn parse_pi_stream(stream: &str) -> Result<(Value, AiUsage)> {
                     .map(str::to_string);
                 usage = parse_usage(&m["usage"]);
             }
+            terminal_error = current_error;
         }
     }
-    let raw = text.context("Pi JSON 流中没有最终文本")?;
-    let clean = raw
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-    Ok((
-        serde_json::from_str(clean).context("Pi 最终文本不是 JSON")?,
+    let value = match terminal_error {
+        Some(error) => Err(error),
+        None => text
+            .as_deref()
+            .context("Pi JSON 流中没有最终文本")
+            .and_then(|raw| {
+                let clean = raw
+                    .trim()
+                    .trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim();
+                serde_json::from_str(clean).context("Pi 最终文本不是 JSON")
+            }),
+    };
+    PiStreamOutcome {
+        value,
         usage,
-    ))
+        raw_text: text,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn parse_pi_stream(stream: &str) -> Result<(Value, AiUsage)> {
+    let PiStreamOutcome { value, usage, .. } = inspect_pi_stream(stream);
+    Ok((value?, usage))
 }
 
 pub(super) fn parse_usage(v: &Value) -> AiUsage {
@@ -276,12 +353,32 @@ pub(super) fn batch_mode_name(mode: BatchMode) -> &'static str {
 }
 
 impl Pipeline {
-    pub(super) async fn call_pi(&self, payload: Value) -> Result<PiResult> {
-        let model = if payload.get("task").and_then(Value::as_str) == Some("translate") {
+    pub(super) async fn call_pi(
+        &self,
+        job_id: &str,
+        stage_id: i64,
+        payload: Value,
+    ) -> Result<PiResult> {
+        let task = payload
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let model = if task == "translate" {
             &self.config.ai.translation_model
         } else {
             &self.config.ai.model
         };
+        let input_json = payload.to_string();
+        let mut audit = AiCallGuard::begin(
+            &self.db,
+            job_id,
+            stage_id,
+            task,
+            &self.config.ai.provider,
+            model,
+            &self.config.ai.thinking,
+            &input_json,
+        )?;
         let mut cmd = Command::new(&self.config.ai.pi);
         cmd.args([
             "--mode",
@@ -306,16 +403,61 @@ impl Pipeline {
             "--no-approve",
         ]);
         cmd.env("Y2B_PI_POLICY_PATH", &self.config.ai.policy);
-        cmd.arg(payload.to_string());
-        let out = run_monitored(cmd, Duration::from_secs(self.config.ai.timeout_seconds))
-            .await
-            .map_err(classify_process_error)?;
-        let (value, usage) = parse_pi_stream(&out.stdout)?;
-        Ok(PiResult {
+        cmd.arg(input_json);
+        let out =
+            match run_monitored(cmd, Duration::from_secs(self.config.ai.timeout_seconds)).await {
+                Ok(output) => output,
+                Err(process_error) => {
+                    let (usage, duration_ms, raw_text) = process_error
+                        .downcast_ref::<ProcessFailure>()
+                        .map(|failure| {
+                            let output = failure.output();
+                            let parsed = inspect_pi_stream(&output.stdout);
+                            (parsed.usage, output.duration_ms, parsed.raw_text)
+                        })
+                        .unwrap_or_else(|| (empty_usage(), 0, None));
+                    let error = classify_process_error(process_error);
+                    let message = error.to_string();
+                    audit.finish(
+                        "process_error",
+                        &usage,
+                        duration_ms,
+                        raw_text.as_deref(),
+                        Some(&message),
+                    )?;
+                    return Err(error);
+                }
+            };
+        let PiStreamOutcome {
             value,
             usage,
-            output: out,
-        })
+            raw_text,
+        } = inspect_pi_stream(&out.stdout);
+        match value {
+            Ok(value) => {
+                let output_json = value.to_string();
+                audit.finish("success", &usage, out.duration_ms, Some(&output_json), None)?;
+                Ok(PiResult { value, output: out })
+            }
+            Err(error) => {
+                let status = if is_ai_global_fault(&error)
+                    || error.to_string().starts_with("Pi 返回错误:")
+                {
+                    "provider_error"
+                } else {
+                    "parse_error"
+                };
+                let message = error.to_string();
+                audit.finish(
+                    status,
+                    &usage,
+                    out.duration_ms,
+                    raw_text.as_deref(),
+                    Some(&message),
+                )?;
+                Err(error)
+            }
+        }
     }
 
     pub(super) fn ai_token_budget(&self) -> Result<usize> {
@@ -325,6 +467,18 @@ impl Pipeline {
             bail!("AI token 配置无效: safe_context_tokens={safe}, context_window_tokens={context}")
         }
         Ok(safe)
+    }
+}
+
+fn empty_usage() -> AiUsage {
+    AiUsage {
+        input: 0,
+        output: 0,
+        reasoning: 0,
+        cache_read: 0,
+        cache_write: 0,
+        total: 0,
+        cost: None,
     }
 }
 
@@ -339,6 +493,34 @@ mod tests {
         let (v, u) = parse_pi_stream(s).unwrap();
         assert_eq!(parse_ranges(&v).unwrap(), vec![(0, 1)]);
         assert_eq!(u.total, 5);
+    }
+
+    #[test]
+    fn invalid_final_json_retains_usage_for_audit() {
+        let stream = r#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"not json"}],"usage":{"input":11,"output":7,"cacheRead":3,"totalTokens":21,"cost":{"total":0.0123}}}]}"#;
+        let parsed = inspect_pi_stream(stream);
+        assert_eq!(parsed.raw_text.as_deref(), Some("not json"));
+        assert_eq!(parsed.usage.input, 11);
+        assert_eq!(parsed.usage.output, 7);
+        assert_eq!(parsed.usage.cache_read, 3);
+        assert_eq!(parsed.usage.total, 21);
+        assert_eq!(parsed.usage.cost, Some(0.0123));
+        assert_eq!(
+            parsed.value.unwrap_err().to_string(),
+            "Pi 最终文本不是 JSON"
+        );
+    }
+
+    #[test]
+    fn provider_error_retains_usage_for_audit() {
+        let stream = r#"{"type":"agent_end","messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"provider temporarily unavailable","usage":{"input":13,"output":2,"totalTokens":15,"cost":{"total":0.004}}}]}"#;
+        let parsed = inspect_pi_stream(stream);
+        assert_eq!(parsed.usage.total, 15);
+        assert_eq!(parsed.usage.cost, Some(0.004));
+        assert_eq!(
+            parsed.value.unwrap_err().to_string(),
+            "Pi 返回错误: provider temporarily unavailable"
+        );
     }
 
     #[test]

@@ -493,26 +493,13 @@ impl Pipeline {
             if let Some(message) = &feedback {
                 payload["feedback"] = json!(message);
             }
-            let input_json = payload.to_string();
-            let r = match self.call_pi(payload).await {
+            let r = match self.call_pi(job_id, stage.id(), payload).await {
                 Ok(result) => result,
                 Err(error) => {
                     let elapsed = stage.elapsed_ms();
                     return Err(stage.fail(error, elapsed, 0));
                 }
             };
-            self.db.record_ai_call(
-                job_id,
-                stage.id(),
-                "publish_metadata",
-                &self.config.ai.provider,
-                &self.config.ai.model,
-                &self.config.ai.thinking,
-                &r.usage,
-                r.output.duration_ms,
-                &input_json,
-                &r.value.to_string(),
-            )?;
             let metadata = match parse_publication_metadata(&r.value) {
                 Ok(metadata) => metadata,
                 Err(error) => {

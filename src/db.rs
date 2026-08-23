@@ -112,10 +112,12 @@ impl Database {
           id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id),
           stage_run_id INTEGER REFERENCES stage_runs(id), task TEXT NOT NULL,
           provider TEXT NOT NULL, model TEXT NOT NULL, thinking TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'success', error TEXT,
           input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
           reasoning_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
           cache_write_tokens INTEGER DEFAULT 0, total_tokens INTEGER DEFAULT 0,
-          cost REAL, duration_ms INTEGER, input_json TEXT, output_json TEXT, created_at TEXT NOT NULL
+          cost REAL, duration_ms INTEGER, input_json TEXT, output_json TEXT,
+          created_at TEXT NOT NULL, finished_at TEXT
         );
         CREATE TABLE IF NOT EXISTS events(
           id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, level TEXT NOT NULL,
@@ -344,6 +346,28 @@ impl Database {
             INSERT OR IGNORE INTO schema_migrations(version,applied_at)
               VALUES(15,CURRENT_TIMESTAMP);
             "#,
+        )?;
+        // v16: AI 审计先登记调用、再写回结果。即使 Pi 输出无法解析、进程失败或
+        // future 被取消，也会留下一条明确状态，而不是从费用统计中静默消失。
+        for (column, definition) in [
+            ("status", "TEXT NOT NULL DEFAULT 'success'"),
+            ("error", "TEXT"),
+            ("finished_at", "TEXT"),
+        ] {
+            if !self.has_column("ai_calls", column)? {
+                self.conn().execute(
+                    &format!("ALTER TABLE ai_calls ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        self.conn().execute(
+            "UPDATE ai_calls SET finished_at=created_at WHERE finished_at IS NULL AND status='success'",
+            [],
+        )?;
+        self.conn().execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(16,CURRENT_TIMESTAMP)",
+            [],
         )?;
         Ok(())
     }
@@ -1427,7 +1451,7 @@ impl Database {
         .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn record_ai_call(
+    pub fn begin_ai_call(
         &self,
         job_id: &str,
         stage_id: i64,
@@ -1435,12 +1459,38 @@ impl Database {
         provider: &str,
         model: &str,
         thinking: &str,
+        input_json: &str,
+    ) -> Result<i64> {
+        let c = self.conn();
+        c.execute(
+            "INSERT INTO ai_calls(job_id,stage_run_id,task,provider,model,thinking,status,input_json,created_at) VALUES(?,?,?,?,?,?,'started',?,?)",
+            params![job_id,stage_id,task,provider,model,thinking,input_json,Utc::now().to_rfc3339()],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_ai_call(
+        &self,
+        id: i64,
+        status: &str,
         usage: &AiUsage,
         duration_ms: i64,
-        input_json: &str,
-        output_json: &str,
+        output_json: Option<&str>,
+        error: Option<&str>,
     ) -> Result<()> {
-        self.conn().execute("INSERT INTO ai_calls(job_id,stage_run_id,task,provider,model,thinking,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost,duration_ms,input_json,output_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![job_id,stage_id,task,provider,model,thinking,usage.input,usage.output,usage.reasoning,usage.cache_read,usage.cache_write,usage.total,usage.cost,duration_ms,input_json,output_json,Utc::now().to_rfc3339()])?;
+        self.conn().execute(
+            "UPDATE ai_calls SET status=?,error=?,input_tokens=?,output_tokens=?,reasoning_tokens=?,cache_read_tokens=?,cache_write_tokens=?,total_tokens=?,cost=?,duration_ms=?,output_json=?,finished_at=? WHERE id=?",
+            params![status,error,usage.input,usage.output,usage.reasoning,usage.cache_read,usage.cache_write,usage.total,usage.cost,duration_ms,output_json,Utc::now().to_rfc3339(),id],
+        )?;
+        Ok(())
+    }
+
+    pub fn interrupt_ai_call(&self, id: i64, error: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE ai_calls SET status='interrupted',error=?,finished_at=? WHERE id=? AND status='started'",
+            params![error,Utc::now().to_rfc3339(),id],
+        )?;
         Ok(())
     }
     pub fn ai_totals(&self) -> Result<AiUsage> {
@@ -1673,6 +1723,47 @@ fn usage_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AiUsage> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn migrates_existing_ai_calls_to_audited_lifecycle() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("v15-ai-calls.db");
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            r#"
+            CREATE TABLE ai_calls(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+              stage_run_id INTEGER, task TEXT NOT NULL,
+              provider TEXT NOT NULL, model TEXT NOT NULL, thinking TEXT NOT NULL,
+              input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+              reasoning_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+              cache_write_tokens INTEGER DEFAULT 0, total_tokens INTEGER DEFAULT 0,
+              cost REAL, duration_ms INTEGER, input_json TEXT, output_json TEXT,
+              created_at TEXT NOT NULL
+            );
+            INSERT INTO ai_calls(
+              job_id,task,provider,model,thinking,total_tokens,cost,created_at
+            ) VALUES('legacy-job','translate','deepseek','pro','off',42,0.01,'2026-08-01T00:00:00Z');
+            "#,
+        )
+        .unwrap();
+        drop(old);
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 16);
+        let migrated: (String, Option<String>, String) = db
+            .conn()
+            .query_row(
+                "SELECT status,error,finished_at FROM ai_calls WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            migrated,
+            ("success".into(), None, "2026-08-01T00:00:00Z".into())
+        );
+    }
+
     fn source_metadata() -> crate::model::VideoMetadata {
         crate::model::VideoMetadata {
             id: "ready-video".into(),
@@ -1742,7 +1833,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 15);
+        assert_eq!(db.schema_version().unwrap(), 16);
         assert_eq!(
             db.list_channels().unwrap()[0].transfer_mode,
             TransferMode::Translated
@@ -1758,7 +1849,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
-        assert_eq!(db.schema_version().unwrap(), 15);
+        assert_eq!(db.schema_version().unwrap(), 16);
         assert!(
             db.create_job(NewJob {
                 channel_id: None,
@@ -1910,6 +2001,131 @@ mod tests {
             db.get_job(&second).unwrap().unwrap().transfer_mode,
             TransferMode::Translated
         );
+    }
+
+    #[test]
+    fn ai_call_audit_tracks_failures_and_interruptions() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("ai-audit.db")).unwrap();
+        let job_id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "ai-audit",
+                url: "https://youtu.be/ai-audit",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        let stage_id = db
+            .start_stage(
+                &job_id,
+                "translation",
+                Some("deepseek"),
+                Some("deepseek-v4-pro"),
+                Some("off"),
+            )
+            .unwrap();
+
+        let failed_id = db
+            .begin_ai_call(
+                &job_id,
+                stage_id,
+                "translate",
+                "deepseek",
+                "deepseek-v4-pro",
+                "off",
+                r#"{"task":"translate"}"#,
+            )
+            .unwrap();
+        let started: String = db
+            .conn()
+            .query_row(
+                "SELECT status FROM ai_calls WHERE id=?",
+                [failed_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(started, "started");
+
+        let usage = AiUsage {
+            input: 11,
+            output: 7,
+            reasoning: 0,
+            cache_read: 3,
+            cache_write: 0,
+            total: 21,
+            cost: Some(0.0123),
+        };
+        db.finish_ai_call(
+            failed_id,
+            "parse_error",
+            &usage,
+            456,
+            Some("not json"),
+            Some("Pi 最终文本不是 JSON"),
+        )
+        .unwrap();
+        let failed: (String, i64, Option<f64>, String, String, bool) = db
+            .conn()
+            .query_row(
+                "SELECT status,total_tokens,cost,output_json,error,finished_at IS NOT NULL FROM ai_calls WHERE id=?",
+                [failed_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            failed,
+            (
+                "parse_error".into(),
+                21,
+                Some(0.0123),
+                "not json".into(),
+                "Pi 最终文本不是 JSON".into(),
+                true,
+            )
+        );
+
+        let interrupted_id = db
+            .begin_ai_call(
+                &job_id,
+                stage_id,
+                "segment",
+                "deepseek",
+                "deepseek-v4-flash",
+                "off",
+                r#"{"task":"segment"}"#,
+            )
+            .unwrap();
+        db.interrupt_ai_call(interrupted_id, "future cancelled")
+            .unwrap();
+        let interrupted: (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT status,error FROM ai_calls WHERE id=?",
+                [interrupted_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            interrupted,
+            ("interrupted".into(), "future cancelled".into())
+        );
+
+        let totals = db.ai_totals_for_job(&job_id).unwrap();
+        assert_eq!(totals.total, 21);
+        assert_eq!(totals.cost, Some(0.0123));
     }
 
     #[test]
@@ -2414,7 +2630,7 @@ mod tests {
         drop(db);
 
         let reopened = Database::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 15);
+        assert_eq!(reopened.schema_version().unwrap(), 16);
         assert!(reopened.is_over_duration_video("too-long", 7200).unwrap());
         reopened
             .record_over_duration_video("too-long", None, 8000, "9000s > 8000s")
