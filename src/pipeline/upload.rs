@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::sleep;
 
-pub(super) const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
+pub const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
 
 pub(super) fn ensure_prepared_file(path: &Path, label: &str) -> Result<()> {
     if !path.metadata().is_ok_and(|metadata| metadata.len() > 0) {

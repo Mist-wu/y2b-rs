@@ -14,7 +14,7 @@ const GATE_BATCH: usize = 50;
 use y2b_rs::{
     Database, check,
     config::{AI_MODEL, AI_PROVIDER, AI_THINKING, AI_TRANSLATION_MODEL, Config},
-    model::{JobStatus, TransferMode},
+    model::{ChannelPriority, JobStatus, TransferMode},
     monitor::Monitor,
     pipeline::{self, AiCircuitBreaker, Pipeline},
     process::run_monitored,
@@ -76,6 +76,11 @@ enum ChannelCmd {
         id: i64,
         #[arg(value_enum)]
         mode: TransferMode,
+    },
+    SetPriority {
+        id: i64,
+        #[arg(value_enum)]
+        priority: ChannelPriority,
     },
     Enable {
         id: i64,
@@ -221,10 +226,11 @@ async fn main() -> Result<()> {
             ChannelCmd::List => {
                 for c in db.list_channels()? {
                     println!(
-                        "{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}",
                         c.id,
                         if c.enabled { "on" } else { "off" },
                         c.transfer_mode,
+                        c.priority,
                         c.name,
                         c.youtube_channel_id
                     )
@@ -233,6 +239,10 @@ async fn main() -> Result<()> {
             ChannelCmd::SetMode { id, mode } => {
                 db.set_channel_transfer_mode(id, mode)?;
                 println!("频道 {id} 的新任务模式已更新为 {mode}");
+            }
+            ChannelCmd::SetPriority { id, priority } => {
+                db.set_channel_priority(id, priority)?;
+                println!("频道 {id} 的优先级已更新为 {priority}");
             }
             ChannelCmd::Enable { id } => db.set_channel_enabled(id, true)?,
             ChannelCmd::Disable { id } => db.set_channel_enabled(id, false)?,
@@ -485,9 +495,13 @@ async fn watch(config_path: PathBuf, config: Config, db: Database) -> Result<()>
         config.monitor.poll_seconds,
         config.monitor.reconcile_hours,
     ));
+    let priority_discovery = tokio::spawn(priority_discovery_loop(Monitor::new(
+        config.clone(),
+        db.clone(),
+    )?));
     let gate = tokio::spawn(gate_loop(Monitor::new(config.clone(), db.clone())?));
     let maintenance = tokio::spawn(maintenance_loop(config.clone(), db.clone()));
-    let mut tasks = vec![discovery, gate, maintenance];
+    let mut tasks = vec![discovery, priority_discovery, gate, maintenance];
     if config.websub.enabled {
         let websub_config = config.websub.clone();
         let websub_db = db.clone();
@@ -565,6 +579,10 @@ async fn schedule_loop(
                     }));
                 }
                 if upload_worker.is_none()
+                    && db.setting_deadline_due(
+                        pipeline::NEXT_BILIBILI_SUBMIT_AT,
+                        Utc::now(),
+                    )?
                     && let Some(job) = db.next_ready_to_upload_job()?
                 {
                     let fresh = reload_config(config_path, config);
@@ -601,6 +619,24 @@ async fn schedule_loop(
     outcome
 }
 
+/// 优先频道拥有独立的 RSS 发现循环，不和普通频道共享每轮名额，也不运行
+/// yt-dlp 回退。每秒检查持久化到期时间，真正的网络请求仍由频道的
+/// `next_poll_at` 按 `monitor.poll_seconds` 限速，避免请求耗时导致错过整轮节拍。
+async fn priority_discovery_loop(monitor: Monitor) {
+    let mut poll = tokio::time::interval(Duration::from_secs(1));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        poll.tick().await;
+        match monitor.poll_priority_rss().await {
+            Ok(discovered) if discovered > 0 => {
+                tracing::info!(discovered, "优先频道 RSS 发现新候选")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(error = %error, "优先频道 RSS 轮询失败"),
+        }
+    }
+}
+
 /// Data API 预测主发现、RSS 探针与每日深扫。
 ///
 /// 两者共用一个任务而不是各占一个：它们都会拉起 yt-dlp，并发执行会在 2 GiB
@@ -629,7 +665,7 @@ async fn discovery_loop(monitor: Monitor, poll_seconds: u64, reconcile_hours: u6
                     Ok(_) => {}
                     Err(error) => {
                         tracing::warn!(error = %error, "Data API 主发现失败，尝试 RSS/yt-dlp 降级");
-                        if let Err(fallback_error) = monitor.poll_all().await {
+                        if let Err(fallback_error) = monitor.poll_all_normal().await {
                             tracing::error!(error = %fallback_error, "Data API 降级发现失败");
                         }
                     }
@@ -637,11 +673,11 @@ async fn discovery_loop(monitor: Monitor, poll_seconds: u64, reconcile_hours: u6
             }
             _ = poll.tick() => {
                 let result = match monitor.data_api_primary_enabled() {
-                    Ok(true) => monitor.poll_rss_probes(2).await,
-                    Ok(false) => monitor.poll_all().await,
+                    Ok(true) => monitor.poll_normal_rss_probes(2).await,
+                    Ok(false) => monitor.poll_all_normal().await,
                     Err(error) => {
                         tracing::warn!(error = %error, "读取 Data API 配额状态失败，回落到 RSS/yt-dlp");
-                        monitor.poll_all().await
+                        monitor.poll_all_normal().await
                     }
                 };
                 if let Err(e) = result {
