@@ -269,6 +269,7 @@ fn app(
                     "ID",
                     "状态",
                     "模式",
+                    "优先级",
                     "频道名称",
                     "YouTube Channel ID",
                     "最后检查/错误",
@@ -292,6 +293,7 @@ fn app(
                         Cell::from(channel.id.to_string()),
                         Cell::from(if channel.enabled { "enabled" } else { "disabled" }),
                         Cell::from(channel.transfer_mode.to_string()),
+                        Cell::from(channel.priority.to_string()),
                         Cell::from(channel.name.clone()),
                         Cell::from(channel.youtube_channel_id.clone()),
                         Cell::from(channel.last_error.clone().unwrap_or(checked)),
@@ -308,9 +310,10 @@ fn app(
                         Constraint::Length(6),
                         Constraint::Length(10),
                         Constraint::Length(10),
+                        Constraint::Length(10),
                         Constraint::Percentage(25),
                         Constraint::Percentage(30),
-                        Constraint::Percentage(25),
+                        Constraint::Percentage(20),
                     ],
                 )
                 .header(header)

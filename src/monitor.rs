@@ -1,7 +1,9 @@
 use crate::{
     config::{Config, YoutubeConfig},
     db::{Database, NewJob, NewVideoCandidate},
-    model::{CandidateSource, Channel, Job, TransferMode, VideoCandidate, VideoMetadata},
+    model::{
+        CandidateSource, Channel, ChannelPriority, Job, TransferMode, VideoCandidate, VideoMetadata,
+    },
     process::run_monitored,
     youtube_api::{PlaylistVideo, QuotaDegradation, YoutubeDataApi},
 };
@@ -177,6 +179,7 @@ struct PollExecution {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataApiPollMode {
+    Priority,
     WebSubFallback,
     InsufficientHistory,
     PredictedHot,
@@ -596,6 +599,12 @@ impl Monitor {
         now: DateTime<Utc>,
         degradation: QuotaDegradation,
     ) -> Result<DataApiPollDecision> {
+        if channel.priority == ChannelPriority::Priority {
+            return Ok(DataApiPollDecision {
+                interval: Duration::from_secs(self.config.monitor.poll_seconds.max(1)),
+                mode: DataApiPollMode::Priority,
+            });
+        }
         let timezone = self
             .config
             .runtime
@@ -919,8 +928,17 @@ impl Monitor {
     }
 
     pub async fn poll_all(&self) -> Result<usize> {
+        self.poll_channels_with_fallback(self.db.list_due_channels(Utc::now())?)
+            .await
+    }
+
+    pub async fn poll_all_normal(&self) -> Result<usize> {
+        self.poll_channels_with_fallback(self.db.list_due_normal_channels(Utc::now())?)
+            .await
+    }
+
+    async fn poll_channels_with_fallback(&self, channels: Vec<Channel>) -> Result<usize> {
         let mut count = 0;
-        let channels = self.db.list_due_channels(Utc::now())?;
         let mut circuit_probes = 0;
         for c in channels {
             if let Some(open_until) = self.rss_circuit_open_until()? {
@@ -944,13 +962,27 @@ impl Monitor {
     /// Data API 正常时 RSS 仅作为低频探针；失败不立即拉起 yt-dlp。yt-dlp 深度
     /// 校对只在每日 API 深扫失败或 Data API 整体不可用时运行。
     pub async fn poll_rss_probes(&self, limit: usize) -> Result<usize> {
+        self.poll_rss_channels(self.db.list_due_channels(Utc::now())?, Some(limit))
+            .await
+    }
+
+    pub async fn poll_normal_rss_probes(&self, limit: usize) -> Result<usize> {
+        self.poll_rss_channels(self.db.list_due_normal_channels(Utc::now())?, Some(limit))
+            .await
+    }
+
+    pub async fn poll_priority_rss(&self) -> Result<usize> {
+        self.poll_rss_channels(self.db.list_due_priority_channels(Utc::now())?, None)
+            .await
+    }
+
+    async fn poll_rss_channels(
+        &self,
+        channels: Vec<Channel>,
+        limit: Option<usize>,
+    ) -> Result<usize> {
         let mut count = 0;
-        for channel in self
-            .db
-            .list_due_channels(Utc::now())?
-            .into_iter()
-            .take(limit)
-        {
+        for channel in channels.into_iter().take(limit.unwrap_or(usize::MAX)) {
             match self
                 .poll_channel_with_fallback(channel.id, true, false)
                 .await
@@ -2757,6 +2789,29 @@ esac
         );
         server.await.unwrap();
         assert!(db.get_job_by_video_id("normalvid01").unwrap().is_some());
+    }
+
+    #[test]
+    fn priority_channel_forces_one_minute_data_api_polling() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("priority-interval.db")).unwrap();
+        let channel_id = add_test_channel(&db, "https://example.invalid/feed", "priority");
+        db.set_channel_priority(channel_id, ChannelPriority::Priority)
+            .unwrap();
+        let mut config = Config::default();
+        config.monitor.poll_seconds = 60;
+        let monitor =
+            Monitor::new_with_data_api(config, db.clone(), None, "http://127.0.0.1:9/youtube/v3")
+                .unwrap();
+        let decision = monitor
+            .data_api_poll_decision(
+                &db.channel(channel_id).unwrap(),
+                Utc::now(),
+                QuotaDegradation::NarrowHot,
+            )
+            .unwrap();
+        assert_eq!(decision.mode, DataApiPollMode::Priority);
+        assert_eq!(decision.interval, Duration::from_secs(60));
     }
 
     #[test]

@@ -53,6 +53,17 @@ macro_rules! serde_enum_display_fromstr {
 }
 serde_enum_display_fromstr!(TransferMode);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum ChannelPriority {
+    #[default]
+    Normal,
+    Priority,
+}
+
+serde_enum_display_fromstr!(ChannelPriority);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateSource {
@@ -91,6 +102,7 @@ pub struct Channel {
     pub url: String,
     pub enabled: bool,
     pub transfer_mode: TransferMode,
+    pub priority: ChannelPriority,
     pub last_checked_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub next_poll_at: Option<DateTime<Utc>>,

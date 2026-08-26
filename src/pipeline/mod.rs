@@ -29,6 +29,7 @@ mod subtitle_flow;
 mod upload;
 
 pub use cc::{CC_INITIAL_DELAY_SECONDS, CC_MAX_ATTEMPTS};
+pub use upload::NEXT_BILIBILI_SUBMIT_AT;
 
 /// YouTube 的整数秒元数据与容器时长会有轻微舍入差异；超过这个范围通常意味着
 /// HLS 分片被跳过或合并出的文件不完整。

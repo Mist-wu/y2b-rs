@@ -23,6 +23,8 @@
 
 频道模式只是**新任务的默认值**：任务入队即固化模式，之后 `channels set-mode` 不改写旧任务。`video_id` 全局唯一，同一视频不会二次入队或二次投稿。
 
+频道优先级分为 `normal` 和 `priority`。优先频道拥有独立的 60 秒 RSS 轮询和 60 秒 Data API 调度，并在候选闸门、准备队列和上传队列中排在全部普通频道之前；同一优先级内部仍按发现时间 FIFO。已经开始执行的任务不会被中断。
+
 ## 快速开始
 
 ```bash
@@ -40,7 +42,8 @@ y2b watch                # 常驻；或 y2b tui 交互查看
 ```bash
 # 频道
 y2b channels add <URL> --mode direct|translated   # 必须显式指定 --mode
-y2b channels list | set-mode <ID> <MODE> | enable <ID> | disable <ID> | sync
+y2b channels list | set-mode <ID> <MODE> | set-priority <ID> normal|priority
+y2b channels enable <ID> | disable <ID> | sync
 
 # 任务
 y2b jobs add <URL> --mode direct|translated       # 必须显式指定 --mode
@@ -73,7 +76,8 @@ y2b backup | auth-check | check --write-baseline
 <details>
 <summary><b>发现与筛选</b></summary>
 
-- RSS 每 60 秒发现更新，每 6 小时用 yt-dlp 校对最近 30 条。RSS 失败先短退避重试 3 次；yt-dlp 回退受单频道冷却和「全局 10 分钟最多 3 次」熔断限制，避免暂态故障演变成请求风暴。回退名额优先给从未尝试或最久未尝试的频道，RSS 全面异常时排在后面的频道不会被饿死。
+- 优先频道每 60 秒分别检查 RSS 和 Data API；独立 RSS 循环每秒检查到期时间，不与普通频道争抢探测名额。普通频道继续使用预测 Data API 与限额 RSS 探针。此保证从视频出现在 YouTube RSS/API 时开始计算，YouTube 自身的数据传播延迟不在服务控制范围内。
+- RSS 失败先短退避重试 3 次；yt-dlp 回退受单频道冷却和「全局 10 分钟最多 3 次」熔断限制，避免暂态故障演变成请求风暴。回退名额优先给从未尝试或最久未尝试的普通频道，RSS 全面异常时排在后面的频道不会被饿死。
 - 直播回放（`was_live`）按普通视频搬运。直播中（`is_live`）、预约（`is_upcoming`）、回放生成中（`post_live`）不入队，每 30 分钟复查，回放就绪后自动搬运。
 - 超过 `youtube.max_duration_seconds`（默认 2 小时）直接跳过并持久化判定，不重复请求；放宽上限后自动重查。已入队任务若发现超时长直接进 `dead_letter`，不消耗重试次数。
 - 只自动搬运策略生效后开播的回放：首次运行把 `live_replay.enqueue_after` 游标设为当时时间，更早的历史回放不会被扫进队列；手动 `jobs add` 不受限。

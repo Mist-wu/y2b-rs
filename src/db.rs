@@ -1,5 +1,5 @@
 use crate::model::{
-    AiUsage, CandidateSource, Channel, GateState, Job, JobStatus, PreparedUpload,
+    AiUsage, CandidateSource, Channel, ChannelPriority, GateState, Job, JobStatus, PreparedUpload,
     PublicationMetadata, StageRun, TransferMode, VideoCandidate,
 };
 use anyhow::{Context, Result};
@@ -51,7 +51,7 @@ pub struct WebSubChannel {
     pub last_received_at: Option<DateTime<Utc>>,
 }
 
-const CHANNEL_COLUMNS: &str = "id,youtube_channel_id,name,url,enabled,transfer_mode,last_checked_at,last_error,next_poll_at,consecutive_failures,uploads_playlist_id,next_data_api_poll_at,data_api_etag,websub_lease_expires_at,websub_last_received_at";
+const CHANNEL_COLUMNS: &str = "id,youtube_channel_id,name,url,enabled,transfer_mode,priority,last_checked_at,last_error,next_poll_at,consecutive_failures,uploads_playlist_id,next_data_api_poll_at,data_api_etag,websub_lease_expires_at,websub_last_received_at";
 const CANDIDATE_COLUMNS: &str = "video_id,channel_id,url,title,published_at,source,discovered_at,gate_state,gate_attempts,next_gate_at,last_error,source_language,source_language_mismatch";
 const WEBSUB_CHANNEL_COLUMNS: &str = "id,youtube_channel_id,name,enabled,websub_lease_expires_at,websub_secret,websub_callback_path,websub_last_received_at";
 /// jobs 表业务列清单，供所有按 id/video_id/队列查询复用。
@@ -85,6 +85,7 @@ impl Database {
           name TEXT NOT NULL, url TEXT NOT NULL, feed_url TEXT NOT NULL,
           enabled INTEGER NOT NULL DEFAULT 1,
           transfer_mode TEXT NOT NULL DEFAULT 'translated', baseline_at TEXT,
+          priority TEXT NOT NULL DEFAULT 'normal',
           last_checked_at TEXT, last_reconcile_at TEXT, last_error TEXT,
           created_at TEXT NOT NULL
         );
@@ -369,6 +370,24 @@ impl Database {
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(16,CURRENT_TIMESTAMP)",
             [],
         )?;
+        // v17: 频道分为普通和优先两类。优先级同时控制发现轮询和任务队列顺序；
+        // 旧频道保持 normal，避免迁移后意外改变现有调度。
+        if !self.has_column("channels", "priority")? {
+            self.conn().execute(
+                "ALTER TABLE channels ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'",
+                [],
+            )?;
+        }
+        self.conn().execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_channels_priority_next_poll
+              ON channels(enabled, priority, next_poll_at);
+            CREATE INDEX IF NOT EXISTS idx_channels_priority_next_data_api_poll
+              ON channels(enabled, priority, next_data_api_poll_at);
+            INSERT OR IGNORE INTO schema_migrations(version,applied_at)
+              VALUES(17,CURRENT_TIMESTAMP);
+            "#,
+        )?;
         Ok(())
     }
 
@@ -458,16 +477,40 @@ impl Database {
     pub fn list_due_channels(&self, now: DateTime<Utc>) -> Result<Vec<Channel>> {
         let c = self.conn();
         let mut q = c.prepare(&format!(
-            "SELECT {CHANNEL_COLUMNS} FROM channels WHERE enabled=1 AND (next_poll_at IS NULL OR next_poll_at<=?) ORDER BY COALESCE(next_poll_at,''),id"
+            "SELECT {CHANNEL_COLUMNS} FROM channels WHERE enabled=1 AND (next_poll_at IS NULL OR next_poll_at<=?) ORDER BY CASE priority WHEN 'priority' THEN 0 ELSE 1 END,COALESCE(next_poll_at,''),id"
         ))?;
         Ok(q.query_map([format_timestamp(now)], channel_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn list_due_priority_channels(&self, now: DateTime<Utc>) -> Result<Vec<Channel>> {
+        self.list_due_channels_by_priority(now, ChannelPriority::Priority)
+    }
+
+    pub fn list_due_normal_channels(&self, now: DateTime<Utc>) -> Result<Vec<Channel>> {
+        self.list_due_channels_by_priority(now, ChannelPriority::Normal)
+    }
+
+    fn list_due_channels_by_priority(
+        &self,
+        now: DateTime<Utc>,
+        priority: ChannelPriority,
+    ) -> Result<Vec<Channel>> {
+        let c = self.conn();
+        let mut q = c.prepare(&format!(
+            "SELECT {CHANNEL_COLUMNS} FROM channels WHERE enabled=1 AND priority=? AND (next_poll_at IS NULL OR next_poll_at<=?) ORDER BY COALESCE(next_poll_at,''),id"
+        ))?;
+        Ok(q.query_map(
+            params![priority.to_string(), format_timestamp(now)],
+            channel_from_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn list_due_data_api_channels(&self, now: DateTime<Utc>) -> Result<Vec<Channel>> {
         let c = self.conn();
         let mut q = c.prepare(&format!(
-            "SELECT {CHANNEL_COLUMNS} FROM channels WHERE enabled=1 AND (next_data_api_poll_at IS NULL OR next_data_api_poll_at<=?) ORDER BY COALESCE(next_data_api_poll_at,''),id"
+            "SELECT {CHANNEL_COLUMNS} FROM channels WHERE enabled=1 AND (next_data_api_poll_at IS NULL OR next_data_api_poll_at<=?) ORDER BY CASE priority WHEN 'priority' THEN 0 ELSE 1 END,COALESCE(next_data_api_poll_at,''),id"
         ))?;
         Ok(q.query_map([format_timestamp(now)], channel_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -702,6 +745,18 @@ impl Database {
         }
         Ok(())
     }
+
+    pub fn set_channel_priority(&self, id: i64, priority: ChannelPriority) -> Result<()> {
+        let now = format_timestamp(Utc::now());
+        let changed = self.conn().execute(
+            "UPDATE channels SET priority=?,next_poll_at=?,next_data_api_poll_at=? WHERE id=?",
+            params![priority.to_string(), now, now, id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("频道不存在: {id}")
+        }
+        Ok(())
+    }
     pub fn mark_channel_checked(&self, id: i64, error: Option<&str>) -> Result<()> {
         self.conn().execute(
             "UPDATE channels SET last_checked_at=?,last_error=? WHERE id=?",
@@ -873,7 +928,7 @@ impl Database {
     ) -> Result<Vec<VideoCandidate>> {
         let c = self.conn();
         let mut q = c.prepare(&format!(
-            "SELECT {CANDIDATE_COLUMNS} FROM video_candidates WHERE gate_state='pending' OR (gate_state='deferred' AND next_gate_at<=?) ORDER BY discovered_at LIMIT ?"
+            "SELECT {CANDIDATE_COLUMNS} FROM video_candidates WHERE gate_state='pending' OR (gate_state='deferred' AND next_gate_at<=?) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=video_candidates.channel_id),0) DESC,discovered_at LIMIT ?"
         ))?;
         Ok(q.query_map(
             params![format_timestamp(now), limit as i64],
@@ -1078,7 +1133,7 @@ impl Database {
         let due = Self::retry_due_clause("updated_at");
         self.job_opt(
             &format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='queued' OR (status='retry_wait' AND ({due})) ORDER BY discovered_at LIMIT 1"
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='queued' OR (status='retry_wait' AND ({due})) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1"
             ),
             params![legacy_before, now],
         )
@@ -1089,7 +1144,7 @@ impl Database {
         let due = Self::retry_due_clause("updated_at");
         self.job_opt(
             &format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='ready_to_upload' OR (status='upload_retry_wait' AND ({due})) ORDER BY discovered_at LIMIT 1"
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='ready_to_upload' OR (status='upload_retry_wait' AND ({due})) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1"
             ),
             params![legacy_before, now],
         )
@@ -1541,6 +1596,15 @@ impl Database {
             .optional()
             .map_err(Into::into)
     }
+    pub fn setting_deadline_due(&self, key: &str, now: DateTime<Utc>) -> Result<bool> {
+        let Some(value) = self.get_setting(key)? else {
+            return Ok(true);
+        };
+        let deadline = DateTime::parse_from_rfc3339(&value)
+            .with_context(|| format!("设置 {key} 的时间无效: {value}"))?
+            .with_timezone(&Utc);
+        Ok(deadline <= now)
+    }
     /// 直播回放的自动入队起点：早于该时间开播的回放不入队。
     ///
     /// 放开 `was_live` 之后，频道 RSS 和 yt-dlp 校对里积压的历史回放会被一次性
@@ -1625,15 +1689,16 @@ fn channel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Channel> {
         url: r.get(3)?,
         enabled: r.get::<_, i64>(4)? != 0,
         transfer_mode: TransferMode::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
-        last_checked_at: parse_opt(r.get(6)?),
-        last_error: r.get(7)?,
-        next_poll_at: parse_opt(r.get(8)?),
-        consecutive_failures: r.get(9)?,
-        uploads_playlist_id: r.get(10)?,
-        next_data_api_poll_at: parse_opt(r.get(11)?),
-        data_api_etag: r.get(12)?,
-        websub_lease_expires_at: parse_opt(r.get(13)?),
-        websub_last_received_at: parse_opt(r.get(14)?),
+        priority: ChannelPriority::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
+        last_checked_at: parse_opt(r.get(7)?),
+        last_error: r.get(8)?,
+        next_poll_at: parse_opt(r.get(9)?),
+        consecutive_failures: r.get(10)?,
+        uploads_playlist_id: r.get(11)?,
+        next_data_api_poll_at: parse_opt(r.get(12)?),
+        data_api_etag: r.get(13)?,
+        websub_lease_expires_at: parse_opt(r.get(14)?),
+        websub_last_received_at: parse_opt(r.get(15)?),
     })
 }
 
@@ -1749,7 +1814,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 16);
+        assert_eq!(db.schema_version().unwrap(), 17);
         let migrated: (String, Option<String>, String) = db
             .conn()
             .query_row(
@@ -1833,10 +1898,14 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 16);
+        assert_eq!(db.schema_version().unwrap(), 17);
         assert_eq!(
             db.list_channels().unwrap()[0].transfer_mode,
             TransferMode::Translated
+        );
+        assert_eq!(
+            db.list_channels().unwrap()[0].priority,
+            ChannelPriority::Normal
         );
         assert_eq!(
             db.get_job("job-v3").unwrap().unwrap().transfer_mode,
@@ -1849,7 +1918,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
-        assert_eq!(db.schema_version().unwrap(), 16);
+        assert_eq!(db.schema_version().unwrap(), 17);
         assert!(
             db.create_job(NewJob {
                 channel_id: None,
@@ -2000,6 +2069,138 @@ mod tests {
         assert_eq!(
             db.get_job(&second).unwrap().unwrap().transfer_mode,
             TransferMode::Translated
+        );
+    }
+
+    #[test]
+    fn channel_priority_controls_discovery_and_both_job_queues() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("priority.db")).unwrap();
+        let normal_channel = db
+            .add_channel(
+                "UC-normal",
+                "normal",
+                "https://youtube.com/@normal/videos",
+                "https://youtube.com/feeds/videos.xml?channel_id=UC-normal",
+                TransferMode::Direct,
+            )
+            .unwrap();
+        let priority_channel = db
+            .add_channel(
+                "UC-priority",
+                "priority",
+                "https://youtube.com/@priority/videos",
+                "https://youtube.com/feeds/videos.xml?channel_id=UC-priority",
+                TransferMode::Direct,
+            )
+            .unwrap();
+        assert_eq!(
+            db.channel(priority_channel).unwrap().priority,
+            ChannelPriority::Normal
+        );
+        db.set_channel_priority(priority_channel, ChannelPriority::Priority)
+            .unwrap();
+
+        let due_at = Utc::now() + chrono::Duration::seconds(1);
+        assert_eq!(
+            db.list_due_priority_channels(due_at).unwrap()[0].id,
+            priority_channel
+        );
+        assert_eq!(
+            db.list_due_normal_channels(due_at).unwrap()[0].id,
+            normal_channel
+        );
+
+        let create = |channel_id, video_id: &'static str| {
+            db.create_job(NewJob {
+                channel_id: Some(channel_id),
+                video_id,
+                url: "https://youtu.be/test",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let normal_job = create(normal_channel, "normal-job");
+        let priority_first = create(priority_channel, "priority-first");
+        let priority_second = create(priority_channel, "priority-second");
+        for (id, discovered_at) in [
+            (&normal_job, "2026-01-01T00:00:00.000Z"),
+            (&priority_first, "2026-01-01T00:01:00.000Z"),
+            (&priority_second, "2026-01-01T00:02:00.000Z"),
+        ] {
+            db.conn()
+                .execute(
+                    "UPDATE jobs SET discovered_at=? WHERE id=?",
+                    params![discovered_at, id],
+                )
+                .unwrap();
+        }
+        assert_eq!(db.next_queued_job().unwrap().unwrap().id, priority_first);
+        db.update_job_status(&priority_first, JobStatus::Completed, None)
+            .unwrap();
+        assert_eq!(db.next_queued_job().unwrap().unwrap().id, priority_second);
+        db.update_job_status(&priority_second, JobStatus::Completed, None)
+            .unwrap();
+        assert_eq!(db.next_queued_job().unwrap().unwrap().id, normal_job);
+
+        let normal_upload = create(normal_channel, "normal-upload");
+        let priority_upload = create(priority_channel, "priority-upload");
+        let upload = PreparedUpload::Submission {
+            video_path: "/tmp/video.mp4".into(),
+            cover_path: "/tmp/cover.jpg".into(),
+            mode: TransferMode::Direct,
+            completion_status: JobStatus::Completed,
+        };
+        db.queue_prepared_upload(&normal_upload, &upload).unwrap();
+        db.queue_prepared_upload(&priority_upload, &upload).unwrap();
+        assert_eq!(
+            db.next_ready_to_upload_job().unwrap().unwrap().id,
+            priority_upload
+        );
+
+        db.insert_video_candidate(NewVideoCandidate {
+            video_id: "normal-candidate",
+            channel_id: Some(normal_channel),
+            url: "https://youtu.be/normal-candidate",
+            title: None,
+            published_at: None,
+            source: CandidateSource::Rss,
+        })
+        .unwrap();
+        db.insert_video_candidate(NewVideoCandidate {
+            video_id: "priority-candidate",
+            channel_id: Some(priority_channel),
+            url: "https://youtu.be/priority-candidate",
+            title: None,
+            published_at: None,
+            source: CandidateSource::Rss,
+        })
+        .unwrap();
+        assert_eq!(
+            db.due_video_candidates(Utc::now(), 10).unwrap()[0].video_id,
+            "priority-candidate"
+        );
+    }
+
+    #[test]
+    fn setting_deadline_prevents_early_worker_claim() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("deadline.db")).unwrap();
+        let now = Utc::now();
+        assert!(db.setting_deadline_due("missing", now).unwrap());
+        db.set_setting(
+            "deadline",
+            &(now + chrono::Duration::minutes(1)).to_rfc3339(),
+        )
+        .unwrap();
+        assert!(!db.setting_deadline_due("deadline", now).unwrap());
+        assert!(
+            db.setting_deadline_due("deadline", now + chrono::Duration::minutes(2))
+                .unwrap()
         );
     }
 
@@ -2630,7 +2831,7 @@ mod tests {
         drop(db);
 
         let reopened = Database::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 16);
+        assert_eq!(reopened.schema_version().unwrap(), 17);
         assert!(reopened.is_over_duration_video("too-long", 7200).unwrap());
         reopened
             .record_over_duration_video("too-long", None, 8000, "9000s > 8000s")
