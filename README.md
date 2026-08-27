@@ -157,8 +157,8 @@ python3 scripts/audit_brawl_glossary.py \
 目标：Ubuntu 22.04 x86_64，`azureuser@20.89.60.23`。Azure 镜像禁止 root 直接 SSH，特权操作走 `azureuser` 免密 `sudo`。服务器不编译 Rust 或 FFmpeg。
 
 ```bash
-# 1. 服务器：2 GiB swap 和预编译依赖
-scp deploy/bootstrap-server.sh azureuser@20.89.60.23:/tmp/
+# 1. 服务器：2 GiB swap、预编译依赖和自动 PO Token Provider
+scp deploy/bootstrap-server.sh deploy/install-ytdlp-pot-provider.sh azureuser@20.89.60.23:/tmp/
 ssh azureuser@20.89.60.23 'sudo bash /tmp/bootstrap-server.sh'
 
 # 2. Mac：静态交叉编译
@@ -206,7 +206,16 @@ systemd 资源限制：`MemoryHigh=1200M`、`MemoryMax=1600M`、`MemorySwapMax=1
 systemctl status y2b-watch
 journalctl -u y2b-watch -f
 systemctl show y2b-watch -p MemoryCurrent -p MemoryPeak -p MemorySwapCurrent
+
+# YouTube 自动字幕受 PO Token 限制时，确认 provider 已由 yt-dlp 发现
+yt-dlp -v --simulate 'https://www.youtube.com/watch?v=VIDEO_ID' 2>&1 \
+  | grep 'PO Token Providers'
 ```
+
+`deploy/install-ytdlp-pot-provider.sh` 固定并校验 `bgutil-ytdlp-pot-provider`
+的 provider 源码与插件版本，使用按需启动的 `script-node` 模式；它不监听网络端口，
+也不需要重启 `y2b-watch.service`。y2b 的 systemd 单元设置 `HOME=/root`，因此每次
+新启动的 yt-dlp 子进程会从 `/root/bgutil-ytdlp-pot-provider` 自动发现 provider。
 
 ## 备份与恢复
 
