@@ -61,6 +61,7 @@ install -m 0644 "$root_dir/pi/brawl-stars-glossary.json" /opt/y2b/pi/brawl-stars
 install -m 0644 "$root_dir/Cargo.lock" /opt/y2b/Cargo.lock
 install -d /opt/y2b/deploy
 install -m 0755 "$root_dir/deploy/restore.sh" /opt/y2b/deploy/restore.sh
+install -m 0755 "$root_dir/deploy/install-ytdlp-pot-provider.sh" /opt/y2b/deploy/install-ytdlp-pot-provider.sh
 install -m 0755 "$root_dir/deploy/y2b-set-deepseek-key.py" /usr/local/sbin/y2b-set-deepseek-key
 install -m 0755 "$root_dir/deploy/y2b-set-deepseek-key.py" /opt/y2b/deploy/y2b-set-deepseek-key.py
 install -m 0644 "$root_dir/deploy/y2b-watch.service" /opt/y2b/deploy/y2b-watch.service

@@ -36,6 +36,13 @@ curl -fL "$yt_url" -o "$tmp_dir/yt-dlp"
 echo "$yt_digest  $tmp_dir/yt-dlp" | sha256sum -c -
 install -m 0755 "$tmp_dir/yt-dlp" /usr/local/bin/yt-dlp
 
+pot_installer=$(cd "$(dirname "$0")" && pwd)/install-ytdlp-pot-provider.sh
+[[ -f "$pot_installer" ]] || {
+  echo "missing companion installer: $pot_installer" >&2
+  exit 1
+}
+bash "$pot_installer"
+
 ff_json=$(curl -fsSL https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest)
 ff_name=ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz
 ff_url=$(jq -r --arg n "$ff_name" '.assets[] | select(.name==$n) | .browser_download_url' <<<"$ff_json")
