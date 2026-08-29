@@ -1,5 +1,8 @@
+import contextlib
 import importlib.util
+import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +13,20 @@ SPEC = importlib.util.spec_from_file_location("perf_report", SCRIPT)
 assert SPEC and SPEC.loader
 PERF_REPORT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PERF_REPORT)
+
+
+def load_script(name: str, filename: str):
+    script = Path(__file__).with_name(filename)
+    spec = importlib.util.spec_from_file_location(name, script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+PERF_MONITOR = load_script("perf_monitor", "perf-monitor.py")
+GLOSSARY_AUDIT = load_script("audit_brawl_glossary", "audit_brawl_glossary.py")
 
 
 class PerfReportTests(unittest.TestCase):
@@ -78,6 +95,39 @@ class PerfReportTests(unittest.TestCase):
             [item["status"] for item in report["job_transitions"]["video"]],
             ["rendering", "completed"],
         )
+
+
+class OperationalArgumentTests(unittest.TestCase):
+    def assert_parse_error(self, parse_args, argv):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                parse_args(argv)
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_perf_tools_reject_nonpositive_and_nonfinite_rates(self):
+        common = ["--db", "state.db", "--output", "out.jsonl", "--video-ids", "vid"]
+        for option, value in [
+            ("--interval", "0"),
+            ("--interval", "nan"),
+            ("--duration", "-1"),
+            ("--duration", "inf"),
+        ]:
+            with self.subTest(option=option, value=value):
+                self.assert_parse_error(PERF_MONITOR.parse_args, common + [option, value])
+        self.assert_parse_error(
+            PERF_REPORT.parse_args, ["monitor.jsonl", "--clock-ticks", "0"]
+        )
+
+    def test_glossary_audit_rejects_invalid_batch_worker_timeout_and_shard(self):
+        for option in ["--batch-size", "--workers", "--timeout", "--shard-count"]:
+            with self.subTest(option=option):
+                self.assert_parse_error(GLOSSARY_AUDIT.parse_args, [option, "0"])
+        self.assert_parse_error(GLOSSARY_AUDIT.parse_args, ["--shard-index", "-1"])
+        self.assert_parse_error(
+            GLOSSARY_AUDIT.parse_args,
+            ["--shard-index", "1", "--shard-count", "1"],
+        )
+        self.assert_parse_error(GLOSSARY_AUDIT.parse_args, ["--timeout"])
 
 
 if __name__ == "__main__":
