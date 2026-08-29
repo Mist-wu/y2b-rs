@@ -20,6 +20,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -113,6 +114,9 @@ class LiveOnce:
         self.work.mkdir(parents=True, exist_ok=True)
         self.state_path = self.work / "state.json"
         self.state = load_json(self.state_path)
+        self.state_lock = threading.RLock()
+        self.hold_stop = threading.Event()
+        self.hold_thread: threading.Thread | None = None
         self.marker = f"LIVE_ONCE:{args.video_id}"
         self.main_start = parse_time(args.main_start)
         self.cut_at = self.main_start - dt.timedelta(seconds=args.keep_before_seconds)
@@ -121,8 +125,9 @@ class LiveOnce:
         self.metadata: dict[str, Any] = self.state.get("metadata") or {}
 
     def save(self, **changes: Any) -> None:
-        self.state.update(changes)
-        atomic_json(self.state_path, self.state)
+        with self.state_lock:
+            self.state.update(changes)
+            atomic_json(self.state_path, self.state)
 
     def acquire_lock(self) -> Any:
         lock_path = self.work / "live-once.lock"
@@ -265,6 +270,34 @@ class LiveOnce:
                 )
                 log("普通视频投稿已暂停；准备、下载和字幕 worker 不受影响")
         return True
+
+    def start_upload_hold_worker(self) -> None:
+        if self.state.get("bvid") or self.hold_thread is not None:
+            return
+
+        def worker() -> None:
+            remaining = max(0.0, (self.hold_at - utc_now()).total_seconds())
+            if self.hold_stop.wait(remaining):
+                return
+            while not self.hold_stop.is_set():
+                try:
+                    if self.ensure_upload_hold():
+                        return
+                except Exception as error:
+                    log(f"准点暂停普通投稿失败，2 秒后重试: {error}")
+                self.hold_stop.wait(2)
+
+        self.hold_thread = threading.Thread(
+            target=worker,
+            name="live-once-upload-hold",
+            daemon=True,
+        )
+        self.hold_thread.start()
+
+    def stop_upload_hold_worker(self) -> None:
+        self.hold_stop.set()
+        if self.hold_thread is not None:
+            self.hold_thread.join(timeout=10)
 
     def wait_until_sidecar_can_upload(self) -> None:
         while True:
@@ -928,12 +961,13 @@ class LiveOnce:
                 return
             self.backup_database()
             self.reserve_job()
+            self.start_upload_hold_worker()
             self.fetch_metadata()
             video = self.capture_until_end()
             bvid = self.upload_video(video)
+            self.stop_upload_hold_worker()
             self.record_upload(video, bvid)
-            if self.state.get("upload_hold"):
-                self.release_upload_hold_after_success()
+            self.release_upload_hold_after_success()
             self.wait_for_subtitle(bvid)
 
 
