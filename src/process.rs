@@ -14,6 +14,7 @@ use tokio::process::Command;
 /// 无限收集会撑爆低配服务器内存；关键信息（agent_end 事件、biliup 的 BV
 /// 号、错误尾部）都位于输出末尾，保留尾部即可。
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 async fn read_capped<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
@@ -24,7 +25,7 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Res
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_CAPTURE_BYTES * 2 {
+        if buf.len() > MAX_CAPTURE_BYTES + chunk.len() {
             let drop = buf.len() - MAX_CAPTURE_BYTES;
             buf.drain(..drop);
         }
@@ -106,8 +107,8 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
     let mut process_group = ProcessGroupGuard::new(pid);
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-    let stdout_task = tokio::spawn(async move { read_capped(&mut stdout).await });
-    let stderr_task = tokio::spawn(async move { read_capped(&mut stderr).await });
+    let mut stdout_task = tokio::spawn(async move { read_capped(&mut stdout).await });
+    let mut stderr_task = tokio::spawn(async move { read_capped(&mut stderr).await });
     let started = Instant::now();
     let mut sys = System::new();
     let (status, peak) = match tokio::time::timeout(timeout, async {
@@ -136,8 +137,37 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
             bail!("子进程超时: {}s", timeout.as_secs());
         }
     };
-    let out = stdout_task.await??;
-    let err = stderr_task.await??;
+    // 直接子进程退出并不代表管道已经关闭：PyInstaller 启动的后代可能继续持有
+    // stdout/stderr。drain 同时受调用方总超时和短宽限期约束，不能在成功路径永久等 EOF。
+    let drain_timeout = PIPE_DRAIN_TIMEOUT.min(timeout.saturating_sub(started.elapsed()));
+    let drain_deadline = tokio::time::Instant::now() + drain_timeout;
+    let mut out = None;
+    let mut err = None;
+    while out.is_none() || err.is_none() {
+        tokio::select! {
+            result = &mut stdout_task, if out.is_none() => out = Some(result??),
+            result = &mut stderr_task, if err.is_none() => err = Some(result??),
+            _ = tokio::time::sleep_until(drain_deadline) => {
+                process_group.kill();
+                let _ = child.start_kill();
+                if out.is_none() {
+                    stdout_task.abort();
+                    let _ = stdout_task.await;
+                }
+                if err.is_none() {
+                    stderr_task.abort();
+                    let _ = stderr_task.await;
+                }
+                let _ = child.wait().await;
+                bail!(
+                    "子进程超时: {}s（后代进程仍持有输出管道）",
+                    timeout.as_secs()
+                );
+            }
+        }
+    }
+    let out = out.expect("stdout 读取任务应已完成");
+    let err = err.expect("stderr 读取任务应已完成");
     // 直接子进程已退出且输出管道已全部 EOF，此时确认整组正常收尾；之后即使
     // 构造返回值失败，也不应再向可能复用的 PID 发信号。
     process_group.disarm();
@@ -251,6 +281,49 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "超时后代进程仍存活: {grandchild}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn exited_parent_with_inherited_stdout_is_bounded_and_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pipe-holder.pid");
+        // 顶层 sh 立即成功退出；后代只持有继承的输出管道，不等待它收尾。
+        let script = format!(
+            "sh -c 'echo $$ > {}; exec sleep 30' 2>/dev/null & exit 0",
+            pid_file.display()
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+
+        let started = Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_monitored(command, Duration::from_secs(1)),
+        )
+        .await
+        .expect("父进程退出后等待输出管道发生永久挂起")
+        .unwrap_err();
+        assert!(error.to_string().contains("后代进程仍持有输出管道"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let descendant: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal 0 只检查本测试创建的 PID 是否仍存在。
+            let alive = unsafe { libc::kill(descendant, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "输出管道超时后代进程仍存活: {descendant}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
