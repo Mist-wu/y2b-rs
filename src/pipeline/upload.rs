@@ -2,9 +2,7 @@
 use super::cc::CC_INITIAL_DELAY_SECONDS;
 use super::publication::build_upload_args;
 use super::{Pipeline, StageGuard};
-use crate::model::{
-    Job, JobStatus, PreparedUpload, PublicationMetadata, TransferMode, VideoMetadata,
-};
+use crate::model::{Job, JobStatus, PreparedUpload, PublicationMetadata, VideoMetadata};
 use crate::process::{ProcessFailure, run_monitored};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -182,17 +180,25 @@ impl Pipeline {
                 publication.title
             ),
         };
-        self.db
-            .confirm_uncertain_upload(job_id, &bvid, completion_status)?;
-        if completion_status == JobStatus::Completed && mode == TransferMode::Translated {
-            self.db
-                .queue_pending_subtitle(job_id, CC_INITIAL_DELAY_SECONDS)?;
-        }
+        let subtitle_queued = self.db.confirm_uncertain_upload(
+            job_id,
+            &bvid,
+            completion_status,
+            mode,
+            CC_INITIAL_DELAY_SECONDS,
+        )?;
         let _ = self.defer_bilibili_submissions(self.config.bilibili.submit_interval_seconds);
         self.db.event(
             Some(job_id),
             "info",
-            &format!("创作中心核对确认投稿成功: {bvid}"),
+            &format!(
+                "创作中心核对确认投稿成功: {bvid}{}",
+                if subtitle_queued {
+                    "；已原子排队 CC 字幕"
+                } else {
+                    ""
+                }
+            ),
         )?;
         Ok(format!("已从创作中心确认 {job_id} -> {bvid}"))
     }
@@ -215,7 +221,7 @@ impl Pipeline {
             .db
             .prepared_upload(&job.id)?
             .with_context(|| format!("待上传任务 {} 缺少持久化上传计划", job.id))?;
-        let (completion_status, mode) = match prepared {
+        let subtitle_queued = match prepared {
             PreparedUpload::Submission {
                 video_path,
                 cover_path,
@@ -276,19 +282,25 @@ impl Pipeline {
                         return Err(UploadUncertainError { detail }.into());
                     }
                 };
-                if let Err(error) =
-                    self.db
-                        .finish_upload_attempt(&job.id, &attempt_id, &bvid, completion_status)
-                {
-                    let detail = format!(
-                        "Bilibili 已返回成功 {bvid}，但本地确认失败（attempt={attempt_id}）: {error:#}"
-                    );
-                    let _ = self
-                        .db
-                        .mark_upload_attempt_uncertain(&job.id, &attempt_id, &detail);
-                    return Err(UploadUncertainError { detail }.into());
+                match self.db.finish_upload_attempt(
+                    &job.id,
+                    &attempt_id,
+                    &bvid,
+                    completion_status,
+                    mode,
+                    CC_INITIAL_DELAY_SECONDS,
+                ) {
+                    Ok(subtitle_queued) => subtitle_queued,
+                    Err(error) => {
+                        let detail = format!(
+                            "Bilibili 已返回成功 {bvid}，但本地确认失败（attempt={attempt_id}）: {error:#}"
+                        );
+                        let _ =
+                            self.db
+                                .mark_upload_attempt_uncertain(&job.id, &attempt_id, &detail);
+                        return Err(UploadUncertainError { detail }.into());
+                    }
                 }
-                (completion_status, mode)
             }
         };
         // 投稿 attempt 与任务终态已经由 finish_upload_attempt 同事务持久化。
@@ -302,14 +314,8 @@ impl Pipeline {
                 &format!("投稿成功后写入冷却时间失败: {error}"),
             );
         }
-        // CC 字幕补交交给独立队列，不占用上传 worker。
-        //
-        // 此前这里同步等待最多 90s + 8×60s ≈ 9.5 分钟，期间下一个 ready_to_upload
-        // 任务无法被领取。只有 translated 任务入队：direct 任务不下载字幕，
-        // 而 completion_status 已是待补字幕的（原视频无字幕直传）也没有素材可用。
-        if completion_status == JobStatus::Completed && mode == TransferMode::Translated {
-            self.db
-                .queue_pending_subtitle(&job.id, CC_INITIAL_DELAY_SECONDS)?;
+        // CC 字幕状态和首次到期时间已与投稿完成同事务写入，不占用上传 worker。
+        if subtitle_queued {
             self.db
                 .event(Some(&job.id), "info", "已投稿，等待自动补交中文 CC 字幕")?;
         }
@@ -500,7 +506,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::db::{Database, NewJob};
-    use crate::model::JobStatus;
+    use crate::model::{JobStatus, TransferMode};
 
     #[test]
     fn biliup_bvid_requires_a_structured_success_response() {
