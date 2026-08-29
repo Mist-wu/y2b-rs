@@ -1,15 +1,18 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 pub const AI_PROVIDER: &str = "deepseek";
 pub const AI_MODEL: &str = "deepseek-v4-flash";
 pub const AI_TRANSLATION_MODEL: &str = "deepseek-v4-pro";
 pub const AI_THINKING: &str = "off";
+const MAX_TRANSLATION_BATCH_RETRIES: usize = 10;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub runtime: RuntimeConfig,
     pub monitor: MonitorConfig,
@@ -22,8 +25,8 @@ pub struct Config {
     pub websub: WebSubConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub data_dir: PathBuf,
     pub database: PathBuf,
@@ -32,8 +35,8 @@ pub struct RuntimeConfig {
     pub timezone: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct MonitorConfig {
     pub poll_seconds: u64,
     /// playlistItems.list 单次读取条数。该接口按调用计费，1 与 50 同为 1 单位。
@@ -54,8 +57,8 @@ pub struct MonitorConfig {
     pub max_attempts: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct YoutubeConfig {
     pub yt_dlp: String,
     pub cookies: PathBuf,
@@ -70,8 +73,8 @@ pub struct YoutubeConfig {
     pub max_duration_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BilibiliConfig {
     pub biliup: String,
     pub cookies: PathBuf,
@@ -79,9 +82,8 @@ pub struct BilibiliConfig {
     pub rate_limit_cooldown_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AiConfig {
     pub pi: String,
     pub extension: PathBuf,
@@ -114,15 +116,15 @@ pub enum BatchMode {
     Adaptive,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RenderConfig {
     pub ffmpeg: String,
     pub ffprobe: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub warn_free_gib: u64,
     pub stop_free_gib: u64,
@@ -131,8 +133,8 @@ pub struct StorageConfig {
     pub weekly_backups: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct TranslationConfig {
     pub source_lang: String,
     pub target_lang: String,
@@ -140,8 +142,8 @@ pub struct TranslationConfig {
     pub enforce_source_lang: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct WebSubConfig {
     /// 默认关闭；关闭时不会绑定任何端口或发起订阅。
     pub enabled: bool,
@@ -272,25 +274,49 @@ impl Default for WebSubConfig {
         }
     }
 }
+/// 主程序在分派子命令前加载配置；只有 `init` 可以在文件尚不存在时使用默认值。
+fn init_command_requested(args: impl IntoIterator<Item = OsString>) -> bool {
+    let mut skip_config_value = false;
+    for arg in args {
+        if skip_config_value {
+            skip_config_value = false;
+            continue;
+        }
+        let arg = arg.to_string_lossy();
+        if arg == "--config" {
+            skip_config_value = true;
+            continue;
+        }
+        if arg.starts_with("--config=") {
+            continue;
+        }
+        return arg == "init";
+    }
+    false
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let config = if path.exists() {
-            let raw = fs::read_to_string(path)
-                .with_context(|| format!("读取配置失败: {}", path.display()))?;
-            toml::from_str(&raw).with_context(|| format!("配置格式无效: {}", path.display()))?
-        } else {
-            Self::default()
+        Self::load_inner(path, init_command_requested(std::env::args_os().skip(1)))
+    }
+
+    fn load_inner(path: &Path, allow_missing: bool) -> Result<Self> {
+        let config = match fs::read_to_string(path) {
+            Ok(raw) => toml::from_str(&raw)
+                .map_err(|error| anyhow::anyhow!("配置格式无效: {}: {error}", path.display()))?,
+            Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+                Self::default()
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("读取配置失败: {}", path.display()));
+            }
         };
-        config.validate_ai_profile()?;
-        config.validate_discovery()?;
-        config.validate_websub()?;
+        config.validate()?;
         Ok(config)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        self.validate_ai_profile()?;
-        self.validate_discovery()?;
-        self.validate_websub()?;
+        self.validate()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -306,6 +332,61 @@ impl Config {
         ] {
             fs::create_dir_all(p)?;
         }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_ai_profile()?;
+        self.validate_discovery()?;
+        self.validate_websub()?;
+        anyhow::ensure!(
+            self.ai.segment_max_cues > 0,
+            "ai.segment_max_cues 必须大于 0"
+        );
+        anyhow::ensure!(
+            self.ai.segment_overlap_cues < self.ai.segment_max_cues,
+            "ai.segment_overlap_cues 必须小于 ai.segment_max_cues"
+        );
+        anyhow::ensure!(
+            self.ai.translation_batch_cues > 0,
+            "ai.translation_batch_cues 必须大于 0"
+        );
+        anyhow::ensure!(
+            self.ai.translation_concurrency > 0,
+            "ai.translation_concurrency 必须大于 0"
+        );
+        anyhow::ensure!(self.ai.timeout_seconds > 0, "ai.timeout_seconds 必须大于 0");
+        anyhow::ensure!(
+            self.ai.translation_batch_retries <= MAX_TRANSLATION_BATCH_RETRIES,
+            "ai.translation_batch_retries 不能大于 {MAX_TRANSLATION_BATCH_RETRIES}"
+        );
+        anyhow::ensure!(
+            self.monitor.max_attempts > 0,
+            "monitor.max_attempts 必须大于 0"
+        );
+        anyhow::ensure!(
+            self.storage.warn_free_gib >= self.storage.stop_free_gib,
+            "storage.warn_free_gib 必须大于等于 storage.stop_free_gib"
+        );
+        anyhow::ensure!(
+            self.youtube.max_fps.is_finite() && self.youtube.max_fps > 0.0,
+            "youtube.max_fps 必须是有限且大于 0 的数"
+        );
+        anyhow::ensure!(self.youtube.max_pixels > 0, "youtube.max_pixels 必须大于 0");
+        anyhow::ensure!(
+            self.bilibili.submit_interval_seconds > 0,
+            "bilibili.submit_interval_seconds 必须大于 0"
+        );
+        anyhow::ensure!(
+            !self.translation.target_lang.trim().is_empty(),
+            "translation.target_lang 不能为空"
+        );
+        anyhow::ensure!(
+            self.translation.source_lang == "en" && self.translation.target_lang == "zh-CN",
+            "翻译语言必须固定为 source_lang=en, target_lang=zh-CN；当前为 source_lang={}, target_lang={}",
+            self.translation.source_lang,
+            self.translation.target_lang
+        );
         Ok(())
     }
 
@@ -325,6 +406,10 @@ impl Config {
     }
 
     pub fn validate_websub(&self) -> Result<()> {
+        self.websub
+            .bind_addr
+            .parse::<SocketAddr>()
+            .with_context(|| format!("websub.bind_addr 无法解析: {}", self.websub.bind_addr))?;
         if self.websub.enabled {
             anyhow::ensure!(
                 self.websub.callback_base_url.starts_with("https://"),
@@ -414,10 +499,154 @@ mod tests {
     }
 
     #[test]
-    fn example_uses_the_fixed_ai_profile() {
+    fn missing_config_is_only_allowed_for_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.toml");
+
+        let error = Config::load_inner(&path, false).unwrap_err().to_string();
+        assert!(error.contains("读取配置失败"));
+        assert!(error.contains("missing.toml"));
+        assert_eq!(Config::load_inner(&path, true).unwrap(), Config::default());
+
+        assert!(init_command_requested(
+            ["--config", "missing.toml", "init"]
+                .into_iter()
+                .map(OsString::from)
+        ));
+        assert!(init_command_requested(
+            ["init", "--config=missing.toml"]
+                .into_iter()
+                .map(OsString::from)
+        ));
+        assert!(!init_command_requested(
+            ["jobs", "add", "init"].into_iter().map(OsString::from)
+        ));
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_at_every_config_level() {
+        for (field, raw) in [
+            ("root_typo", "root_typo = true"),
+            ("data_dr", "[runtime]\ndata_dr = '/tmp'"),
+            ("poll_second", "[monitor]\npoll_second = 1"),
+            ("max_pixel", "[youtube]\nmax_pixel = 1"),
+            (
+                "submit_interval_second",
+                "[bilibili]\nsubmit_interval_second = 1",
+            ),
+            ("timeout_second", "[ai]\ntimeout_second = 1"),
+            ("ffmepg", "[render]\nffmepg = 'ffmpeg'"),
+            ("warn_free_gibs", "[storage]\nwarn_free_gibs = 1"),
+            ("target_lnag", "[translation]\ntarget_lnag = 'zh-CN'"),
+            ("bind_adrr", "[websub]\nbind_adrr = '127.0.0.1:1'"),
+        ] {
+            let error = toml::from_str::<Config>(raw).unwrap_err().to_string();
+            assert!(error.contains(field), "错误未指出字段 {field}: {error}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown.toml");
+        fs::write(&path, "[youtube]\nmax_fpss = 60").unwrap();
+        let error = Config::load_inner(&path, false).unwrap_err().to_string();
+        assert!(
+            error.contains("max_fpss"),
+            "加载错误未指出未知字段: {error}"
+        );
+    }
+
+    fn assert_invalid(config: &Config, field: &str) {
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains(field), "错误未指出字段 {field}: {error}");
+    }
+
+    #[test]
+    fn rejects_invalid_config_boundaries() {
+        let mut config = Config::default();
+        config.ai.segment_max_cues = 0;
+        assert_invalid(&config, "segment_max_cues");
+
+        let mut config = Config::default();
+        config.ai.segment_overlap_cues = config.ai.segment_max_cues;
+        assert_invalid(&config, "segment_overlap_cues");
+
+        let mut config = Config::default();
+        config.ai.translation_batch_cues = 0;
+        assert_invalid(&config, "translation_batch_cues");
+
+        let mut config = Config::default();
+        config.ai.translation_concurrency = 0;
+        assert_invalid(&config, "translation_concurrency");
+
+        let mut config = Config::default();
+        config.ai.timeout_seconds = 0;
+        assert_invalid(&config, "timeout_seconds");
+
+        let mut config = Config::default();
+        config.ai.translation_batch_retries = MAX_TRANSLATION_BATCH_RETRIES + 1;
+        assert_invalid(&config, "translation_batch_retries");
+
+        let mut config = Config::default();
+        config.monitor.max_attempts = 0;
+        assert_invalid(&config, "max_attempts");
+
+        let mut config = Config::default();
+        config.storage.warn_free_gib = config.storage.stop_free_gib - 1;
+        assert_invalid(&config, "warn_free_gib");
+
+        for max_fps in [0.0, f64::INFINITY, f64::NAN] {
+            let mut config = Config::default();
+            config.youtube.max_fps = max_fps;
+            assert_invalid(&config, "max_fps");
+        }
+
+        let mut config = Config::default();
+        config.youtube.max_pixels = 0;
+        assert_invalid(&config, "max_pixels");
+
+        let mut config = Config::default();
+        config.bilibili.submit_interval_seconds = 0;
+        assert_invalid(&config, "submit_interval_seconds");
+
+        let mut config = Config::default();
+        config.translation.target_lang.clear();
+        assert_invalid(&config, "target_lang");
+
+        let mut config = Config::default();
+        config.translation.target_lang = "ja".into();
+        assert_invalid(&config, "target_lang");
+
+        let mut config = Config::default();
+        config.translation.source_lang = "ja".into();
+        assert_invalid(&config, "source_lang");
+
+        let mut config = Config::default();
+        config.websub.bind_addr = "not an address".into();
+        assert_invalid(&config, "bind_addr");
+    }
+
+    #[test]
+    fn accepts_valid_config_boundaries() {
+        let mut config = Config::default();
+        config.ai.segment_max_cues = 1;
+        config.ai.segment_overlap_cues = 0;
+        config.ai.translation_batch_cues = 1;
+        config.ai.translation_concurrency = 1;
+        config.ai.timeout_seconds = 1;
+        config.ai.translation_batch_retries = MAX_TRANSLATION_BATCH_RETRIES;
+        config.monitor.max_attempts = 1;
+        config.storage.warn_free_gib = config.storage.stop_free_gib;
+        config.youtube.max_fps = f64::MIN_POSITIVE;
+        config.youtube.max_pixels = 1;
+        config.bilibili.submit_interval_seconds = 1;
+        config.websub.bind_addr = "[::1]:1".into();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn example_matches_rust_defaults() {
         let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
-        config.validate_ai_profile().unwrap();
-        config.validate_discovery().unwrap();
+        config.validate().unwrap();
+        assert_eq!(config, Config::default());
     }
 
     #[test]
