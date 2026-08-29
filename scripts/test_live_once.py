@@ -7,7 +7,16 @@ import threading
 import unittest
 from pathlib import Path
 
-from live_once import LiveOnce, parse_time
+from live_once import (
+    HOLD_OWNER_KEY,
+    HOLD_PREVIOUS_KEY,
+    HOLD_UNTIL,
+    NEXT_SUBMIT_KEY,
+    LiveOnce,
+    iso,
+    parse_time,
+    utc_now,
+)
 
 
 UTC = dt.timezone.utc
@@ -110,6 +119,120 @@ class LiveOnceTests(unittest.TestCase):
             item.start_upload_hold_worker()
             self.assertTrue(called.wait(1))
             item.stop_upload_hold_worker()
+
+    def test_upload_hold_waits_for_uploading_job_before_claiming(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = arguments(root)
+            args.hold_at = "2020-01-01T00:00:00Z"
+            make_database(Path(args.database))
+            connection = sqlite3.connect(args.database)
+            connection.execute(
+                """
+                INSERT INTO jobs(id,video_id,url,status,transfer_mode,created_at,updated_at)
+                VALUES('ordinary','ordinary','https://youtu.be/ordinary','uploading','direct','now','now')
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            item = LiveOnce(args)
+            self.assertFalse(item.ensure_upload_hold())
+            connection = sqlite3.connect(args.database)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM settings").fetchone()[0], 0
+            )
+            connection.execute("UPDATE jobs SET status='completed' WHERE id='ordinary'")
+            connection.commit()
+            connection.close()
+
+            self.assertTrue(item.ensure_upload_hold())
+            connection = sqlite3.connect(args.database)
+            settings = dict(connection.execute("SELECT key,value FROM settings"))
+            connection.close()
+            self.assertEqual(settings[NEXT_SUBMIT_KEY], HOLD_UNTIL)
+            self.assertEqual(settings[HOLD_OWNER_KEY], item.state["upload_hold_owner"])
+            self.assertEqual(json.loads(settings[HOLD_PREVIOUS_KEY]), None)
+
+    def test_upload_hold_release_preserves_newer_platform_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = arguments(root)
+            args.hold_at = "2020-01-01T00:00:00Z"
+            make_database(Path(args.database))
+            item = LiveOnce(args)
+            self.assertTrue(item.ensure_upload_hold())
+            later = iso(utc_now() + dt.timedelta(hours=12))
+            connection = sqlite3.connect(args.database)
+            connection.execute(
+                "UPDATE settings SET value=? WHERE key=?", (later, NEXT_SUBMIT_KEY)
+            )
+            connection.commit()
+            connection.close()
+
+            item.release_upload_hold_after_success()
+            connection = sqlite3.connect(args.database)
+            settings = dict(connection.execute("SELECT key,value FROM settings"))
+            connection.close()
+            self.assertEqual(settings[NEXT_SUBMIT_KEY], later)
+            self.assertNotIn(HOLD_OWNER_KEY, settings)
+            self.assertNotIn(HOLD_PREVIOUS_KEY, settings)
+
+    def test_upload_hold_rollback_restores_only_its_own_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = arguments(root)
+            args.hold_at = "2020-01-01T00:00:00Z"
+            make_database(Path(args.database))
+            original = iso(utc_now() + dt.timedelta(minutes=10))
+            connection = sqlite3.connect(args.database)
+            connection.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)",
+                (NEXT_SUBMIT_KEY, original, "now"),
+            )
+            connection.commit()
+            connection.close()
+            item = LiveOnce(args)
+            self.assertTrue(item.ensure_upload_hold())
+
+            resumed = LiveOnce(args)
+            self.assertTrue(resumed.ensure_upload_hold())
+            resumed.rollback()
+            connection = sqlite3.connect(args.database)
+            settings = dict(connection.execute("SELECT key,value FROM settings"))
+            connection.close()
+            self.assertEqual(settings[NEXT_SUBMIT_KEY], original)
+            self.assertNotIn(HOLD_OWNER_KEY, settings)
+            self.assertNotIn(HOLD_PREVIOUS_KEY, settings)
+
+    def test_upload_hold_rollback_does_not_clobber_foreign_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = arguments(root)
+            make_database(Path(args.database))
+            item = LiveOnce(args)
+            item.save(upload_hold=True, upload_hold_owner="ours")
+            deadline = iso(utc_now() + dt.timedelta(hours=6))
+            connection = sqlite3.connect(args.database)
+            connection.executemany(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)",
+                [
+                    (NEXT_SUBMIT_KEY, deadline, "now"),
+                    (HOLD_OWNER_KEY, "foreign", "now"),
+                    (HOLD_PREVIOUS_KEY, json.dumps(None), "now"),
+                ],
+            )
+            connection.commit()
+            connection.close()
+
+            with self.assertRaisesRegex(RuntimeError, "owned by another process"):
+                item.release_upload_hold_after_success()
+            item.rollback()
+            connection = sqlite3.connect(args.database)
+            settings = dict(connection.execute("SELECT key,value FROM settings"))
+            connection.close()
+            self.assertEqual(settings[NEXT_SUBMIT_KEY], deadline)
+            self.assertEqual(settings[HOLD_OWNER_KEY], "foreign")
 
     def test_segments_are_deduplicated_and_keep_pre_roll(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

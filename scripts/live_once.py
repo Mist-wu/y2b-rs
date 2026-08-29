@@ -31,6 +31,8 @@ from typing import Any
 
 UTC = dt.timezone.utc
 NEXT_SUBMIT_KEY = "bilibili.next_submit_at"
+HOLD_OWNER_KEY = "bilibili.upload_hold_owner"
+HOLD_PREVIOUS_KEY = "bilibili.upload_hold_previous"
 HOLD_UNTIL = "2099-12-31T23:59:59+00:00"
 BVID_RE = re.compile(r"\bBV[0-9A-Za-z]+\b")
 SEGMENT_RE = re.compile(r"segment-(\d{8}T\d{6}Z)\.ts$")
@@ -225,50 +227,124 @@ class LiveOnce:
             ).fetchone()
         return int(row[0])
 
+    def upload_hold_owner(self) -> str:
+        owner = self.state.get("upload_hold_owner")
+        if owner:
+            return str(owner)
+        owner = f"{self.marker}:{uuid.uuid4()}"
+        self.save(upload_hold_owner=owner)
+        return owner
+
+    @staticmethod
+    def decode_previous_hold(value: str | None) -> str | None:
+        if value is None:
+            return None
+        decoded = json.loads(value)
+        if decoded is not None and not isinstance(decoded, str):
+            raise ValueError("upload hold previous value must be a string or null")
+        return decoded
+
     def ensure_upload_hold(self) -> bool:
         if utc_now() < self.hold_at:
             return False
-        active = self.active_ordinary_uploads()
+        owner = self.upload_hold_owner()
+        now = iso(utc_now())
+        active = 0
+        foreign_owner: str | None = None
+        current: str | None = None
+        previous: str | None = None
+        acquired_new = False
+        with sqlite_connect(Path(self.args.database)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # 必须在拿到 SQLite 写锁后再检查。这样它与 Rust 的原子投稿领取只有一个赢家。
+            active = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE status='uploading' AND video_id<>?",
+                    (self.args.video_id,),
+                ).fetchone()[0]
+            )
+            if active:
+                connection.rollback()
+            else:
+                owner_row = connection.execute(
+                    "SELECT value FROM settings WHERE key=?", (HOLD_OWNER_KEY,)
+                ).fetchone()
+                foreign_owner = owner_row[0] if owner_row and owner_row[0] != owner else None
+                if foreign_owner:
+                    connection.rollback()
+                elif owner_row:
+                    previous_row = connection.execute(
+                        "SELECT value FROM settings WHERE key=?", (HOLD_PREVIOUS_KEY,)
+                    ).fetchone()
+                    previous = self.decode_previous_hold(
+                        previous_row[0] if previous_row else None
+                    )
+                    connection.commit()
+                else:
+                    row = connection.execute(
+                        "SELECT value FROM settings WHERE key=?", (NEXT_SUBMIT_KEY,)
+                    ).fetchone()
+                    current = row[0] if row else None
+                    previous = (
+                        self.state.get("original_next_submit_at")
+                        if current == HOLD_UNTIL and self.state.get("upload_hold")
+                        else current
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+                        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
+                        """,
+                        (NEXT_SUBMIT_KEY, HOLD_UNTIL, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+                        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
+                        """,
+                        (HOLD_OWNER_KEY, owner, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+                        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
+                        """,
+                        (HOLD_PREVIOUS_KEY, json.dumps(previous), now),
+                    )
+                    connection.commit()
+                    acquired_new = True
+
         if active:
             if not self.state.get("waiting_for_ordinary_upload"):
                 log(f"22:00 已到，等待 {active} 个已开始的普通投稿完成")
                 self.save(waiting_for_ordinary_upload=True)
             return False
-        now = iso(utc_now())
-        with sqlite_connect(Path(self.args.database)) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT value FROM settings WHERE key=?", (NEXT_SUBMIT_KEY,)
-            ).fetchone()
-            current = row[0] if row else None
-            if current != HOLD_UNTIL:
-                original = self.state.get("original_next_submit_at")
-                if "original_next_submit_at" not in self.state:
-                    original = current
-                not_before = self.state.get("sidecar_not_before")
-                if current and current != HOLD_UNTIL:
-                    try:
-                        current_time = parse_time(current)
-                        previous = parse_time(not_before) if not_before else None
-                        if current_time > utc_now() and (previous is None or current_time > previous):
-                            not_before = iso(current_time)
-                    except ValueError:
-                        log(f"忽略无法解析的原投稿冷却时间: {current}")
-                connection.execute(
-                    """
-                    INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
-                    ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
-                    """,
-                    (NEXT_SUBMIT_KEY, HOLD_UNTIL, now),
-                )
-                connection.commit()
-                self.save(
-                    original_next_submit_at=original,
-                    sidecar_not_before=not_before,
-                    upload_hold=True,
-                    waiting_for_ordinary_upload=False,
-                )
-                log("普通视频投稿已暂停；准备、下载和字幕 worker 不受影响")
+        if foreign_owner:
+            if self.state.get("waiting_for_upload_hold_owner") != foreign_owner:
+                log("另一个一次性任务持有普通投稿暂停权，等待其释放")
+                self.save(waiting_for_upload_hold_owner=foreign_owner)
+            return False
+
+        not_before = self.state.get("sidecar_not_before")
+        if previous:
+            try:
+                previous_time = parse_time(previous)
+                saved_time = parse_time(not_before) if not_before else None
+                if previous_time > utc_now() and (
+                    saved_time is None or previous_time > saved_time
+                ):
+                    not_before = iso(previous_time)
+            except ValueError:
+                log(f"忽略无法解析的原投稿冷却时间: {previous}")
+        self.save(
+            original_next_submit_at=previous,
+            sidecar_not_before=not_before,
+            upload_hold=True,
+            waiting_for_ordinary_upload=False,
+            waiting_for_upload_hold_owner=None,
+        )
+        if acquired_new:
+            log("普通视频投稿已暂停；准备、下载和字幕 worker 不受影响")
         return True
 
     def start_upload_hold_worker(self) -> None:
@@ -301,7 +377,10 @@ class LiveOnce:
 
     def wait_until_sidecar_can_upload(self) -> None:
         while True:
-            self.ensure_upload_hold()
+            if not self.ensure_upload_hold():
+                remaining = max(0.0, (self.hold_at - utc_now()).total_seconds())
+                time.sleep(min(max(remaining, 1), 3))
+                continue
             if self.active_ordinary_uploads():
                 time.sleep(3)
                 continue
@@ -315,17 +394,45 @@ class LiveOnce:
             return
 
     def release_upload_hold_after_success(self) -> None:
-        next_submit = iso(utc_now() + dt.timedelta(seconds=self.args.submit_interval_seconds))
-        now = iso(utc_now())
+        owner = self.upload_hold_owner()
+        now_time = utc_now()
+        next_submit_time = now_time + dt.timedelta(seconds=self.args.submit_interval_seconds)
+        now = iso(now_time)
+        released = False
         with sqlite_connect(Path(self.args.database)) as connection:
-            connection.execute(
-                """
-                INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
-                """,
-                (NEXT_SUBMIT_KEY, next_submit, now),
-            )
-            connection.commit()
+            connection.execute("BEGIN IMMEDIATE")
+            owner_row = connection.execute(
+                "SELECT value FROM settings WHERE key=?", (HOLD_OWNER_KEY,)
+            ).fetchone()
+            if owner_row and owner_row[0] == owner:
+                current_row = connection.execute(
+                    "SELECT value FROM settings WHERE key=?", (NEXT_SUBMIT_KEY,)
+                ).fetchone()
+                current = current_row[0] if current_row else None
+                # hold 期间若平台限流写入了更晚的冷却时间，释放时必须保留它。
+                if current and current != HOLD_UNTIL:
+                    current_time = parse_time(current)
+                    if current_time > next_submit_time:
+                        next_submit_time = current_time
+                next_submit = iso(next_submit_time)
+                connection.execute(
+                    """
+                    INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
+                    """,
+                    (NEXT_SUBMIT_KEY, next_submit, now),
+                )
+                connection.execute(
+                    "DELETE FROM settings WHERE key IN (?,?)",
+                    (HOLD_OWNER_KEY, HOLD_PREVIOUS_KEY),
+                )
+                connection.commit()
+                released = True
+            else:
+                connection.rollback()
+                next_submit = None
+        if not released:
+            raise RuntimeError("cannot release an upload hold owned by another process")
         self.save(upload_hold=False, released_next_submit_at=next_submit)
         log(f"普通投稿恢复，下一次最早投稿时间: {next_submit}")
 
@@ -913,6 +1020,9 @@ class LiveOnce:
         if self.state.get("bvid"):
             raise RuntimeError("cannot roll back after Bilibili upload succeeded")
         original = self.state.get("original_candidate")
+        owner = self.state.get("upload_hold_owner")
+        hold_released = False
+        newer_deadline_preserved = False
         with sqlite_connect(Path(self.args.database)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             job = connection.execute(
@@ -938,18 +1048,48 @@ class LiveOnce:
                     f"UPDATE video_candidates SET {assignments} WHERE video_id=?",
                     tuple(original.get(column) for column in columns) + (self.args.video_id,),
                 )
-            if self.state.get("upload_hold"):
-                original_submit = self.state.get("original_next_submit_at")
-                if original_submit is None:
-                    connection.execute("DELETE FROM settings WHERE key=?", (NEXT_SUBMIT_KEY,))
+            owner_row = connection.execute(
+                "SELECT value FROM settings WHERE key=?", (HOLD_OWNER_KEY,)
+            ).fetchone()
+            if owner and owner_row and owner_row[0] == owner:
+                current_row = connection.execute(
+                    "SELECT value FROM settings WHERE key=?", (NEXT_SUBMIT_KEY,)
+                ).fetchone()
+                current = current_row[0] if current_row else None
+                previous_row = connection.execute(
+                    "SELECT value FROM settings WHERE key=?", (HOLD_PREVIOUS_KEY,)
+                ).fetchone()
+                previous = self.decode_previous_hold(
+                    previous_row[0] if previous_row else None
+                )
+                if current == HOLD_UNTIL:
+                    if previous is None:
+                        connection.execute(
+                            "DELETE FROM settings WHERE key=?", (NEXT_SUBMIT_KEY,)
+                        )
+                    else:
+                        connection.execute(
+                            """
+                            INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+                            ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
+                            """,
+                            (NEXT_SUBMIT_KEY, previous, iso(utc_now())),
+                        )
                 else:
-                    connection.execute(
-                        "UPDATE settings SET value=?,updated_at=? WHERE key=?",
-                        (original_submit, iso(utc_now()), NEXT_SUBMIT_KEY),
-                    )
+                    newer_deadline_preserved = True
+                connection.execute(
+                    "DELETE FROM settings WHERE key IN (?,?)",
+                    (HOLD_OWNER_KEY, HOLD_PREVIOUS_KEY),
+                )
+                hold_released = True
             connection.commit()
         self.save(phase="rolled_back", upload_hold=False)
-        log("一次性任务已回滚；候选和普通投稿窗口已恢复")
+        if newer_deadline_preserved:
+            log("一次性任务已回滚；保留了 hold 期间写入的较新投稿冷却时间")
+        elif hold_released:
+            log("一次性任务已回滚；候选和普通投稿窗口已恢复")
+        else:
+            log("一次性任务已回滚；未改动其他进程持有的投稿窗口")
 
     def execute(self) -> None:
         with self.acquire_lock():

@@ -14,7 +14,7 @@ use thiserror::Error;
 use tokio::process::Command;
 use tokio::time::sleep;
 
-pub const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
+pub use crate::db::NEXT_BILIBILI_SUBMIT_AT;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BiliupSubmissionResponse {
