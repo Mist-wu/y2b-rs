@@ -1,0 +1,94 @@
+name: Quality gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: 安装 Rust 质量检查组件
+        run: |
+          rustup default stable
+          rustup component add rustfmt clippy
+      - name: 检查格式
+        run: cargo fmt --check
+      - name: 运行 Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: 运行 Rust 测试
+        run: cargo test
+
+  typescript-and-data:
+    name: TypeScript 和仓库结构
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: 安装 Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: 安装 TypeScript 依赖
+        run: npm ci
+      - name: 检查类型和 Pi extension 解析
+        run: npm run check
+      - name: 校验 JSON、词库和仓库约束
+        run: python3 -m unittest discover -s .github/workflows/tests -p 'test_*.py'
+
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: 运行 scripts 测试
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: 运行 deploy 测试
+        run: python3 -m unittest discover -s deploy/tests -p 'test_*.py'
+      - name: 编译检查 Python 文件
+        run: python3 -m compileall -q scripts deploy
+
+  shell:
+    name: Shell
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: 运行 ShellCheck
+        run: shellcheck deploy/*.sh
+      - name: 检查 Bash 语法
+        run: bash -n deploy/*.sh
+
+  dependency-audit:
+    name: 依赖安全审计
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: 安装 Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: 审计 npm 依赖
+        run: |
+          npm ci
+          npm audit
+      - name: 安装 RustSec cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: 审计 Rust 依赖
+        run: cargo audit
