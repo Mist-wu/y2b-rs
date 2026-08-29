@@ -69,6 +69,8 @@ const CLAIM_LEASE_SECONDS: i64 = 300;
 pub(crate) const PREPARE_CLAIM_KIND: &str = "prepare";
 pub(crate) const SUBTITLE_CLAIM_KIND: &str = "subtitle";
 pub(crate) const UPLOAD_CLAIM_KIND: &str = "upload";
+pub const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
+pub const BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -1482,13 +1484,42 @@ impl Database {
         anyhow::bail!("任务 {id} 当前状态 {} 不允许暂停", current.status)
     }
 
-    /// 原子创建投稿 attempt 并领取任务。返回 attempt ID；未到待上传状态时返回 None。
+    /// 原子检查全局投稿窗口、创建 attempt 并领取任务。
+    ///
+    /// `live_once` 与普通调度器都通过 SQLite 的写事务串行化：要么旁路先写入
+    /// hold，普通任务无法领取；要么普通任务先进入 uploading，旁路会等待它结束。
+    /// 返回 attempt ID；窗口未到、存在旁路 hold 或任务状态不匹配时返回 None。
     pub fn begin_prepared_upload(&self, id: &str) -> Result<Option<String>> {
         let attempt_id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let hold_owner: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key=?",
+                [BILIBILI_UPLOAD_HOLD_OWNER],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if hold_owner.is_some() {
+            return Ok(None);
+        }
+        let deadline: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key=?",
+                [NEXT_BILIBILI_SUBMIT_AT],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(deadline) = deadline {
+            let deadline = DateTime::parse_from_rfc3339(&deadline)
+                .with_context(|| format!("设置 {NEXT_BILIBILI_SUBMIT_AT} 的时间无效: {deadline}"))?
+                .with_timezone(&Utc);
+            if deadline > now {
+                return Ok(None);
+            }
+        }
         let changed = tx.execute(
             "UPDATE jobs SET status='uploading',error=NULL,claim_kind=?,claim_owner=?,claim_expires_at=?,updated_at=? \
              WHERE id=? AND status IN ('ready_to_upload','upload_retry_wait')",
@@ -2205,6 +2236,14 @@ impl Database {
             .with_context(|| format!("设置 {key} 的时间无效: {value}"))?
             .with_timezone(&Utc);
         Ok(deadline <= now)
+    }
+    /// 调度器的只读快速判断；真正的窗口与 hold 校验仍在 `begin_prepared_upload`
+    /// 的写事务内重复执行，避免检查后领取前的竞态。
+    pub fn bilibili_submission_due(&self, now: DateTime<Utc>) -> Result<bool> {
+        if self.get_setting(BILIBILI_UPLOAD_HOLD_OWNER)?.is_some() {
+            return Ok(false);
+        }
+        self.setting_deadline_due(NEXT_BILIBILI_SUBMIT_AT, now)
     }
     /// 直播回放的自动入队起点：早于该时间开播的回放不入队。
     ///
@@ -3286,6 +3325,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attempt, ("succeeded".into(), Some("BV1uxE16ZE7e".into())));
+    }
+
+    #[test]
+    fn upload_claim_atomically_observes_deadline_and_live_hold() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("upload-window.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "upload-window",
+                url: "https://youtu.be/upload-window",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        db.queue_prepared_upload(
+            &id,
+            &PreparedUpload::Submission {
+                video_path: "/tmp/upload-window.mp4".into(),
+                cover_path: "/tmp/upload-window.jpg".into(),
+                mode: TransferMode::Direct,
+                completion_status: JobStatus::Completed,
+            },
+        )
+        .unwrap();
+
+        db.set_setting(
+            NEXT_BILIBILI_SUBMIT_AT,
+            &(Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
+        )
+        .unwrap();
+        assert!(db.begin_prepared_upload(&id).unwrap().is_none());
+        assert_eq!(
+            db.get_job(&id).unwrap().unwrap().status,
+            JobStatus::ReadyToUpload
+        );
+
+        db.set_setting(
+            NEXT_BILIBILI_SUBMIT_AT,
+            &(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
+        )
+        .unwrap();
+        db.set_setting(BILIBILI_UPLOAD_HOLD_OWNER, "live-once:test")
+            .unwrap();
+        assert!(db.begin_prepared_upload(&id).unwrap().is_none());
+        assert_eq!(
+            db.get_job(&id).unwrap().unwrap().status,
+            JobStatus::ReadyToUpload
+        );
+
+        db.conn()
+            .execute(
+                "DELETE FROM settings WHERE key=?",
+                [BILIBILI_UPLOAD_HOLD_OWNER],
+            )
+            .unwrap();
+        assert!(db.begin_prepared_upload(&id).unwrap().is_some());
+        assert_eq!(
+            db.get_job(&id).unwrap().unwrap().status,
+            JobStatus::Uploading
+        );
     }
 
     #[test]

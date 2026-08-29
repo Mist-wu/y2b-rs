@@ -589,10 +589,7 @@ async fn schedule_loop(
                     }));
                 }
                 if upload_worker.is_none()
-                    && db.setting_deadline_due(
-                        pipeline::NEXT_BILIBILI_SUBMIT_AT,
-                        Utc::now(),
-                    )?
+                    && db.bilibili_submission_due(Utc::now())?
                     && let Some(job) = db.next_ready_to_upload_job()?
                 {
                     let fresh = reload_config(config_path, config);
