@@ -39,6 +39,10 @@ fi
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
 python3 "$root_dir/deploy/y2b-set-deepseek-key.py" --check
 
+# 首次部署时服务尚未 active，assert_idle 不查数据库；缺 sqlite3 主要会破坏
+# 服务已运行后的再次部署，而 restore 无论服务状态如何都必须使用它。
+command -v sqlite3 >/dev/null || { echo "sqlite3 is required" >&2; exit 1; }
+
 database=/var/lib/y2b/state.db
 assert_idle() {
   if systemctl is-active --quiet y2b-watch.service && [[ -f "$database" ]]; then

@@ -177,19 +177,8 @@ async fn main() -> Result<()> {
         Cmd::Init => unreachable!(),
         Cmd::ConfigCheck => unreachable!(),
         Cmd::Check { write_baseline } => {
-            for i in check::run(&config, &db).await {
-                println!(
-                    "{} {:<20} {}",
-                    if i.ok { "OK" } else { "FAIL" },
-                    i.name,
-                    i.detail
-                );
-            }
-            if write_baseline {
-                let p = config.runtime.data_dir.join("dependency-baseline.json");
-                check::write_baseline(&config, &p).await?;
-                println!("baseline: {}", p.display());
-            }
+            let checks = check::run(&config, &db).await;
+            finish_check(&config, &checks, write_baseline).await?;
         }
         Cmd::Watch => watch(cli.config.clone(), config, db).await?,
         Cmd::Run { url, mode } => {
@@ -774,23 +763,77 @@ async fn reap_worker(worker: &mut Option<tokio::task::JoinHandle<()>>, name: &st
     }
 }
 
-async fn check_auth(config: &Config, db: &Database) -> Result<()> {
-    let monitor = Monitor::new(config.clone(), db.clone())?;
-    match monitor.fetch_metadata(&config.youtube.probe_url).await {
-        Ok(_) => db.set_setting(
-            "auth.youtube",
-            &format!("ok {}", chrono::Utc::now().to_rfc3339()),
-        )?,
-        Err(e) => db.set_setting("auth.youtube", &format!("failed: {e}"))?,
+async fn finish_check(
+    config: &Config,
+    checks: &[check::CheckItem],
+    write_baseline: bool,
+) -> Result<()> {
+    for item in checks {
+        let status = if item.ok {
+            "OK"
+        } else if item.required {
+            "FAIL"
+        } else {
+            "WARN"
+        };
+        println!("{status} {:<20} {}", item.name, item.detail);
     }
+    let failed = checks
+        .iter()
+        .filter(|item| item.required && !item.ok)
+        .map(|item| item.name.as_str())
+        .collect::<Vec<_>>();
+    if !failed.is_empty() {
+        anyhow::bail!("必选检查失败: {}", failed.join(", "))
+    }
+    if write_baseline {
+        let path = config.runtime.data_dir.join("dependency-baseline.json");
+        check::write_baseline(config, &path, checks).await?;
+        println!("baseline: {}", path.display());
+    }
+    Ok(())
+}
+
+async fn check_auth(config: &Config, db: &Database) -> Result<()> {
+    let youtube = match Monitor::new(config.clone(), db.clone()) {
+        Ok(monitor) => monitor
+            .fetch_metadata(&config.youtube.probe_url)
+            .await
+            .map(|_| ()),
+        Err(error) => Err(error),
+    };
     let mut cmd = Command::new(&config.bilibili.biliup);
     cmd.arg("-u").arg(&config.bilibili.cookies).arg("renew");
-    match run_monitored(cmd, Duration::from_secs(180)).await {
-        Ok(_) => db.set_setting(
-            "auth.bilibili",
-            &format!("ok {}", chrono::Utc::now().to_rfc3339()),
-        )?,
-        Err(e) => db.set_setting("auth.bilibili", &format!("failed: {e}"))?,
+    let bilibili = run_monitored(cmd, Duration::from_secs(180))
+        .await
+        .map(|_| ());
+    record_auth_results(db, youtube, bilibili)
+}
+
+fn record_auth_results(db: &Database, youtube: Result<()>, bilibili: Result<()>) -> Result<()> {
+    let checked_at = chrono::Utc::now().to_rfc3339();
+    let youtube_status = match &youtube {
+        Ok(()) => format!("ok {checked_at}"),
+        Err(error) => format!("failed: {error:#}"),
+    };
+    let bilibili_status = match &bilibili {
+        Ok(()) => format!("ok {checked_at}"),
+        Err(error) => format!("failed: {error:#}"),
+    };
+    let youtube_write = db.set_setting("auth.youtube", &youtube_status);
+    let bilibili_write = db.set_setting("auth.bilibili", &bilibili_status);
+    youtube_write?;
+    bilibili_write?;
+
+    let mut failed = Vec::new();
+    if let Err(error) = youtube {
+        failed.push(format!("YouTube: {error:#}"));
+    }
+    if let Err(error) = bilibili {
+        failed.push(format!("Bilibili: {error:#}"));
+    }
+    if !failed.is_empty() {
+        anyhow::bail!("认证检查失败: {}", failed.join("; "))
     }
     Ok(())
 }
@@ -837,4 +880,265 @@ fn prune(dir: &std::path::Path, keep: usize) -> Result<()> {
         std::fs::remove_file(e.path())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Output;
+
+    #[tokio::test]
+    async fn required_check_failure_returns_error_without_overwriting_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.runtime.data_dir = temp.path().to_path_buf();
+        let baseline = temp.path().join("dependency-baseline.json");
+        fs::write(&baseline, "原基线").unwrap();
+        let checks = vec![
+            check::CheckItem {
+                name: "pi".into(),
+                ok: false,
+                required: true,
+                detail: "未找到 pi".into(),
+            },
+            check::CheckItem {
+                name: "swap".into(),
+                ok: false,
+                required: false,
+                detail: "未启用".into(),
+            },
+        ];
+
+        let error = finish_check(&config, &checks, true).await.unwrap_err();
+        assert!(error.to_string().contains("必选检查失败: pi"));
+        assert_eq!(fs::read_to_string(baseline).unwrap(), "原基线");
+    }
+
+    #[test]
+    fn auth_failure_records_both_results_before_returning_error() {
+        for youtube_fails in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let db = Database::open(&temp.path().join("state.db")).unwrap();
+            let youtube = if youtube_fails {
+                Err(anyhow::anyhow!("YouTube cookie 失效"))
+            } else {
+                Ok(())
+            };
+            let bilibili = if youtube_fails {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("Bilibili cookie 失效"))
+            };
+
+            let error = record_auth_results(&db, youtube, bilibili).unwrap_err();
+            assert!(error.to_string().contains("认证检查失败"));
+            let youtube_status = db.get_setting("auth.youtube").unwrap().unwrap();
+            let bilibili_status = db.get_setting("auth.bilibili").unwrap().unwrap();
+            assert_eq!(youtube_status.starts_with("failed:"), youtube_fails);
+            assert_eq!(bilibili_status.starts_with("failed:"), !youtube_fails);
+        }
+    }
+
+    #[test]
+    fn deployment_scripts_install_and_preflight_sqlite() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let bootstrap = fs::read_to_string(root.join("deploy/bootstrap-server.sh")).unwrap();
+        let install = bootstrap
+            .lines()
+            .find(|line| line.starts_with("apt-get install -y "))
+            .unwrap();
+        assert!(
+            install
+                .split_whitespace()
+                .any(|dependency| dependency == "sqlite3")
+        );
+
+        let deploy = fs::read_to_string(root.join("deploy/deploy-app.sh")).unwrap();
+        let sqlite_check = deploy.find("command -v sqlite3").unwrap();
+        let first_idle_check = deploy.find("\nassert_idle\n").unwrap();
+        assert!(sqlite_check < first_idle_check);
+    }
+
+    fn write_executable(path: &Path, content: &str) {
+        fs::write(path, content).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    struct RestoreFixture {
+        _temp: tempfile::TempDir,
+        state_dir: PathBuf,
+        backup: PathBuf,
+        sqlite3: PathBuf,
+        systemctl: PathBuf,
+        service_state: PathBuf,
+        systemctl_log: PathBuf,
+        fail_start_once: PathBuf,
+    }
+
+    fn restore_fixture(active: bool) -> RestoreFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("data");
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        let backup = temp.path().join("backup.db");
+        fs::write(&backup, "new-v19").unwrap();
+
+        let sqlite3 = bin_dir.join("sqlite3");
+        write_executable(
+            &sqlite3,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+database=$1
+query=$2
+case "$query" in
+  *integrity_check*)
+    if grep -q '^damaged' "$database"; then
+      printf 'row 1 missing\nrow 2 broken\n'
+    else
+      printf 'ok\n'
+    fi
+    ;;
+  *sqlite_master*) printf '4\n' ;;
+  *MAX\(version\)*)
+    if grep -q 'v18' "$database"; then printf '18\n'; else printf '19\n'; fi
+    ;;
+  *) echo "unexpected sqlite query: $query" >&2; exit 2 ;;
+esac
+"#,
+        );
+
+        let systemctl = bin_dir.join("systemctl");
+        write_executable(
+            &systemctl,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$1" >>"$RESTORE_TEST_SYSTEMCTL_LOG"
+case "$1" in
+  is-active)
+    [[ $(<"$RESTORE_TEST_SERVICE_STATE") == active ]] && exit 0
+    exit 3
+    ;;
+  stop) printf 'inactive\n' >"$RESTORE_TEST_SERVICE_STATE" ;;
+  start)
+    if [[ -f "$RESTORE_TEST_FAIL_START_ONCE" ]]; then
+      rm -f "$RESTORE_TEST_FAIL_START_ONCE"
+      exit 1
+    fi
+    printf 'active\n' >"$RESTORE_TEST_SERVICE_STATE"
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+        );
+        let service_state = temp.path().join("service-state");
+        fs::write(
+            &service_state,
+            if active { "active\n" } else { "inactive\n" },
+        )
+        .unwrap();
+
+        RestoreFixture {
+            _temp: temp,
+            state_dir,
+            backup,
+            sqlite3,
+            systemctl,
+            service_state,
+            systemctl_log: PathBuf::new(),
+            fail_start_once: PathBuf::new(),
+        }
+        .with_runtime_paths()
+    }
+
+    impl RestoreFixture {
+        fn with_runtime_paths(mut self) -> Self {
+            let root = self.service_state.parent().unwrap();
+            self.systemctl_log = root.join("systemctl.log");
+            self.fail_start_once = root.join("fail-start-once");
+            self
+        }
+
+        fn run_with_sqlite(&self, sqlite3: &Path) -> Output {
+            std::process::Command::new("bash")
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/deploy/restore.sh"))
+                .arg(&self.backup)
+                .env("Y2B_STATE_DIR", &self.state_dir)
+                .env("Y2B_SQLITE3", sqlite3)
+                .env("Y2B_SYSTEMCTL", &self.systemctl)
+                .env("RESTORE_TEST_SERVICE_STATE", &self.service_state)
+                .env("RESTORE_TEST_SYSTEMCTL_LOG", &self.systemctl_log)
+                .env("RESTORE_TEST_FAIL_START_ONCE", &self.fail_start_once)
+                .output()
+                .unwrap()
+        }
+
+        fn run(&self) -> Output {
+            self.run_with_sqlite(&self.sqlite3)
+        }
+    }
+
+    #[test]
+    fn restore_succeeds_without_an_existing_database() {
+        let fixture = restore_fixture(false);
+        let output = fixture.run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.state_dir.join("state.db")).unwrap(),
+            "new-v19"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "inactive\n"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_corrupt_backup_before_stopping_service() {
+        let fixture = restore_fixture(true);
+        let database = fixture.state_dir.join("state.db");
+        fs::write(&database, "old-v19").unwrap();
+        fs::write(&fixture.backup, "damaged-v19").unwrap();
+
+        let output = fixture.run();
+        assert!(!output.status.success());
+        assert_eq!(fs::read_to_string(database).unwrap(), "old-v19");
+        assert!(!fixture.systemctl_log.exists());
+    }
+
+    #[test]
+    fn restore_rejects_missing_sqlite_before_stopping_service() {
+        let fixture = restore_fixture(true);
+        let missing = fixture.state_dir.join("missing-sqlite3");
+        let output = fixture.run_with_sqlite(&missing);
+
+        assert!(!output.status.success());
+        assert!(!fixture.systemctl_log.exists());
+    }
+
+    #[test]
+    fn restore_rolls_back_database_when_service_start_fails() {
+        let fixture = restore_fixture(true);
+        let database = fixture.state_dir.join("state.db");
+        fs::write(&database, "old-v19").unwrap();
+        fs::write(&fixture.fail_start_once, "fail\n").unwrap();
+
+        let output = fixture.run();
+        assert!(!output.status.success());
+        assert_eq!(fs::read_to_string(database).unwrap(), "old-v19");
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "active\n"
+        );
+        let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+        assert!(calls.matches("start\n").count() >= 2);
+    }
 }
