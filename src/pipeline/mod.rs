@@ -9,6 +9,7 @@ use crate::model::{Job, JobStatus, PreparedUpload, TransferMode, VideoMetadata};
 use crate::monitor::{Monitor, exceeds_duration_limit, is_live_content_pending, ytdlp_command};
 use crate::process::run_monitored;
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::future::Future;
@@ -300,6 +301,129 @@ where
 
 fn requires_translated_pipeline(mode: TransferMode) -> bool {
     mode == TransferMode::Translated
+}
+
+const TRANSLATION_CACHE_PROVENANCE_SCHEMA: u32 = 1;
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TranslationCacheProvenance {
+    schema: u32,
+    video_id: String,
+    source_lang: String,
+    target_lang: String,
+    provider: String,
+    model: String,
+    thinking: String,
+    policy_path: String,
+    policy_sha256: Option<String>,
+}
+
+fn translation_cache_paths(work: &Path, video_id: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let segmented = work.join(format!("{video_id}.en.segmented.json"));
+    let translated = work.join(format!("{video_id}.en-zh-CN.translated.json"));
+    let provenance = work.join(format!("{video_id}.en-zh-CN.translated.provenance.json"));
+    (segmented, translated, provenance)
+}
+
+fn expected_translation_provenance(config: &Config, video_id: &str) -> TranslationCacheProvenance {
+    use sha2::{Digest, Sha256};
+
+    let policy_sha256 = fs::read(&config.ai.policy)
+        .ok()
+        .map(|content| hex::encode(Sha256::digest(content)));
+    TranslationCacheProvenance {
+        schema: TRANSLATION_CACHE_PROVENANCE_SCHEMA,
+        video_id: video_id.to_string(),
+        source_lang: config.translation.source_lang.clone(),
+        target_lang: config.translation.target_lang.clone(),
+        provider: config.ai.provider.clone(),
+        model: config.ai.translation_model.clone(),
+        thinking: config.ai.thinking.clone(),
+        policy_path: config.ai.policy.to_string_lossy().into_owned(),
+        policy_sha256,
+    }
+}
+
+fn write_translation_provenance(
+    path: &Path,
+    provenance: &TranslationCacheProvenance,
+) -> Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("translation.provenance.json");
+    let temporary = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        fs::write(&temporary, serde_json::to_vec_pretty(provenance)?)?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn validate_translation_cache(config: &Config, video_id: &str, work: &Path) -> Result<()> {
+    let (segmented, translated, provenance_path) = translation_cache_paths(work, video_id);
+    let source =
+        subtitle_flow::load_segmented_cache(&segmented)?.context("翻译缓存缺少有效分句来源")?;
+    let provenance: TranslationCacheProvenance =
+        serde_json::from_slice(&fs::read(&provenance_path).with_context(|| {
+            format!(
+                "读取翻译缓存 provenance 失败: {}",
+                provenance_path.display()
+            )
+        })?)
+        .context("翻译缓存 provenance 不是有效 JSON")?;
+    let expected = expected_translation_provenance(config, video_id);
+    if provenance.source_lang != expected.source_lang
+        || provenance.target_lang != expected.target_lang
+    {
+        bail!(
+            "翻译缓存语言对 {}->{} 与当前 {}->{} 不匹配",
+            provenance.source_lang,
+            provenance.target_lang,
+            expected.source_lang,
+            expected.target_lang
+        )
+    }
+    if provenance != expected {
+        bail!("翻译缓存 provenance 与当前视频、模型或策略不匹配")
+    }
+    subtitle_flow::load_translation_checkpoint(&translated, &source)?
+        .context("翻译缓存文件不存在")?;
+    Ok(())
+}
+
+fn quarantine_cache(path: &Path) -> Result<Option<PathBuf>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cache");
+    let quarantined = path.with_file_name(format!("{name}.corrupt-{}", uuid::Uuid::new_v4()));
+    fs::rename(path, &quarantined)
+        .with_context(|| format!("隔离损坏缓存失败: {}", path.display()))?;
+    Ok(Some(quarantined))
+}
+
+fn quarantine_invalid_vtt_caches(work: &Path, video_id: &str) -> Result<Vec<PathBuf>> {
+    let mut quarantined = Vec::new();
+    while let Some(path) = subtitle_flow::pick_subtitle_file(work, video_id)? {
+        if crate::subtitle::parse_vtt(&path).is_ok() {
+            break;
+        }
+        if let Some(path) = quarantine_cache(&path)? {
+            quarantined.push(path);
+        }
+    }
+    Ok(quarantined)
 }
 
 /// 任务重试退避基数与上限：第 n 次失败后等待 `min(5min × 2^n, 1h)`。
@@ -678,8 +802,22 @@ impl Pipeline {
             return Ok(());
         }
 
+        self.validate_subtitle_caches(&job.id, &meta.id, &work)?;
         let video_fut = self.download_video(&job.id, &job.url, &meta, &work);
-        let subtitle_fut = self.prepare_translated_subtitle(job, &meta, &work);
+        let subtitle_fut = async {
+            let result = self.prepare_translated_subtitle(job, &meta, &work).await;
+            let (_, translated, provenance_path) = translation_cache_paths(&work, &meta.id);
+            if translated.exists() {
+                let provenance = expected_translation_provenance(&self.config, &meta.id);
+                if let Err(error) = write_translation_provenance(&provenance_path, &provenance) {
+                    if result.is_ok() {
+                        return Err(error).context("写入翻译缓存 provenance 失败");
+                    }
+                    tracing::warn!(error = %error, "写入失败任务的翻译缓存 provenance 失败");
+                }
+            }
+            result
+        };
         let (video, subtitle) = try_join_branches(video_fut, subtitle_fut).await?;
         self.db
             .set_job_paths(&job.id, Some(&video.to_string_lossy()))?;
@@ -798,6 +936,45 @@ impl Pipeline {
             }
             Err(error) => Err(stage.fail(error, duration_ms, 0)).context("下载 YouTube 封面失败"),
         }
+    }
+
+    fn validate_subtitle_caches(&self, job_id: &str, video_id: &str, work: &Path) -> Result<()> {
+        for quarantined in quarantine_invalid_vtt_caches(work, video_id)? {
+            self.db.event(
+                Some(job_id),
+                "warn",
+                &format!("原始 VTT 缓存损坏，已隔离: {}", quarantined.display()),
+            )?;
+        }
+
+        let (segmented, translated, provenance) = translation_cache_paths(work, video_id);
+        if segmented.exists()
+            && let Err(error) = subtitle_flow::load_segmented_cache(&segmented)
+        {
+            quarantine_cache(&segmented)?;
+            quarantine_cache(&translated)?;
+            quarantine_cache(&provenance)?;
+            self.db.event(
+                Some(job_id),
+                "warn",
+                &format!("分句缓存损坏，已连同翻译缓存隔离: {error:#}"),
+            )?;
+            return Ok(());
+        }
+        if translated.exists()
+            && let Err(error) = validate_translation_cache(&self.config, video_id, work)
+        {
+            quarantine_cache(&translated)?;
+            quarantine_cache(&provenance)?;
+            self.db.event(
+                Some(job_id),
+                "warn",
+                &format!("翻译缓存不完整或 provenance 失配，已隔离: {error:#}"),
+            )?;
+        } else if !translated.exists() && provenance.exists() {
+            quarantine_cache(&provenance)?;
+        }
+        Ok(())
     }
 
     fn ensure_disk(&self) -> Result<()> {
@@ -1008,7 +1185,7 @@ impl Pipeline {
 mod tests {
     use super::*;
     use crate::db::NewJob;
-    use crate::pipeline::testing::metadata;
+    use crate::pipeline::testing::{cue, metadata};
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
@@ -1150,6 +1327,55 @@ mod tests {
         };
         let error = validate_media(oversized, None, 921_600).unwrap_err();
         assert!(error.to_string().contains("max_pixels=921600"));
+    }
+
+    #[test]
+    fn corrupt_raw_vtt_cache_is_quarantined_before_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let corrupt = temp.path().join("vid.en.vtt");
+        std::fs::write(&corrupt, "WEBVTT\n\nnot a cue\n").unwrap();
+
+        let quarantined = quarantine_invalid_vtt_caches(temp.path(), "vid").unwrap();
+        assert_eq!(quarantined.len(), 1);
+        assert!(!corrupt.exists());
+        assert!(quarantined[0].exists());
+        assert_eq!(
+            subtitle_flow::pick_subtitle_file(temp.path(), "vid").unwrap(),
+            None,
+            "隔离后必须走 yt-dlp 重新下载"
+        );
+    }
+
+    #[test]
+    fn translation_cache_requires_current_language_and_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.ai.policy = temp.path().join("policy.json");
+        std::fs::write(&config.ai.policy, "{}\n").unwrap();
+        let (segmented, translated, provenance_path) = translation_cache_paths(temp.path(), "vid");
+        let source = vec![cue(0, "hello")];
+        crate::subtitle::save_json(&source, &segmented).unwrap();
+        let mut completed = source;
+        completed[0].translation = Some("你好".into());
+        crate::subtitle::save_json(&completed, &translated).unwrap();
+        let provenance = expected_translation_provenance(&config, "vid");
+        write_translation_provenance(&provenance_path, &provenance).unwrap();
+        validate_translation_cache(&config, "vid", temp.path()).unwrap();
+
+        config.translation.target_lang = "zh-TW".into();
+        let error = validate_translation_cache(&config, "vid", temp.path()).unwrap_err();
+        assert!(error.to_string().contains("语言对"));
+        config.translation.target_lang = "zh-CN".into();
+        completed[0].source = "different source".into();
+        crate::subtitle::save_json(&completed, &translated).unwrap();
+        assert!(
+            validate_translation_cache(&config, "vid", temp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("不匹配")
+        );
+        std::fs::remove_file(&provenance_path).unwrap();
+        assert!(validate_translation_cache(&config, "vid", temp.path()).is_err());
     }
 
     #[test]
