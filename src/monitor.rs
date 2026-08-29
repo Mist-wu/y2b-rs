@@ -35,7 +35,9 @@ pub struct Monitor {
     uploads_refreshed_this_process: AtomicBool,
 }
 
-/// 构造带公共参数（js 运行时、cookies）的 yt-dlp 命令，供各子命令复用。
+const YOUTUBE_EXTRACTOR_ARGS: &str = "youtube:player_client=web_creator";
+
+/// 构造带公共参数（YouTube 客户端、js 运行时、cookies）的 yt-dlp 命令，供各子命令复用。
 ///
 /// 注意：不要加 `--force-ipv4`。曾经为了绕开 `[Errno 101] Network is unreachable`
 /// 加过，但那是误诊——真正的原因是部署机到 `74.125.0.0/16` 整段不可达，两个地址
@@ -44,7 +46,16 @@ pub struct Monitor {
 /// not supported`，属于净负面。
 pub(crate) fn ytdlp_command(config: &YoutubeConfig) -> Command {
     let mut cmd = Command::new(&config.yt_dlp);
-    cmd.args(["--js-runtimes", "node"]);
+    // 2026-08 起默认的 web_safari 客户端会在服务器账号上稳定返回
+    // `The page needs to be reloaded`。字幕路径曾单独指定 web_creator，导致
+    // 字幕可用但元数据和原片下载仍失败。统一放在公共入口，确保发现、元数据、
+    // 字幕和原片下载使用同一客户端；GVS token 由已部署的 bgutil provider 生成。
+    cmd.args([
+        "--js-runtimes",
+        "node",
+        "--extractor-args",
+        YOUTUBE_EXTRACTOR_ARGS,
+    ]);
     if config.cookies.exists() {
         cmd.arg("--cookies").arg(&config.cookies);
     }
@@ -1708,6 +1719,21 @@ impl Monitor {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn ytdlp_command_uses_web_creator_for_every_youtube_call() {
+        let cmd = ytdlp_command(&YoutubeConfig::default());
+        let args = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair[0] == "--extractor-args" && pair[1] == YOUTUBE_EXTRACTOR_ARGS })
+        );
+    }
 
     async fn mock_response(
         status: u16,
