@@ -533,8 +533,10 @@ fn app(
                         && let Some(i) = state.selected()
                         && let Some(j) = jobs.get(i)
                     {
-                        db.update_job_status(&j.id, JobStatus::Paused, None)?;
-                        notice = format!("已暂停 {}", j.video_id);
+                        notice = match db.pause_job(&j.id) {
+                            Ok(()) => format!("已暂停 {}", j.video_id),
+                            Err(e) => format!("暂停失败: {e}"),
+                        };
                     }
                 }
                 KeyCode::Char('a') => {
