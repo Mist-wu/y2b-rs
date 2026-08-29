@@ -490,6 +490,14 @@ impl Pipeline {
     pub async fn upload_prepared_job(&self, job: Job) -> Result<()> {
         let result = self.upload_prepared_job_inner(&job).await;
         if let Err(error) = &result {
+            if upload::is_upload_uncertain(error) {
+                self.db.event(
+                    Some(&job.id),
+                    "warn",
+                    &format!("投稿结果不确定，已停止自动重试: {error}"),
+                )?;
+                return result;
+            }
             let attempt = self.db.increment_attempt(&job.id)?;
             let rate_limited = error.to_string().contains("21566");
             if rate_limited {

@@ -109,6 +109,10 @@ enum JobCmd {
     Retry {
         id: String,
     },
+    /// 从 Bilibili 创作中心核对 upload_uncertain 任务；只接受唯一同名稿件。
+    ReconcileUpload {
+        id: String,
+    },
 }
 #[derive(Subcommand)]
 enum SubtitleCmd {
@@ -334,6 +338,12 @@ async fn main() -> Result<()> {
                 }
                 db.retry_job(&id)?;
                 println!("已重新排队 {id}");
+            }
+            JobCmd::ReconcileUpload { id } => {
+                let message = Pipeline::new(config, db)
+                    .reconcile_uncertain_upload(&id)
+                    .await?;
+                println!("{message}");
             }
         },
         Cmd::Subtitle(c) => match c {

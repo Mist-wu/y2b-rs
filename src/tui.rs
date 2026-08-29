@@ -344,6 +344,7 @@ fn app(
                         JobStatus::Failed | JobStatus::DeadLetter => Color::Red,
                         JobStatus::ReadyToUpload => Color::Cyan,
                         JobStatus::UploadRetryWait => Color::Yellow,
+                        JobStatus::UploadUncertain => Color::LightRed,
                         JobStatus::UploadedOriginalPendingSubtitle => Color::Magenta,
                         JobStatus::Paused => Color::DarkGray,
                         _ => Color::White,
