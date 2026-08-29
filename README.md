@@ -224,8 +224,8 @@ yt-dlp -v --simulate 'https://www.youtube.com/watch?v=VIDEO_ID' 2>&1 \
 1. 空服务器运行 `bootstrap-server.sh`。
 2. 恢复 `/etc/y2b/config.toml`、`/etc/y2b/y2b.env`、两个 cookies 文件，并用 `y2b-set-deepseek-key` 重新注入 DeepSeek Key；`/opt/y2b/pi/` 下的资源由 `deploy-app.sh` 从仓库安装，无需单独备份。
 3. 从 `/var/lib/y2b/backups/daily` 或 `weekly` 选数据库，执行 `deploy/restore.sh BACKUP.db`。
-4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时自动升级到 v10（新增超时长视频判定表，幂等）。旧频道和任务模式均为 `translated`；升级前停在待补字幕的任务各获一次自动补交机会，升级前的 `retry_wait` 行沿用固定 10 分钟退避。
-5. SQLite 保存完整队列：`queued`/`retry_wait`/`processing` 重启后恢复，任务模式和追加目标 BV 不丢失，`dead_letter` 从 TUI 或 CLI 恢复后重新下载。
+4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时自动升级到 v18（迁移幂等）。旧频道和任务模式均为 `translated`；升级前停在待补字幕的任务各获一次自动补交机会，升级前的 `retry_wait` 行沿用固定 10 分钟退避。
+5. SQLite 保存完整队列：准备和 CC 字幕任务通过原子领取、租约与心跳避免多进程重复执行；过期租约在重启后恢复。任务模式和追加目标 BV 不丢失，`dead_letter` 可从 TUI 或 CLI 安全恢复。
 
 ## 上线验收
 

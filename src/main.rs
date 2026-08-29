@@ -560,7 +560,7 @@ async fn schedule_loop(
                 reap_worker(&mut subtitle_worker, "字幕工作线程").await;
                 if prepare_worker.is_none()
                     && !ai_circuit_breaker.is_open()
-                    && let Some(job) = db.next_queued_job()?
+                    && let Some(job) = db.claim_next_prepare_job()?
                 {
                     let fresh = reload_config(config_path, config);
                     let worker_db = db.clone();
@@ -596,7 +596,7 @@ async fn schedule_loop(
                 // CC 字幕补交独立于上传：失败已由 Pipeline 记录并安排退避重试，
                 // 这里只负责不让它占住上传 worker。
                 if subtitle_worker.is_none()
-                    && let Some(job) = db.next_pending_subtitle_job(pipeline::CC_MAX_ATTEMPTS)?
+                    && let Some(job) = db.claim_next_pending_subtitle_job(pipeline::CC_MAX_ATTEMPTS)?
                 {
                     let fresh = reload_config(config_path, config);
                     let worker_db = db.clone();
