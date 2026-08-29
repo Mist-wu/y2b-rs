@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::process::Command;
@@ -407,11 +406,7 @@ async fn main() -> Result<()> {
         },
         Cmd::Login(c) => match c {
             LoginCmd::Youtube { cookies_file } => {
-                std::fs::copy(cookies_file, &config.youtube.cookies)?;
-                std::fs::set_permissions(
-                    &config.youtube.cookies,
-                    std::fs::Permissions::from_mode(0o600),
-                )?;
+                tui::import_cookie(&cookies_file, &config.youtube.cookies)?;
                 println!("已导入 {}", config.youtube.cookies.display());
             }
             LoginCmd::Bilibili => {

@@ -4,7 +4,7 @@ use crate::{
     model::{JobStatus, TransferMode},
     monitor::{EnqueueOutcome, Monitor},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono_tz::Tz;
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
@@ -15,13 +15,13 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
 use std::{
-    os::unix::fs::PermissionsExt,
-    path::Path,
-    process::{Command, Stdio},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc::{Receiver, TryRecvError, channel},
     time::{Duration, Instant},
 };
-use sysinfo::{Disks, System};
+use sysinfo::System;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ManualInput {
@@ -123,8 +123,16 @@ fn app(
     let mut manual_input = ManualInput::Idle;
     let mut manual_result: Option<Receiver<Result<EnqueueOutcome>>> = None;
     let mut select_job_id: Option<String> = None;
-    let mut host = HostStats::new();
+    let mut host = HostStats::new(&config.runtime.data_dir);
+    let mut auth_check = AuthCheckProcess::default();
     loop {
+        if let Some(status) = auth_check.poll()? {
+            notice = if status.success() {
+                "认证检查已完成".into()
+            } else {
+                format!("认证检查失败: {status}")
+            };
+        }
         let received = manual_result.as_ref().map(Receiver::try_recv);
         match received {
             Some(Ok(Ok(outcome))) => {
@@ -540,21 +548,23 @@ fn app(
                         };
                     }
                 }
-                KeyCode::Char('a') => {
-                    match std::env::current_exe().and_then(|exe| {
-                        Command::new(exe)
+                KeyCode::Char('a') => match std::env::current_exe() {
+                    Ok(exe) => {
+                        let mut command = Command::new(exe);
+                        command
                             .arg("--config")
                             .arg(config_path)
                             .arg("auth-check")
                             .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .spawn()
-                            .map(|_| ())
-                    }) {
-                        Ok(()) => notice = "已启动认证检查".into(),
-                        Err(e) => notice = format!("认证检查启动失败: {e}"),
-                    };
-                }
+                            .stderr(Stdio::null());
+                        match auth_check.start(&mut command) {
+                            Ok(true) => notice = "已启动认证检查".into(),
+                            Ok(false) => notice = "认证检查仍在运行，请勿重复启动".into(),
+                            Err(e) => notice = format!("认证检查启动失败: {e}"),
+                        }
+                    }
+                    Err(e) => notice = format!("无法定位当前程序: {e}"),
+                },
                 KeyCode::Char('y') => {
                     import_target = Some(true);
                     import_path.clear();
@@ -571,7 +581,62 @@ fn app(
             }
         }
     }
+    auth_check.shutdown()?;
     Ok(())
+}
+
+#[derive(Default)]
+struct AuthCheckProcess {
+    child: Option<Child>,
+}
+
+impl AuthCheckProcess {
+    fn poll(&mut self) -> Result<Option<ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let status = child.try_wait()?;
+        if status.is_some() {
+            self.child.take();
+        }
+        Ok(status)
+    }
+
+    fn start(&mut self, command: &mut Command) -> Result<bool> {
+        self.poll()?;
+        if self.child.is_some() {
+            return Ok(false);
+        }
+        self.child = Some(command.spawn()?);
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn is_running(&self) -> bool {
+        self.child.is_some()
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        if child.try_wait()?.is_none() {
+            child.kill()?;
+            child.wait()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AuthCheckProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take()
+            && child.try_wait().ok().flatten().is_none()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// 主机内存/swap/磁盘快照，按 `REFRESH_INTERVAL` 节流刷新。
@@ -580,6 +645,7 @@ fn app(
 /// 重新扫描全部进程。
 struct HostStats {
     system: System,
+    data_dir: PathBuf,
     refreshed_at: Option<Instant>,
     used_memory_mib: u64,
     total_memory_mib: u64,
@@ -591,9 +657,10 @@ struct HostStats {
 impl HostStats {
     const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
-    fn new() -> Self {
+    fn new(data_dir: &Path) -> Self {
         Self {
             system: System::new(),
+            data_dir: data_dir.to_path_buf(),
             refreshed_at: None,
             used_memory_mib: 0,
             total_memory_mib: 0,
@@ -614,20 +681,36 @@ impl HostStats {
         self.total_memory_mib = self.system.total_memory() / 1024 / 1024;
         self.used_swap_mib = self.system.used_swap() / 1024 / 1024;
         self.total_swap_mib = self.system.total_swap() / 1024 / 1024;
-        self.free_gib = Disks::new_with_refreshed_list()
-            .list()
-            .iter()
-            .map(|disk| disk.available_space())
-            .sum::<u64>()
-            / (1024 * 1024 * 1024);
+        self.free_gib = fs2::available_space(&self.data_dir).unwrap_or(0) / (1024 * 1024 * 1024);
         self.refreshed_at = Some(Instant::now());
     }
 }
 
-fn import_cookie(source: &Path, dest: &Path) -> Result<()> {
-    std::fs::copy(source, dest)?;
-    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
+pub fn import_cookie(source: &Path, dest: &Path) -> Result<()> {
+    let parent = dest.parent().context("cookies 目标路径没有父目录")?;
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cookies");
+    let temporary = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut input = std::fs::File::open(source)?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        output.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        drop(output);
+        std::fs::rename(&temporary, dest)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -666,12 +749,64 @@ mod tests {
 
     #[test]
     fn host_stats_populate_once_then_throttle() {
-        let mut host = HostStats::new();
+        let directory = tempfile::tempdir().unwrap();
+        let mut host = HostStats::new(directory.path());
         assert!(host.needs_refresh(), "首次绘制必须刷新");
         host.refresh();
         assert!(host.total_memory_mib > 0, "刷新后应读到总内存");
+        assert_eq!(
+            host.free_gib,
+            fs2::available_space(directory.path()).unwrap() / (1024 * 1024 * 1024),
+            "磁盘值必须来自 data_dir 所在文件系统"
+        );
         // 刷新后进入节流窗口，后续重绘直接复用快照。
         assert!(!host.needs_refresh());
+    }
+
+    #[test]
+    fn auth_check_process_blocks_duplicates_then_reaps_child() {
+        let mut auth = AuthCheckProcess::default();
+        let mut running = Command::new("sleep");
+        running.arg("2");
+        assert!(auth.start(&mut running).unwrap());
+        assert!(auth.is_running());
+
+        let mut duplicate = Command::new("true");
+        assert!(!auth.start(&mut duplicate).unwrap());
+        auth.shutdown().unwrap();
+        assert!(!auth.is_running());
+
+        let mut completed = Command::new("true");
+        assert!(auth.start(&mut completed).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while auth.poll().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!auth.is_running(), "退出的认证子进程必须被回收");
+    }
+
+    #[test]
+    fn cookie_import_atomically_replaces_with_private_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.txt");
+        let dest = directory.path().join("cookies.txt");
+        std::fs::write(&source, "new-cookie").unwrap();
+        std::fs::write(&dest, "old-cookie").unwrap();
+        assert!(import_cookie(&directory.path().join("missing"), &dest).is_err());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "old-cookie");
+        import_cookie(&source, &dest).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new-cookie");
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
     }
 
     #[test]
