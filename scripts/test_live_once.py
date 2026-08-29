@@ -3,6 +3,7 @@ import datetime as dt
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -93,6 +94,22 @@ class LiveOnceTests(unittest.TestCase):
             self.assertNotIn("--dynamic", command)
             self.assertNotIn("--source", command)
             self.assertIn("原标题：Official Talk", command[command.index("--desc") + 1])
+
+    def test_upload_hold_worker_runs_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = arguments(Path(directory))
+            args.hold_at = "2020-01-01T00:00:00Z"
+            item = LiveOnce(args)
+            called = threading.Event()
+
+            def hold() -> bool:
+                called.set()
+                return True
+
+            item.ensure_upload_hold = hold  # type: ignore[method-assign]
+            item.start_upload_hold_worker()
+            self.assertTrue(called.wait(1))
+            item.stop_upload_hold_worker()
 
     def test_segments_are_deduplicated_and_keep_pre_roll(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
