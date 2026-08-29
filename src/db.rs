@@ -1434,6 +1434,27 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// 安全暂停尚未发生不可逆投稿副作用的任务。
+    ///
+    /// 准备中的任务会同时撤销领取租约；旧 worker 的后续 CAS 写入会失败，心跳也
+    /// 会尽快取消其 future。`uploading` 和所有已投稿状态必须拒绝，不能用暂停伪装
+    /// 成一个可直接重试的状态。
+    pub fn pause_job(&self, id: &str) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE jobs SET status='paused',error='用户暂停',retry_at=NULL,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE id=? AND status IN ('queued','retry_wait','inspecting','processing','ready_to_upload','upload_retry_wait')",
+            params![Utc::now().to_rfc3339(), id],
+        )?;
+        if changed == 1 {
+            return Ok(());
+        }
+        let current = self
+            .get_job(id)?
+            .with_context(|| format!("任务不存在: {id}"))?;
+        anyhow::bail!("任务 {id} 当前状态 {} 不允许暂停", current.status)
+    }
+
     pub fn claim_prepared_upload(&self, id: &str, status: JobStatus) -> Result<bool> {
         if status != JobStatus::Uploading {
             anyhow::bail!("无效的上传领取状态: {status}")
@@ -1500,11 +1521,15 @@ impl Database {
     }
     pub fn queue_prepared_upload(&self, id: &str, upload: &PreparedUpload) -> Result<()> {
         let changed = self.conn().execute(
-            "UPDATE jobs SET prepared_upload_json=?,status='ready_to_upload',error=NULL,updated_at=? WHERE id=?",
+            "UPDATE jobs SET prepared_upload_json=?,status='ready_to_upload',error=NULL,updated_at=? \
+             WHERE id=? AND status IN ('queued','retry_wait','inspecting','processing','failed','dead_letter')",
             params![serde_json::to_string(upload)?, Utc::now().to_rfc3339(), id],
         )?;
         if changed == 0 {
-            anyhow::bail!("任务不存在: {id}")
+            let current = self
+                .get_job(id)?
+                .with_context(|| format!("任务不存在: {id}"))?;
+            anyhow::bail!("任务 {id} 当前状态 {} 不允许写入待上传计划", current.status)
         }
         Ok(())
     }
@@ -3116,8 +3141,7 @@ mod tests {
         };
         db.queue_prepared_upload(&id, &plan).unwrap();
         db.increment_attempt(&id).unwrap();
-        db.update_job_status(&id, JobStatus::Paused, Some("failed"))
-            .unwrap();
+        db.pause_job(&id).unwrap();
 
         db.retry_job(&id).unwrap();
         let job = db.get_job(&id).unwrap().unwrap();
@@ -3171,6 +3195,115 @@ mod tests {
         .unwrap();
         let error = db.retry_job(&id).unwrap_err().to_string();
         assert!(error.contains("投稿结果不确定"));
+        assert_eq!(db.get_job(&id).unwrap().unwrap().status, JobStatus::Paused);
+    }
+
+    #[test]
+    fn pause_revokes_prepare_claim_and_stale_worker_cannot_resume_it() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("pause-claim.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "pause-active",
+                url: "https://youtu.be/pause-active",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        db.claim_prepare_job(&id).unwrap().unwrap();
+        assert!(db.owns_job_claim(&id, PREPARE_CLAIM_KIND).unwrap());
+
+        db.pause_job(&id).unwrap();
+        assert_eq!(db.get_job(&id).unwrap().unwrap().status, JobStatus::Paused);
+        assert!(!db.owns_job_claim(&id, PREPARE_CLAIM_KIND).unwrap());
+        assert!(
+            db.update_claimed_job_status(
+                &id,
+                PREPARE_CLAIM_KIND,
+                JobStatus::Processing,
+                None,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            db.queue_claimed_prepared_upload(
+                &id,
+                &PreparedUpload::Submission {
+                    video_path: "/tmp/stale.mp4".into(),
+                    cover_path: "/tmp/stale.jpg".into(),
+                    mode: TransferMode::Direct,
+                    completion_status: JobStatus::Completed,
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(db.get_job(&id).unwrap().unwrap().status, JobStatus::Paused);
+    }
+
+    #[test]
+    fn pause_rejects_uploading_post_upload_and_terminal_states() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("pause-states.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "pause-states",
+                url: "https://youtu.be/pause-states",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+
+        for status in [
+            JobStatus::Uploading,
+            JobStatus::UploadedOriginalPendingSubtitle,
+            JobStatus::Completed,
+            JobStatus::DeadLetter,
+            JobStatus::Failed,
+        ] {
+            db.update_job_status(&id, status, None).unwrap();
+            assert!(db.pause_job(&id).is_err(), "{status} 不应允许暂停");
+            assert_eq!(db.get_job(&id).unwrap().unwrap().status, status);
+        }
+    }
+
+    #[test]
+    fn paused_job_cannot_be_overwritten_by_generic_preparation_completion() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("pause-plan.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "pause-plan",
+                url: "https://youtu.be/pause-plan",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        db.pause_job(&id).unwrap();
+        assert!(
+            db.queue_prepared_upload(
+                &id,
+                &PreparedUpload::Submission {
+                    video_path: "/tmp/paused.mp4".into(),
+                    cover_path: "/tmp/paused.jpg".into(),
+                    mode: TransferMode::Direct,
+                    completion_status: JobStatus::Completed,
+                },
+            )
+            .is_err()
+        );
         assert_eq!(db.get_job(&id).unwrap().unwrap().status, JobStatus::Paused);
     }
 
@@ -3335,7 +3468,7 @@ mod tests {
             },
         )
         .unwrap();
-        db.update_job_status(&id, JobStatus::Paused, None).unwrap();
+        db.pause_job(&id).unwrap();
 
         assert!(!db.claim_prepared_upload(&id, JobStatus::Uploading).unwrap());
         assert_eq!(db.get_job(&id).unwrap().unwrap().status, JobStatus::Paused);

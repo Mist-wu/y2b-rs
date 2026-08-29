@@ -266,7 +266,7 @@ mod tests {
                 .await
         });
         tokio::task::yield_now().await;
-        db.update_job_status(&id, JobStatus::Paused, None).unwrap();
+        db.pause_job(&id).unwrap();
 
         let should_upload = tokio::time::timeout(Duration::from_millis(200), waiter)
             .await
