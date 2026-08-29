@@ -5,7 +5,10 @@ use crate::{
         CandidateSource, Channel, ChannelPriority, Job, TransferMode, VideoCandidate, VideoMetadata,
     },
     process::run_monitored,
-    youtube_api::{PlaylistVideo, QuotaDegradation, YoutubeDataApi},
+    youtube_api::{
+        PlaylistVideo, QuotaDegradation, ResponseBodyError, YoutubeDataApi, bounded_http_client,
+        read_response_body,
+    },
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Timelike, Utc};
@@ -110,6 +113,7 @@ const DURATION_LIMIT_PREFIX: &str = "视频时长超过上限";
 
 const RSS_MAX_RETRIES: usize = 2;
 const RSS_RETRY_BASE: Duration = Duration::from_secs(1);
+const RSS_BODY_LIMIT: usize = 1024 * 1024;
 const FALLBACK_CHANNEL_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const FALLBACK_GLOBAL_WINDOW: Duration = Duration::from_secs(10 * 60);
 const FALLBACK_GLOBAL_LIMIT: usize = 3;
@@ -180,6 +184,8 @@ enum FeedFetchError {
         #[source]
         source: reqwest::Error,
     },
+    #[error("RSS 响应体超过上限 {limit} 字节")]
+    BodyTooLarge { limit: usize },
 }
 
 struct PollExecution {
@@ -334,13 +340,14 @@ impl FeedFetchError {
         match self {
             Self::Http { status, .. } => status.is_server_error(),
             Self::Request { source } => source.is_timeout() || source.is_connect(),
+            Self::BodyTooLarge { .. } => false,
         }
     }
 
     fn retry_at(&self) -> Option<DateTime<Utc>> {
         match self {
             Self::Http { retry_at, .. } => *retry_at,
-            Self::Request { .. } => None,
+            Self::Request { .. } | Self::BodyTooLarge { .. } => None,
         }
     }
 }
@@ -563,9 +570,7 @@ impl Monitor {
         api_key: Option<String>,
         api_base_url: Option<&str>,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .user_agent("y2b-rs/0.1")
-            .build()?;
+        let client = bounded_http_client("y2b-rs/0.1")?;
         let data_api = api_key.map(|api_key| match api_base_url {
             Some(base_url) => {
                 YoutubeDataApi::with_base_url(client.clone(), db.clone(), api_key, base_url)
@@ -1192,11 +1197,17 @@ impl Monitor {
     async fn fetch_feed_bytes(&self, url: &str) -> std::result::Result<Vec<u8>, FeedFetchError> {
         for retry in 0..=RSS_MAX_RETRIES {
             let result = match self.client.get(url).send().await {
-                Ok(response) if response.status().is_success() => response
-                    .bytes()
-                    .await
-                    .map(|bytes| bytes.to_vec())
-                    .map_err(|source| FeedFetchError::Request { source }),
+                Ok(response) if response.status().is_success() => {
+                    match read_response_body(response, RSS_BODY_LIMIT).await {
+                        Ok(bytes) => Ok(bytes),
+                        Err(ResponseBodyError::Request(source)) => {
+                            Err(FeedFetchError::Request { source })
+                        }
+                        Err(ResponseBodyError::TooLarge { limit }) => {
+                            Err(FeedFetchError::BodyTooLarge { limit })
+                        }
+                    }
+                }
                 Ok(response) => {
                     let status = response.status();
                     let retry_at = (status == StatusCode::TOO_MANY_REQUESTS)
@@ -2073,6 +2084,38 @@ esac
             .await
             .unwrap();
         assert_eq!(bytes, b"feed");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_rss_response_is_rejected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                RSS_BODY_LIMIT + 1
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("large-rss.db")).unwrap();
+        let monitor = Monitor::new(Config::default(), db).unwrap();
+        let error = monitor
+            .fetch_feed_bytes(&format!("http://{address}/feed"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            FeedFetchError::BodyTooLarge {
+                limit: RSS_BODY_LIMIT
+            }
+        ));
         server.await.unwrap();
     }
 

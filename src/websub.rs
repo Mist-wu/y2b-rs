@@ -2,6 +2,7 @@ use crate::{
     config::WebSubConfig,
     db::{Database, NewVideoCandidate, WebSubChannel},
     model::CandidateSource,
+    youtube_api::bounded_http_client,
 };
 use anyhow::{Context, Result};
 use axum::{
@@ -46,9 +47,7 @@ impl WebSubService {
         Ok(Self {
             config,
             db,
-            client: reqwest::Client::builder()
-                .user_agent("y2b-rs/0.1")
-                .build()?,
+            client: bounded_http_client("y2b-rs/0.1")?,
             hub_url: WEBSUB_HUB_URL.to_string(),
         })
     }
