@@ -4,7 +4,7 @@
 //! 负责字幕获取/分句/翻译，`publication` 负责投稿元数据，`upload` 负责 biliup
 //! 与投稿窗口，`cc` 负责中文 CC 字幕补交。
 use crate::config::Config;
-use crate::db::Database;
+use crate::db::{Database, PREPARE_CLAIM_KIND};
 use crate::model::{Job, JobStatus, PreparedUpload, TransferMode, VideoMetadata};
 use crate::monitor::{Monitor, exceeds_duration_limit, is_live_content_pending, ytdlp_command};
 use crate::process::run_monitored;
@@ -369,7 +369,36 @@ impl Pipeline {
         }
     }
 
+    async fn run_with_claim_heartbeat<T, F>(
+        &self,
+        job_id: &str,
+        claim_kind: &str,
+        future: F,
+    ) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        tokio::pin!(future);
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut future => return result,
+                _ = heartbeat.tick() => {
+                    if !self.db.renew_job_claim(job_id, claim_kind)? {
+                        bail!("任务 {job_id} 的 {claim_kind} 领取租约已丢失")
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn run_job(&self, job: Job) -> Result<()> {
+        let job = self
+            .db
+            .claim_prepare_job(&job.id)?
+            .with_context(|| format!("任务 {} 已被其他执行者领取或尚未到期", job.id))?;
         self.prepare_job(job.clone()).await?;
         let Some(prepared) = self.db.get_job(&job.id)? else {
             bail!("准备完成后任务不存在: {}", job.id)
@@ -381,8 +410,17 @@ impl Pipeline {
     }
 
     pub async fn prepare_job(&self, job: Job) -> Result<()> {
-        let result = self.prepare_job_inner(&job).await;
+        if !self.db.owns_job_claim(&job.id, PREPARE_CLAIM_KIND)? {
+            bail!("任务 {} 没有当前进程持有的准备领取权", job.id)
+        }
+        let result = self
+            .run_with_claim_heartbeat(&job.id, PREPARE_CLAIM_KIND, self.prepare_job_inner(&job))
+            .await;
         if let Err(e) = &result {
+            // 租约已经被其他执行者接管时，旧 worker 只能退出，不能覆盖新状态。
+            if !self.db.owns_job_claim(&job.id, PREPARE_CLAIM_KIND)? {
+                return result;
+            }
             // 直播内容尚未就绪时保留原任务并定时复查：同一个 video_id 已有任务
             // 后，频道轮询不会重复创建，直接终结会让它永远无法在回放就绪后恢复。
             // 时长超限才是永久终结；401/402 则暂停当前任务并打开进程级熔断。
@@ -399,7 +437,8 @@ impl Pipeline {
             let attempt = if permanent_skip || deferred_live || global_ai_fault {
                 job.attempt
             } else {
-                self.db.increment_attempt(&job.id)?
+                self.db
+                    .increment_claimed_attempt(&job.id, PREPARE_CLAIM_KIND)?
             };
             let status = if global_ai_fault {
                 JobStatus::Paused
@@ -415,8 +454,9 @@ impl Pipeline {
             };
             let detail = format!("{e:#}");
             if status == JobStatus::RetryWait {
-                self.db.defer_job_retry(
+                self.db.defer_claimed_job_retry(
                     &job.id,
+                    PREPARE_CLAIM_KIND,
                     status,
                     &detail,
                     if deferred_live {
@@ -426,7 +466,13 @@ impl Pipeline {
                     },
                 )?;
             } else {
-                self.db.update_job_status(&job.id, status, Some(&detail))?;
+                self.db.update_claimed_job_status(
+                    &job.id,
+                    PREPARE_CLAIM_KIND,
+                    status,
+                    Some(&detail),
+                    true,
+                )?;
             }
             self.db.event(
                 Some(&job.id),
@@ -483,8 +529,6 @@ impl Pipeline {
             &self.config.ai.model,
             &self.config.ai.thinking,
         )?;
-        self.db
-            .update_job_status(&job.id, JobStatus::Inspecting, None)?;
         let mut stage = StageGuard::start(&self.db, &job.id, "metadata", None, None, None)?;
         let monitor = Monitor::new(self.config.clone(), self.db.clone())?;
         let (meta, peak, duration) = match monitor.fetch_metadata(&job.url).await {
@@ -513,8 +557,13 @@ impl Pipeline {
         self.db.save_source_metadata(&job.id, &meta)?;
         let work = self.config.runtime.download_dir.join(&meta.id);
         fs::create_dir_all(&work)?;
-        self.db
-            .update_job_status(&job.id, JobStatus::Processing, None)?;
+        self.db.update_claimed_job_status(
+            &job.id,
+            PREPARE_CLAIM_KIND,
+            JobStatus::Processing,
+            None,
+            false,
+        )?;
         if !requires_translated_pipeline(job.transfer_mode) {
             return self.run_direct(job, &meta, &work).await;
         }
@@ -532,7 +581,7 @@ impl Pipeline {
             self.db
                 .set_job_paths(&job.id, Some(&video.to_string_lossy()))?;
             let cover = self.download_cover(&job.id, &meta, &work).await?;
-            self.db.queue_prepared_upload(
+            self.db.queue_claimed_prepared_upload(
                 &job.id,
                 &PreparedUpload::Submission {
                     video_path: video.to_string_lossy().into_owned(),
@@ -578,7 +627,7 @@ impl Pipeline {
                 completion_status: JobStatus::Completed,
             }
         };
-        self.db.queue_prepared_upload(&job.id, &prepared)?;
+        self.db.queue_claimed_prepared_upload(&job.id, &prepared)?;
         Ok(())
     }
 
@@ -602,7 +651,7 @@ impl Pipeline {
         self.probe_media(&job.id, video, "original_probe").await?;
         let work = video.parent().context("视频文件没有工作目录")?;
         let cover = self.download_cover(&job.id, meta, work).await?;
-        self.db.queue_prepared_upload(
+        self.db.queue_claimed_prepared_upload(
             &job.id,
             &PreparedUpload::Submission {
                 video_path: video.to_string_lossy().into_owned(),

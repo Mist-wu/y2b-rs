@@ -1,6 +1,7 @@
 //! B站中文 CC 字幕补交（软字幕，提交后走平台审核）。
 use super::{Pipeline, subtitle_flow::load_segmented_cache};
 use crate::bilibili_api::{self, CcCue};
+use crate::db::SUBTITLE_CLAIM_KIND;
 use crate::model::{Job, JobStatus, VideoMetadata};
 use crate::subtitle::{self, Cue};
 use anyhow::{Context, Result, bail};
@@ -179,7 +180,21 @@ impl Pipeline {
             .db
             .job_by_bvid(bvid)?
             .with_context(|| format!("数据库中找不到 bvid={bvid} 的任务"))?;
-        self.backfill_cc_subtitle_for_job(&job, true).await
+        let job = self
+            .db
+            .claim_subtitle_job_now(&job.id)?
+            .with_context(|| format!("任务 {} 的字幕正在由其他执行者处理", job.id))?;
+        let result = self
+            .run_with_claim_heartbeat(
+                &job.id,
+                SUBTITLE_CLAIM_KIND,
+                self.backfill_cc_subtitle_for_job(&job, true),
+            )
+            .await;
+        if result.is_err() && self.db.owns_job_claim(&job.id, SUBTITLE_CLAIM_KIND)? {
+            self.db.release_job_claim(&job.id, SUBTITLE_CLAIM_KIND)?;
+        }
+        result
     }
 
     /// CC 字幕队列的一次尝试：素材缺失时**重新下载**，而不是只查本地缓存。
@@ -200,12 +215,25 @@ impl Pipeline {
     /// 字幕探测（线上均值约 9 秒），不会触发分句和翻译；一旦拿到字幕则做一次
     /// 完整流程并写入缓存，后续重试复用缓存。
     pub async fn submit_pending_subtitle(&self, job: Job) -> Result<()> {
-        match self.backfill_cc_subtitle_for_job(&job, true).await {
+        if !self.db.owns_job_claim(&job.id, SUBTITLE_CLAIM_KIND)? {
+            bail!("任务 {} 没有当前进程持有的字幕领取权", job.id)
+        }
+        let result = self
+            .run_with_claim_heartbeat(
+                &job.id,
+                SUBTITLE_CLAIM_KIND,
+                self.backfill_cc_subtitle_for_job(&job, true),
+            )
+            .await;
+        match result {
             Ok(message) => {
                 tracing::info!(job_id = %job.id, "{message}");
                 Ok(())
             }
             Err(error) => {
+                if !self.db.owns_job_claim(&job.id, SUBTITLE_CLAIM_KIND)? {
+                    return Err(error);
+                }
                 let detail = format!("{error:#}");
                 let attempt = job.subtitle_attempt + 1;
                 let missing_material = is_missing_subtitle_material(&error);
@@ -219,13 +247,16 @@ impl Pipeline {
                             "CC 字幕自动重试耗尽（第 {attempt}/{CC_MAX_ATTEMPTS} 次）: {detail}"
                         )
                     };
-                    self.db
-                        .exhaust_pending_subtitle(&job.id, CC_MAX_ATTEMPTS, &exhausted)?;
+                    self.db.exhaust_claimed_pending_subtitle(
+                        &job.id,
+                        CC_MAX_ATTEMPTS,
+                        &exhausted,
+                    )?;
                     self.db.event(Some(&job.id), "warn", &exhausted)?;
                     return Err(error);
                 }
                 let delay = cc_retry_delay_seconds(attempt, is_bilibili_video_not_ready(&error));
-                self.db.defer_pending_subtitle(
+                self.db.defer_claimed_pending_subtitle(
                     &job.id,
                     &format!("CC 字幕提交失败: {detail}"),
                     delay,
@@ -286,9 +317,11 @@ impl Pipeline {
         if client.has_subtitle_lan(view.cid, "zh").await? {
             // `zh` 是投稿者提交的中文 CC；平台自动翻译使用 `zh-CN`，不能在这里
             // 当成已完成，否则待补任务会被静默跳过。
+            self.db.finish_subtitle_claim(
+                &job.id,
+                job.status == JobStatus::UploadedOriginalPendingSubtitle,
+            )?;
             if job.status == JobStatus::UploadedOriginalPendingSubtitle {
-                self.db
-                    .update_job_status(&job.id, JobStatus::Completed, None)?;
                 self.db.event(
                     Some(&job.id),
                     "info",
@@ -351,16 +384,16 @@ impl Pipeline {
             bail!("{EMPTY_TRANSLATION_PREFIX}，没有可提交的中文字幕")
         }
         client.submit(&view, "zh", &cc_cues).await?;
+        // 外部提交成功后先释放领取并落最终状态；审计事件失败不能导致整次提交重跑。
+        self.db.finish_subtitle_claim(
+            &job.id,
+            job.status == JobStatus::UploadedOriginalPendingSubtitle,
+        )?;
         self.db.event(
             Some(&job.id),
             "info",
             &format!("已提交中文 CC 字幕（{} 条），等待 B站审核", cc_cues.len()),
         )?;
-        // 提交成功后，把待补字幕状态的任务标记为完成（自动提交失败时才会挂起）。
-        if job.status == JobStatus::UploadedOriginalPendingSubtitle {
-            self.db
-                .update_job_status(&job.id, JobStatus::Completed, None)?;
-        }
         Ok(format!(
             "{bvid} 已提交中文 CC 字幕（{} 条），等待 B站审核",
             cc_cues.len()

@@ -11,7 +11,11 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 #[derive(Clone)]
-pub struct Database(Arc<Mutex<Connection>>);
+pub struct Database {
+    connection: Arc<Mutex<Connection>>,
+    /// 同一进程内的 clone 共享领取者标识；另一个进程/Database::open 会得到新标识。
+    claim_owner: Arc<str>,
+}
 
 pub struct NewJob<'a> {
     pub channel_id: Option<i64>,
@@ -61,6 +65,9 @@ const AI_USAGE_SELECT: &str = "COALESCE(SUM(input_tokens),0),COALESCE(SUM(output
 /// 原始调用与已归档汇总的统一用量数据源。
 const AI_USAGE_ROWS: &str = "(SELECT job_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost FROM ai_calls UNION ALL SELECT job_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost FROM ai_usage_rollups) usage";
 const UNCERTAIN_UPLOAD_RECOVERY_ERROR: &str = "服务重启时上传结果不确定，请确认 Bilibili 后再处理";
+const CLAIM_LEASE_SECONDS: i64 = 300;
+pub(crate) const PREPARE_CLAIM_KIND: &str = "prepare";
+pub(crate) const SUBTITLE_CLAIM_KIND: &str = "subtitle";
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -72,7 +79,10 @@ impl Database {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let db = Self(Arc::new(Mutex::new(conn)));
+        let db = Self {
+            connection: Arc::new(Mutex::new(conn)),
+            claim_owner: Arc::from(Uuid::new_v4().to_string()),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -389,6 +399,28 @@ impl Database {
               VALUES(17,CURRENT_TIMESTAMP);
             "#,
         )?;
+        // v18: 准备与 CC 字幕 worker 使用数据库租约原子领取。这样 watch、run 和
+        // 手工 subtitle 命令并存时，同一任务也只会交给一个执行者。
+        for (column, definition) in [
+            ("claim_kind", "TEXT"),
+            ("claim_owner", "TEXT"),
+            ("claim_expires_at", "TEXT"),
+        ] {
+            if !self.has_column("jobs", column)? {
+                self.conn().execute(
+                    &format!("ALTER TABLE jobs ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        self.conn().execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_jobs_claim
+              ON jobs(status, claim_kind, claim_expires_at, discovered_at);
+            INSERT OR IGNORE INTO schema_migrations(version,applied_at)
+              VALUES(18,CURRENT_TIMESTAMP);
+            "#,
+        )?;
         Ok(())
     }
 
@@ -412,7 +444,7 @@ impl Database {
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.0.lock().expect("database mutex poisoned")
+        self.connection.lock().expect("database mutex poisoned")
     }
 
     /// 判断表是否已含某列（用于幂等迁移）。
@@ -1116,9 +1148,12 @@ impl Database {
     pub fn jobs_awaiting_subtitle(&self) -> Result<Vec<Job>> {
         let c = self.conn();
         let mut q = c.prepare(&format!(
-            "SELECT {JOB_COLUMNS} FROM jobs WHERE bvid IS NOT NULL AND bvid<>'' AND status IN ('completed','uploaded_original_pending_subtitle') ORDER BY discovered_at"
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE bvid IS NOT NULL AND bvid<>'' \
+             AND status IN ('completed','uploaded_original_pending_subtitle') \
+             AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?) \
+             ORDER BY discovered_at"
         ))?;
-        Ok(q.query_map([], job_from_row)?
+        Ok(q.query_map([Utc::now().to_rfc3339()], job_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn list_jobs(&self, limit: usize) -> Result<Vec<Job>> {
@@ -1129,6 +1164,181 @@ impl Database {
         Ok(q.query_map([limit as i64], job_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    fn claim_deadline(now: DateTime<Utc>) -> String {
+        (now + chrono::Duration::seconds(CLAIM_LEASE_SECONDS)).to_rfc3339()
+    }
+
+    /// 原子领取下一条准备任务，并直接切换到 `inspecting`。
+    pub fn claim_next_prepare_job(&self) -> Result<Option<Job>> {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let legacy_before =
+            (now - chrono::Duration::minutes(Self::LEGACY_RETRY_MINUTES)).to_rfc3339();
+        let sql = format!(
+            "UPDATE jobs SET status='inspecting',claim_kind='{PREPARE_CLAIM_KIND}',claim_owner=?1,claim_expires_at=?2,error=NULL,updated_at=?3 \
+             WHERE id=(SELECT id FROM jobs \
+               WHERE (status='queued' OR (status='retry_wait' AND ((retry_at IS NULL AND updated_at<=?4) OR retry_at<=?5))) \
+                 AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?5) \
+               ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1) \
+             RETURNING {JOB_COLUMNS}"
+        );
+        self.job_opt(
+            &sql,
+            params![
+                self.claim_owner.as_ref(),
+                Self::claim_deadline(now),
+                &now_text,
+                legacy_before,
+                &now_text
+            ],
+        )
+    }
+
+    /// 原子领取指定准备任务，供 `y2b run` 使用。
+    pub fn claim_prepare_job(&self, id: &str) -> Result<Option<Job>> {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let legacy_before =
+            (now - chrono::Duration::minutes(Self::LEGACY_RETRY_MINUTES)).to_rfc3339();
+        let sql = format!(
+            "UPDATE jobs SET status='inspecting',claim_kind='{PREPARE_CLAIM_KIND}',claim_owner=?1,claim_expires_at=?2,error=NULL,updated_at=?3 \
+             WHERE id=?4 \
+               AND (status='queued' OR (status='retry_wait' AND ((retry_at IS NULL AND updated_at<=?5) OR retry_at<=?6))) \
+               AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?6) \
+             RETURNING {JOB_COLUMNS}"
+        );
+        self.job_opt(
+            &sql,
+            params![
+                self.claim_owner.as_ref(),
+                Self::claim_deadline(now),
+                &now_text,
+                id,
+                legacy_before,
+                &now_text
+            ],
+        )
+    }
+
+    pub fn renew_job_claim(&self, id: &str, kind: &str) -> Result<bool> {
+        let now = Utc::now();
+        let changed = self.conn().execute(
+            "UPDATE jobs SET claim_expires_at=? WHERE id=? AND claim_kind=? AND claim_owner=?",
+            params![
+                Self::claim_deadline(now),
+                id,
+                kind,
+                self.claim_owner.as_ref()
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn owns_job_claim(&self, id: &str, kind: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=? AND claim_kind=? AND claim_owner=?)",
+            params![id, kind, self.claim_owner.as_ref()],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn release_job_claim(&self, id: &str, kind: &str) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE jobs SET claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE id=? AND claim_kind=? AND claim_owner=?",
+            params![Utc::now().to_rfc3339(), id, kind, self.claim_owner.as_ref()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn update_claimed_job_status(
+        &self,
+        id: &str,
+        kind: &str,
+        status: JobStatus,
+        error: Option<&str>,
+        release: bool,
+    ) -> Result<()> {
+        if matches!(status, JobStatus::RetryWait | JobStatus::UploadRetryWait) {
+            anyhow::bail!("重试等待状态必须用 defer_claimed_job_retry 设置退避时间: {status}")
+        }
+        let changed = if release {
+            self.conn().execute(
+                "UPDATE jobs SET status=?,error=?,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+                 WHERE id=? AND claim_kind=? AND claim_owner=?",
+                params![
+                    status.to_string(),
+                    error,
+                    Utc::now().to_rfc3339(),
+                    id,
+                    kind,
+                    self.claim_owner.as_ref()
+                ],
+            )?
+        } else {
+            self.conn().execute(
+                "UPDATE jobs SET status=?,error=?,updated_at=? \
+                 WHERE id=? AND claim_kind=? AND claim_owner=?",
+                params![
+                    status.to_string(),
+                    error,
+                    Utc::now().to_rfc3339(),
+                    id,
+                    kind,
+                    self.claim_owner.as_ref()
+                ],
+            )?
+        };
+        if changed != 1 {
+            anyhow::bail!("任务 {id} 的 {kind} 领取权已丢失")
+        }
+        Ok(())
+    }
+
+    pub fn increment_claimed_attempt(&self, id: &str, kind: &str) -> Result<i64> {
+        self.conn()
+            .query_row(
+                "UPDATE jobs SET attempt=attempt+1,updated_at=? \
+                 WHERE id=? AND claim_kind=? AND claim_owner=? RETURNING attempt",
+                params![Utc::now().to_rfc3339(), id, kind, self.claim_owner.as_ref()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("任务 {id} 的 {kind} 领取权已丢失"))
+    }
+
+    pub fn defer_claimed_job_retry(
+        &self,
+        id: &str,
+        kind: &str,
+        status: JobStatus,
+        error: &str,
+        delay_seconds: i64,
+    ) -> Result<()> {
+        if !matches!(status, JobStatus::RetryWait | JobStatus::UploadRetryWait) {
+            anyhow::bail!("defer_claimed_job_retry 只接受重试等待状态，收到 {status}")
+        }
+        let now = Utc::now();
+        let changed = self.conn().execute(
+            "UPDATE jobs SET status=?,error=?,retry_at=?,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE id=? AND claim_kind=? AND claim_owner=?",
+            params![
+                status.to_string(),
+                error,
+                (now + chrono::Duration::seconds(delay_seconds)).to_rfc3339(),
+                now.to_rfc3339(),
+                id,
+                kind,
+                self.claim_owner.as_ref()
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("任务 {id} 的 {kind} 领取权已丢失")
+        }
+        Ok(())
+    }
+
     pub fn next_queued_job(&self) -> Result<Option<Job>> {
         let (legacy_before, now) = Self::retry_due_params();
         let due = Self::retry_due_clause("updated_at");
@@ -1184,14 +1394,26 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         // 状态串里保留 downloading/segmenting/translating/rendering：这些变体已从
         // JobStatus 移除（从未被构造），但旧数据库里可能还留着这样的行，恢复时要一并捞回。
-        let recovered=c.execute("UPDATE jobs SET status='queued',error='服务重启后自动恢复',retry_at=NULL,updated_at=? WHERE status IN ('inspecting','processing','downloading','segmenting','translating','rendering')",[&now])?;
+        let recovered = c.execute(
+            "UPDATE jobs SET status='queued',error='领取租约过期后自动恢复',retry_at=NULL,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE status IN ('inspecting','processing','downloading','segmenting','translating','rendering') \
+               AND (claim_expires_at IS NULL OR claim_expires_at<=?)",
+            params![&now, &now],
+        )?;
+        c.execute(
+            "UPDATE jobs SET claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE status='uploaded_original_pending_subtitle' AND claim_kind=? \
+               AND (claim_expires_at IS NULL OR claim_expires_at<=?)",
+            params![&now, SUBTITLE_CLAIM_KIND, &now],
+        )?;
         c.execute(
             "UPDATE jobs SET status='paused',error=?,updated_at=? WHERE status IN ('uploading')",
             params![UNCERTAIN_UPLOAD_RECOVERY_ERROR, &now],
         )?;
         c.execute(
-            "UPDATE stage_runs SET status='failed',finished_at=?,duration_ms=COALESCE(duration_ms,CAST(MAX(0,(julianday(?) - julianday(started_at))*86400000) AS INTEGER)),detail=COALESCE(detail,'服务重启中断阶段') WHERE status='running'",
-            params![&now, &now],
+            "UPDATE stage_runs SET status='failed',finished_at=?,duration_ms=COALESCE(duration_ms,CAST(MAX(0,(julianday(?) - julianday(started_at))*86400000) AS INTEGER)),detail=COALESCE(detail,'服务重启中断阶段') \
+             WHERE status='running' AND NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.id=stage_runs.job_id AND jobs.claim_expires_at>?)",
+            params![&now, &now, &now],
         )?;
         Ok(recovered)
     }
@@ -1286,6 +1508,24 @@ impl Database {
         }
         Ok(())
     }
+
+    pub fn queue_claimed_prepared_upload(&self, id: &str, upload: &PreparedUpload) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE jobs SET prepared_upload_json=?,status='ready_to_upload',error=NULL,retry_at=NULL,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE id=? AND claim_kind=? AND claim_owner=?",
+            params![
+                serde_json::to_string(upload)?,
+                Utc::now().to_rfc3339(),
+                id,
+                PREPARE_CLAIM_KIND,
+                self.claim_owner.as_ref()
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("任务 {id} 的准备领取权已丢失")
+        }
+        Ok(())
+    }
     pub fn prepared_upload(&self, id: &str) -> Result<Option<PreparedUpload>> {
         let value = self
             .conn()
@@ -1305,7 +1545,7 @@ impl Database {
     pub fn queue_pending_subtitle(&self, id: &str, delay_seconds: i64) -> Result<()> {
         let retry_at = Utc::now() + chrono::Duration::seconds(delay_seconds);
         let changed = self.conn().execute(
-            "UPDATE jobs SET status=?,subtitle_attempt=0,subtitle_retry_at=?,updated_at=? WHERE id=?",
+            "UPDATE jobs SET status=?,subtitle_attempt=0,subtitle_retry_at=?,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? WHERE id=?",
             params![
                 JobStatus::UploadedOriginalPendingSubtitle.to_string(),
                 retry_at.to_rfc3339(),
@@ -1328,9 +1568,60 @@ impl Database {
                 "SELECT {JOB_COLUMNS} FROM jobs WHERE status='uploaded_original_pending_subtitle' \
                  AND bvid IS NOT NULL AND bvid<>'' AND subtitle_attempt<? \
                  AND (subtitle_retry_at IS NULL OR subtitle_retry_at<=?) \
+                 AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?) \
                  ORDER BY discovered_at LIMIT 1"
             ),
-            params![max_attempts, Utc::now().to_rfc3339()],
+            params![
+                max_attempts,
+                Utc::now().to_rfc3339(),
+                Utc::now().to_rfc3339()
+            ],
+        )
+    }
+
+    /// 原子领取下一条到期的 CC 字幕任务。状态保持 pending，领取权由租约区分。
+    pub fn claim_next_pending_subtitle_job(&self, max_attempts: i64) -> Result<Option<Job>> {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let sql = format!(
+            "UPDATE jobs SET claim_kind='{SUBTITLE_CLAIM_KIND}',claim_owner=?1,claim_expires_at=?2,updated_at=?3 \
+             WHERE id=(SELECT id FROM jobs WHERE status='uploaded_original_pending_subtitle' \
+               AND bvid IS NOT NULL AND bvid<>'' AND subtitle_attempt<?4 \
+               AND (subtitle_retry_at IS NULL OR subtitle_retry_at<=?3) \
+               AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?3) \
+               ORDER BY discovered_at LIMIT 1) \
+             RETURNING {JOB_COLUMNS}"
+        );
+        self.job_opt(
+            &sql,
+            params![
+                self.claim_owner.as_ref(),
+                Self::claim_deadline(now),
+                &now_text,
+                max_attempts
+            ],
+        )
+    }
+
+    /// 手工补字幕也先领取，避免与自动 worker 或另一条手工命令重复提交。
+    pub fn claim_subtitle_job_now(&self, id: &str) -> Result<Option<Job>> {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let sql = format!(
+            "UPDATE jobs SET claim_kind='{SUBTITLE_CLAIM_KIND}',claim_owner=?1,claim_expires_at=?2,updated_at=?3 \
+             WHERE id=?4 AND bvid IS NOT NULL AND bvid<>'' \
+               AND status IN ('completed','uploaded_original_pending_subtitle') \
+               AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?3) \
+             RETURNING {JOB_COLUMNS}"
+        );
+        self.job_opt(
+            &sql,
+            params![
+                self.claim_owner.as_ref(),
+                Self::claim_deadline(now),
+                &now_text,
+                id
+            ],
         )
     }
 
@@ -1350,6 +1641,31 @@ impl Database {
         Ok(())
     }
 
+    pub fn defer_claimed_pending_subtitle(
+        &self,
+        id: &str,
+        error: &str,
+        delay_seconds: i64,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let changed = self.conn().execute(
+            "UPDATE jobs SET subtitle_attempt=subtitle_attempt+1,subtitle_retry_at=?,error=?,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE id=? AND claim_kind=? AND claim_owner=?",
+            params![
+                (now + chrono::Duration::seconds(delay_seconds)).to_rfc3339(),
+                error,
+                now.to_rfc3339(),
+                id,
+                SUBTITLE_CLAIM_KIND,
+                self.claim_owner.as_ref()
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("任务 {id} 的字幕领取权已丢失")
+        }
+        Ok(())
+    }
+
     /// 明确不可能自动成功（例如根本没有翻译素材）时直接耗尽重试，
     /// 任务留在待补状态供 `y2b subtitle add/--all` 手动处理。
     pub fn exhaust_pending_subtitle(&self, id: &str, max_attempts: i64, error: &str) -> Result<()> {
@@ -1360,11 +1676,60 @@ impl Database {
         Ok(())
     }
 
+    pub fn exhaust_claimed_pending_subtitle(
+        &self,
+        id: &str,
+        max_attempts: i64,
+        error: &str,
+    ) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE jobs SET subtitle_attempt=?,subtitle_retry_at=NULL,error=?,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE id=? AND claim_kind=? AND claim_owner=?",
+            params![
+                max_attempts,
+                error,
+                Utc::now().to_rfc3339(),
+                id,
+                SUBTITLE_CLAIM_KIND,
+                self.claim_owner.as_ref()
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("任务 {id} 的字幕领取权已丢失")
+        }
+        Ok(())
+    }
+
+    pub fn finish_subtitle_claim(&self, id: &str, mark_completed: bool) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE jobs SET status=CASE WHEN ? THEN 'completed' ELSE status END,error=NULL,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE id=? AND claim_kind=? AND claim_owner=?",
+            params![
+                mark_completed,
+                Utc::now().to_rfc3339(),
+                id,
+                SUBTITLE_CLAIM_KIND,
+                self.claim_owner.as_ref()
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("任务 {id} 的字幕领取权已丢失")
+        }
+        Ok(())
+    }
+
     /// 重新武装 CC 字幕队列：清空计数并立即到期。
     pub fn rearm_pending_subtitle(&self, id: &str) -> Result<()> {
         let changed = self.conn().execute(
-            "UPDATE jobs SET subtitle_attempt=0,subtitle_retry_at=?,error=NULL,updated_at=? WHERE id=? AND status='uploaded_original_pending_subtitle'",
-            params![Utc::now().to_rfc3339(), Utc::now().to_rfc3339(), id],
+            "UPDATE jobs SET subtitle_attempt=0,subtitle_retry_at=?,error=NULL,updated_at=? \
+             WHERE id=? AND status='uploaded_original_pending_subtitle' \
+               AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?)",
+            params![
+                Utc::now().to_rfc3339(),
+                Utc::now().to_rfc3339(),
+                id,
+                Utc::now().to_rfc3339()
+            ],
         )?;
         if changed == 0 {
             anyhow::bail!("任务不在待补字幕状态: {id}")
@@ -1829,7 +2194,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 17);
+        assert_eq!(db.schema_version().unwrap(), 18);
         let migrated: (String, Option<String>, String) = db
             .conn()
             .query_row(
@@ -1913,7 +2278,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 17);
+        assert_eq!(db.schema_version().unwrap(), 18);
         assert_eq!(
             db.list_channels().unwrap()[0].transfer_mode,
             TransferMode::Translated
@@ -1933,7 +2298,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
-        assert_eq!(db.schema_version().unwrap(), 17);
+        assert_eq!(db.schema_version().unwrap(), 18);
         assert!(
             db.create_job(NewJob {
                 channel_id: None,
@@ -2426,6 +2791,110 @@ mod tests {
     }
 
     #[test]
+    fn prepare_claim_is_atomic_leased_and_rejects_stale_owner_writes() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("claims.db");
+        let first = Database::open(&path).unwrap();
+        let id = first
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "claimed-prepare",
+                url: "https://youtu.be/claimed-prepare",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        let second = Database::open(&path).unwrap();
+
+        let claimed = first.claim_next_prepare_job().unwrap().unwrap();
+        assert_eq!(claimed.id, id);
+        assert_eq!(claimed.status, JobStatus::Inspecting);
+        assert!(second.claim_next_prepare_job().unwrap().is_none());
+        // 启动第二个进程不能把仍有有效租约的工作误判成重启残留。
+        assert_eq!(second.recover_incomplete_jobs().unwrap(), 0);
+
+        first
+            .conn()
+            .execute(
+                "UPDATE jobs SET claim_expires_at=? WHERE id=?",
+                params![(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(), id],
+            )
+            .unwrap();
+        assert_eq!(second.recover_incomplete_jobs().unwrap(), 1);
+        assert_eq!(second.claim_next_prepare_job().unwrap().unwrap().id, id);
+        assert!(
+            first
+                .update_claimed_job_status(
+                    &id,
+                    PREPARE_CLAIM_KIND,
+                    JobStatus::Processing,
+                    None,
+                    false,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn subtitle_claim_blocks_automatic_and_manual_duplicate_submission() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("subtitle-claims.db");
+        let first = Database::open(&path).unwrap();
+        let id = first
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "claimed-subtitle",
+                url: "https://youtu.be/claimed-subtitle",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        first.set_job_bvid(&id, "BV1claimed").unwrap();
+        first.queue_pending_subtitle(&id, -1).unwrap();
+        let second = Database::open(&path).unwrap();
+
+        assert_eq!(
+            first
+                .claim_next_pending_subtitle_job(16)
+                .unwrap()
+                .unwrap()
+                .id,
+            id
+        );
+        assert!(
+            second
+                .claim_next_pending_subtitle_job(16)
+                .unwrap()
+                .is_none()
+        );
+        assert!(second.claim_subtitle_job_now(&id).unwrap().is_none());
+        assert!(second.jobs_awaiting_subtitle().unwrap().is_empty());
+
+        first
+            .defer_claimed_pending_subtitle(&id, "temporary", -1)
+            .unwrap();
+        assert_eq!(
+            second
+                .claim_next_pending_subtitle_job(16)
+                .unwrap()
+                .unwrap()
+                .id,
+            id
+        );
+        assert!(
+            first
+                .defer_claimed_pending_subtitle(&id, "stale", 60)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn preparation_and_upload_queues_are_independent_and_durable() {
         let t = tempfile::tempdir().unwrap();
         let path = t.path().join("x.db");
@@ -2893,7 +3362,7 @@ mod tests {
         drop(db);
 
         let reopened = Database::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 17);
+        assert_eq!(reopened.schema_version().unwrap(), 18);
         assert!(reopened.is_over_duration_video("too-long", 7200).unwrap());
         reopened
             .record_over_duration_video("too-long", None, 8000, "9000s > 8000s")
