@@ -12,6 +12,8 @@ pub enum JobStatus {
     Processing,
     ReadyToUpload,
     Uploading,
+    /// 投稿请求可能已被 Bilibili 接受，但本地未能可靠确认结果；禁止自动重投。
+    UploadUncertain,
     UploadRetryWait,
     UploadedOriginalPendingSubtitle,
     Completed,

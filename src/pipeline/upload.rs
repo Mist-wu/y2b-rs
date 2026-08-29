@@ -5,16 +5,117 @@ use super::{Pipeline, StageGuard};
 use crate::model::{
     Job, JobStatus, PreparedUpload, PublicationMetadata, TransferMode, VideoMetadata,
 };
-use crate::process::run_monitored;
+use crate::process::{ProcessFailure, run_monitored};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use regex::Regex;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use thiserror::Error;
 use tokio::process::Command;
 use tokio::time::sleep;
 
 pub const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BiliupSubmissionResponse {
+    Accepted(String),
+    AcceptedWithoutBvid,
+    Rejected(i64),
+}
+
+#[derive(Debug, Error)]
+#[error("{detail}")]
+struct BiliupRejectedError {
+    detail: String,
+}
+
+#[derive(Debug, Error)]
+#[error("{detail}")]
+pub(super) struct UploadUncertainError {
+    detail: String,
+}
+
+pub(super) fn is_upload_uncertain(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<UploadUncertainError>().is_some()
+}
+
+fn valid_bvid(value: &str) -> bool {
+    Regex::new(r"^BV[0-9A-Za-z]{10}$")
+        .expect("固定 BVID 正则必须有效")
+        .is_match(value)
+}
+
+fn response_from_json_line(line: &str) -> Option<BiliupSubmissionResponse> {
+    for (start, character) in line
+        .char_indices()
+        .filter(|(_, character)| *character == '{')
+    {
+        debug_assert_eq!(character, '{');
+        let parsed = serde_json::Deserializer::from_str(&line[start..])
+            .into_iter::<Value>()
+            .next()
+            .and_then(std::result::Result::ok);
+        let Some(value) = parsed else {
+            continue;
+        };
+        let Some(code) = value.get("code").and_then(Value::as_i64) else {
+            continue;
+        };
+        if code != 0 {
+            return Some(BiliupSubmissionResponse::Rejected(code));
+        }
+        return Some(
+            value
+                .pointer("/data/bvid")
+                .and_then(Value::as_str)
+                .filter(|bvid| valid_bvid(bvid))
+                .map(|bvid| BiliupSubmissionResponse::Accepted(bvid.to_string()))
+                .unwrap_or(BiliupSubmissionResponse::AcceptedWithoutBvid),
+        );
+    }
+    None
+}
+
+fn response_from_debug_line(line: &str) -> Option<BiliupSubmissionResponse> {
+    let response =
+        Regex::new(r#"ResponseData\s*\{\s*code:\s*(-?\d+),\s*data:\s*(.*),\s*message:\s*"#)
+            .expect("固定 ResponseData 正则必须有效");
+    let captures = response.captures(line)?;
+    let code = captures.get(1)?.as_str().parse::<i64>().ok()?;
+    if code != 0 {
+        return Some(BiliupSubmissionResponse::Rejected(code));
+    }
+    let bvid = Regex::new(r#""bvid":\s*String\("(BV[0-9A-Za-z]{10})"\)"#)
+        .expect("固定 biliup Debug BVID 正则必须有效")
+        .captures(captures.get(2)?.as_str())
+        .and_then(|captures| captures.get(1))
+        .map(|value| value.as_str().to_string());
+    Some(
+        bvid.map(BiliupSubmissionResponse::Accepted)
+            .unwrap_or(BiliupSubmissionResponse::AcceptedWithoutBvid),
+    )
+}
+
+fn parse_biliup_submission(output: &str) -> Option<BiliupSubmissionResponse> {
+    output
+        .lines()
+        .filter_map(|line| response_from_json_line(line).or_else(|| response_from_debug_line(line)))
+        .next_back()
+}
+
+fn parse_creator_archives(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.splitn(3, '\t');
+            let bvid = columns.next()?.trim();
+            let title = columns.next()?.trim();
+            valid_bvid(bvid).then(|| (bvid.to_string(), title.to_string()))
+        })
+        .collect()
+}
 
 pub(super) fn ensure_prepared_file(path: &Path, label: &str) -> Result<()> {
     if !path.metadata().is_ok_and(|metadata| metadata.len() > 0) {
@@ -24,6 +125,78 @@ pub(super) fn ensure_prepared_file(path: &Path, label: &str) -> Result<()> {
 }
 
 impl Pipeline {
+    /// 对 `upload_uncertain` 任务读取创作中心最近稿件，按持久化投稿标题唯一匹配。
+    /// 找不到或同名多条时保持不确定态，绝不自动重投。
+    pub async fn reconcile_uncertain_upload(&self, job_id: &str) -> Result<String> {
+        let job = self
+            .db
+            .get_job(job_id)?
+            .with_context(|| format!("任务不存在: {job_id}"))?;
+        if job.status != JobStatus::UploadUncertain {
+            bail!(
+                "任务 {job_id} 当前状态不是 upload_uncertain: {}",
+                job.status
+            )
+        }
+        let prepared = self
+            .db
+            .prepared_upload(job_id)?
+            .with_context(|| format!("不确定投稿任务 {job_id} 缺少上传计划"))?;
+        let (mode, completion_status) = match prepared {
+            PreparedUpload::Submission {
+                mode,
+                completion_status,
+                ..
+            } => (mode, completion_status),
+        };
+        let publication = self
+            .db
+            .publication_metadata(job_id)?
+            .with_context(|| format!("不确定投稿任务 {job_id} 缺少投稿元数据"))?;
+        let mut command = Command::new(&self.config.bilibili.biliup);
+        command
+            .arg("-u")
+            .arg(&self.config.bilibili.cookies)
+            .arg("list")
+            .arg("--from-page")
+            .arg("1")
+            .arg("--max-pages")
+            .arg("5");
+        let output = run_monitored(command, Duration::from_secs(120)).await?;
+        let mut matches = parse_creator_archives(&output.stdout)
+            .into_iter()
+            .filter(|(_, title)| title == &publication.title)
+            .map(|(bvid, _)| bvid)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        let bvid = match matches.as_slice() {
+            [bvid] => bvid.clone(),
+            [] => bail!(
+                "创作中心最近稿件中没有标题完全匹配的记录，任务保持 upload_uncertain: {}",
+                publication.title
+            ),
+            _ => bail!(
+                "创作中心存在 {} 条同名稿件，无法唯一确认，任务保持 upload_uncertain: {}",
+                matches.len(),
+                publication.title
+            ),
+        };
+        self.db
+            .confirm_uncertain_upload(job_id, &bvid, completion_status)?;
+        if completion_status == JobStatus::Completed && mode == TransferMode::Translated {
+            self.db
+                .queue_pending_subtitle(job_id, CC_INITIAL_DELAY_SECONDS)?;
+        }
+        let _ = self.defer_bilibili_submissions(self.config.bilibili.submit_interval_seconds);
+        self.db.event(
+            Some(job_id),
+            "info",
+            &format!("创作中心核对确认投稿成功: {bvid}"),
+        )?;
+        Ok(format!("已从创作中心确认 {job_id} -> {bvid}"))
+    }
+
     pub(super) async fn upload_prepared_job_inner(&self, job: &Job) -> Result<()> {
         if !matches!(
             job.status,
@@ -42,7 +215,7 @@ impl Pipeline {
             .db
             .prepared_upload(&job.id)?
             .with_context(|| format!("待上传任务 {} 缺少持久化上传计划", job.id))?;
-        let (bvid, completion_status, mode) = match prepared {
+        let (completion_status, mode) = match prepared {
             PreparedUpload::Submission {
                 video_path,
                 cover_path,
@@ -67,21 +240,68 @@ impl Pipeline {
                     .db
                     .source_metadata(&job.id)?
                     .with_context(|| format!("待上传任务 {} 缺少来源元数据", job.id))?;
-                if !self.wait_for_bilibili_submission(&job.id).await?
-                    || !self
-                        .db
-                        .claim_prepared_upload(&job.id, JobStatus::Uploading)?
-                {
+                if !self.wait_for_bilibili_submission(&job.id).await? {
                     return Ok(());
                 }
-                let bvid = self
-                    .upload(&job.id, &video, &publication, &meta, Some(&cover))
-                    .await?;
-                (bvid, completion_status, mode)
+                let Some(attempt_id) = self.db.begin_prepared_upload(&job.id)? else {
+                    return Ok(());
+                };
+                let execution = self
+                    .run_with_claim_heartbeat(
+                        &job.id,
+                        crate::db::UPLOAD_CLAIM_KIND,
+                        self.upload(&job.id, &video, &publication, &meta, Some(&cover)),
+                    )
+                    .await;
+                let bvid = match execution {
+                    Ok(bvid) => bvid,
+                    Err(error) if error.downcast_ref::<BiliupRejectedError>().is_some() => {
+                        self.db
+                            .fail_upload_attempt(&job.id, &attempt_id, &error.to_string())?;
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        let detail = format!(
+                            "投稿结果不确定（attempt={attempt_id}），请用 jobs reconcile-upload 核对创作中心后再处理: {error:#}"
+                        );
+                        let marked =
+                            self.db
+                                .mark_upload_attempt_uncertain(&job.id, &attempt_id, &detail);
+                        let detail = match marked {
+                            Ok(()) => detail,
+                            Err(mark_error) => {
+                                format!("{detail}；写入不确定状态失败: {mark_error:#}")
+                            }
+                        };
+                        return Err(UploadUncertainError { detail }.into());
+                    }
+                };
+                if let Err(error) =
+                    self.db
+                        .finish_upload_attempt(&job.id, &attempt_id, &bvid, completion_status)
+                {
+                    let detail = format!(
+                        "Bilibili 已返回成功 {bvid}，但本地确认失败（attempt={attempt_id}）: {error:#}"
+                    );
+                    let _ = self
+                        .db
+                        .mark_upload_attempt_uncertain(&job.id, &attempt_id, &detail);
+                    return Err(UploadUncertainError { detail }.into());
+                }
+                (completion_status, mode)
             }
         };
-        self.db
-            .finish_prepared_upload(&job.id, &bvid, completion_status)?;
+        // 投稿 attempt 与任务终态已经由 finish_upload_attempt 同事务持久化。
+        if let Err(error) =
+            self.defer_bilibili_submissions(self.config.bilibili.submit_interval_seconds)
+        {
+            tracing::warn!(job_id = %job.id, error = %error, "投稿成功后写入冷却时间失败");
+            let _ = self.db.event(
+                Some(&job.id),
+                "warn",
+                &format!("投稿成功后写入冷却时间失败: {error}"),
+            );
+        }
         // CC 字幕补交交给独立队列，不占用上传 worker。
         //
         // 此前这里同步等待最多 90s + 8×60s ≈ 9.5 分钟，期间下一个 ready_to_upload
@@ -129,24 +349,79 @@ impl Pipeline {
         if let Some(c) = cover {
             cmd.arg("--cover").arg(c);
         }
-        let out = match run_monitored(cmd, Duration::from_secs(14400)).await {
-            Ok(output) => output,
+        match run_monitored(cmd, Duration::from_secs(14400)).await {
+            Ok(output) => {
+                let merged = output.stdout.clone() + "\n" + &output.stderr;
+                match parse_biliup_submission(&merged) {
+                    Some(BiliupSubmissionResponse::Accepted(bvid)) => {
+                        stage.finish(
+                            "completed",
+                            output.duration_ms,
+                            output.peak_rss_kib,
+                            Some(&bvid),
+                        )?;
+                        Ok(bvid)
+                    }
+                    Some(BiliupSubmissionResponse::Rejected(code)) => {
+                        let error = BiliupRejectedError {
+                            detail: format!("biliup 投稿被平台拒绝: code={code}"),
+                        };
+                        Err(stage.fail(error.into(), output.duration_ms, output.peak_rss_kib))
+                    }
+                    Some(BiliupSubmissionResponse::AcceptedWithoutBvid) => {
+                        let error = UploadUncertainError {
+                            detail: "biliup 返回成功响应，但响应中没有合法 BVID".into(),
+                        };
+                        Err(stage.fail(error.into(), output.duration_ms, output.peak_rss_kib))
+                    }
+                    None => {
+                        let error = UploadUncertainError {
+                            detail: "biliup 退出成功，但没有可验证的结构化投稿响应".into(),
+                        };
+                        Err(stage.fail(error.into(), output.duration_ms, output.peak_rss_kib))
+                    }
+                }
+            }
             Err(error) => {
+                if let Some(failure) = error.downcast_ref::<ProcessFailure>() {
+                    let output = failure.output();
+                    let merged = output.stdout.clone() + "\n" + &output.stderr;
+                    match parse_biliup_submission(&merged) {
+                        Some(BiliupSubmissionResponse::Accepted(bvid)) => {
+                            stage.finish(
+                                "completed",
+                                output.duration_ms,
+                                output.peak_rss_kib,
+                                Some(&bvid),
+                            )?;
+                            return Ok(bvid);
+                        }
+                        Some(BiliupSubmissionResponse::Rejected(code)) => {
+                            let rejected = BiliupRejectedError {
+                                detail: format!("biliup 投稿被平台拒绝: code={code}: {error}"),
+                            };
+                            return Err(stage.fail(
+                                rejected.into(),
+                                output.duration_ms,
+                                output.peak_rss_kib,
+                            ));
+                        }
+                        Some(BiliupSubmissionResponse::AcceptedWithoutBvid) | None => {}
+                    }
+                }
                 let elapsed = stage.elapsed_ms();
-                return Err(stage.fail(error, elapsed, 0));
+                if error.to_string().contains("启动子进程失败") {
+                    let rejected = BiliupRejectedError {
+                        detail: format!("biliup 未启动，未产生投稿: {error:#}"),
+                    };
+                    return Err(stage.fail(rejected.into(), elapsed, 0));
+                }
+                let uncertain = UploadUncertainError {
+                    detail: format!("biliup 执行中断，无法确认平台是否已接受投稿: {error:#}"),
+                };
+                Err(stage.fail(uncertain.into(), elapsed, 0))
             }
-        };
-        let merged = out.stdout.clone() + "\n" + &out.stderr;
-        let bvid = match Regex::new(r"\bBV[0-9A-Za-z]+\b")?.find(&merged) {
-            Some(value) => value.as_str().to_string(),
-            None => {
-                let error = anyhow::anyhow!("biliup 未返回 BV 号");
-                return Err(stage.fail(error, out.duration_ms, out.peak_rss_kib));
-            }
-        };
-        stage.finish("completed", out.duration_ms, out.peak_rss_kib, Some(&bvid))?;
-        self.defer_bilibili_submissions(self.config.bilibili.submit_interval_seconds)?;
-        Ok(bvid)
+        }
     }
 
     pub(super) async fn wait_for_bilibili_submission(&self, job_id: &str) -> Result<bool> {
@@ -226,6 +501,44 @@ mod tests {
     use crate::config::Config;
     use crate::db::{Database, NewJob};
     use crate::model::JobStatus;
+
+    #[test]
+    fn biliup_bvid_requires_a_structured_success_response() {
+        assert_eq!(
+            parse_biliup_submission(
+                r#"2026-08-30 INFO ResponseData { code: 0, data: Some(Object {"aid": Number(1), "bvid": String("BV1uxE16ZE7e")}), message: "0", ttl: Some(1) }"#
+            ),
+            Some(BiliupSubmissionResponse::Accepted("BV1uxE16ZE7e".into()))
+        );
+        assert_eq!(
+            parse_biliup_submission(r#"{"code":0,"data":{"aid":1,"bvid":"BV17x411w7KC"}}"#),
+            Some(BiliupSubmissionResponse::Accepted("BV17x411w7KC".into()))
+        );
+        assert_eq!(
+            parse_biliup_submission(
+                r#"2026-08-30 INFO ResponseData { code: 21566, data: None, message: "rate limited", ttl: Some(1) }"#
+            ),
+            Some(BiliupSubmissionResponse::Rejected(21566))
+        );
+
+        // 标题、参数或普通日志里的 BV 号绝不能被当成投稿结果。
+        assert_eq!(
+            parse_biliup_submission("upload title: 回顾 BV1uxE16ZE7e\nWeb 接口投稿成功"),
+            None
+        );
+        assert_eq!(
+            parse_biliup_submission(r#"{"code":0,"data":{"bvid":"BV-short"}}"#),
+            Some(BiliupSubmissionResponse::AcceptedWithoutBvid)
+        );
+    }
+
+    #[test]
+    fn creator_archive_parser_accepts_only_tsv_rows_with_exact_bvids() {
+        let rows = parse_creator_archives(
+            "2026-08-30 INFO login ok\nBV1uxE16ZE7e\t标题 A\t\u{1b}[1;92m已通过\u{1b}[0m\nnot-a-bvid\t标题 B\t失败\n",
+        );
+        assert_eq!(rows, vec![("BV1uxE16ZE7e".into(), "标题 A".into())]);
+    }
 
     #[tokio::test]
     async fn pausing_job_interrupts_submission_window_wait() {

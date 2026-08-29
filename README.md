@@ -48,7 +48,7 @@ y2b channels enable <ID> | disable <ID> | sync
 # 任务
 y2b jobs add <URL> --mode direct|translated       # 必须显式指定 --mode
 y2b run <URL> [--mode translated]                 # 单次跑完，默认 translated
-y2b jobs list [N] | show <JOB_ID> | retry <JOB_ID>
+y2b jobs list [N] | show <JOB_ID> | retry <JOB_ID> | reconcile-upload <JOB_ID>
 
 # 字幕 / 模型 / 运维
 y2b subtitle add <BVID>   # 给指定已投稿视频补中文 CC
@@ -108,6 +108,7 @@ y2b backup | auth-check | check --write-baseline
 
 - SQLite 持久化频道、任务、阶段、峰值 RSS、Pi token/cost 和认证状态。普通故障连续失败 5 次进 `dead_letter` 并删除大型视频；失败间按 `min(5min × 2^n, 1h)` 退避，首次重试仍是 10 分钟。直播／预约／回放生成中不消耗失败次数。
 - `watch` 使用单个准备 worker + 单个上传 worker + 单个字幕 worker。任务准备完成后持久化为 `ready_to_upload`，投稿冷却期间仍可继续下载和翻译后续任务，实际上传严格串行。CC 字幕补交独立成队列，不占用上传 worker。
+- 每次真正投稿先持久化 attempt；中断且无法确认结果时进入 `upload_uncertain`，禁止自动重投。`jobs reconcile-upload` 只在创作中心最近稿件中找到唯一同名记录时确认成功。
 - RSS 轮询／yt-dlp 校对与备份／认证各跑独立任务，长时间 yt-dlp 调用不阻塞队列调度。裸频道 URL 规范化到内容标签页，校对结果中的频道／播放列表条目不会被误当视频。
 - 所有外部命令独占 Unix 进程组；超时或并行分支提前取消都会清理完整后代树，避免 PyInstaller yt-dlp／Node 变成孤儿进程继续写临时分片。
 - 新投稿默认至少间隔 30 分钟；B 站返回 `21566` 时全局冷却 6 小时并自动等待后重试。
@@ -224,7 +225,7 @@ yt-dlp -v --simulate 'https://www.youtube.com/watch?v=VIDEO_ID' 2>&1 \
 1. 空服务器运行 `bootstrap-server.sh`。
 2. 恢复 `/etc/y2b/config.toml`、`/etc/y2b/y2b.env`、两个 cookies 文件，并用 `y2b-set-deepseek-key` 重新注入 DeepSeek Key；`/opt/y2b/pi/` 下的资源由 `deploy-app.sh` 从仓库安装，无需单独备份。
 3. 从 `/var/lib/y2b/backups/daily` 或 `weekly` 选数据库，执行 `deploy/restore.sh BACKUP.db`。
-4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时自动升级到 v18（迁移幂等）。旧频道和任务模式均为 `translated`；升级前停在待补字幕的任务各获一次自动补交机会，升级前的 `retry_wait` 行沿用固定 10 分钟退避。
+4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时自动升级到 v19（迁移幂等）。旧频道和任务模式均为 `translated`；升级前停在待补字幕的任务各获一次自动补交机会，升级前的 `retry_wait` 行沿用固定 10 分钟退避。
 5. SQLite 保存完整队列：准备和 CC 字幕任务通过原子领取、租约与心跳避免多进程重复执行；过期租约在重启后恢复。任务模式和追加目标 BV 不丢失，`dead_letter` 可从 TUI 或 CLI 安全恢复。
 
 ## 上线验收
