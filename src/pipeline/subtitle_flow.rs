@@ -16,7 +16,7 @@ use crate::subtitle::{self, Cue};
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream};
 use regex::Regex;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -452,12 +452,35 @@ pub(super) fn append_core_ranges(
     Ok(())
 }
 
+const SUBTITLE_TRACKS_TEMPLATE: &str = "%(.{subtitles,automatic_captions})j";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubtitleTrackKind {
+    Manual,
+    Automatic,
+}
+
+impl SubtitleTrackKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Automatic => "automatic",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SubtitleTrack {
+    language: String,
+    kind: SubtitleTrackKind,
+}
+
 /// 选出用于分句/翻译的英文字幕文件。
 ///
-/// `--sub-langs "en.*,en"` 可能同时落盘 `<id>.en.vtt`、`<id>.en-US.vtt`、
-/// `<id>.en-orig.vtt`；`read_dir` 的顺序依赖文件系统，直接取第一个会让同一
-/// 视频重跑时选到不同字幕源。这里固定优先级：精确 `en` > 其余语言标签字典序，
-/// 保证结果可复现。
+/// yt-dlp 可能把模板中的语言和自身追加的语言各写一次，生成
+/// `<id>.en.en.vtt`。旧版 `en.*` 还会留下 `<id>.en.en-ar.vtt` 等英文源机器
+/// 翻译轨道；这些不能被误当成英语缓存。这里固定优先级：精确 `en` >
+/// `en-orig` > 英语地区变体，保证重跑结果可复现。
 pub(super) fn pick_subtitle_file(work: &Path, video_id: &str) -> Result<Option<PathBuf>> {
     let mut candidates = fs::read_dir(work)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -466,6 +489,7 @@ pub(super) fn pick_subtitle_file(work: &Path, video_id: &str) -> Result<Option<P
                 && path.metadata().is_ok_and(|metadata| metadata.len() > 0)
         })
         .map(|path| (subtitle_language_tag(&path, video_id), path))
+        .filter(|(language, _)| is_english_subtitle_language(language))
         .collect::<Vec<_>>();
     candidates.sort_by(|(left_lang, left_path), (right_lang, right_path)| {
         subtitle_language_rank(left_lang)
@@ -476,16 +500,45 @@ pub(super) fn pick_subtitle_file(work: &Path, video_id: &str) -> Result<Option<P
     Ok(candidates.into_iter().next().map(|(_, path)| path))
 }
 
-/// 语言标签优先级：精确 `en` > 具名变体（`en-US`…） > 无法识别的文件名。
+fn pick_subtitle_file_for_language(
+    work: &Path,
+    video_id: &str,
+    language: &str,
+) -> Result<Option<PathBuf>> {
+    let mut candidates = fs::read_dir(work)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "vtt")
+                && path.metadata().is_ok_and(|metadata| metadata.len() > 0)
+                && subtitle_language_tag(path, video_id) == language
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    Ok(candidates.into_iter().next())
+}
+
+/// 语言标签优先级：精确 `en` > 原始自动字幕 `en-orig` > 英语地区变体。
 pub(super) fn subtitle_language_rank(language: &str) -> u8 {
     match language {
         "en" => 0,
-        "" => 2,
-        _ => 1,
+        "en-orig" => 1,
+        _ => 2,
     }
 }
 
-/// 从 `<video_id>.<language>.vtt` 取出语言标签；文件名不匹配时返回空串。
+fn is_english_subtitle_language(language: &str) -> bool {
+    if matches!(language, "en" | "en-orig") {
+        return true;
+    }
+    let Some(variant) = language.strip_prefix("en-") else {
+        return false;
+    };
+    // YouTube 的英文源翻译轨道使用 `en-ar`、`en-de`、`en-zh-Hans` 等全小写
+    // 目标代码；真实英语地区变体通常含大写区域代码（en-US、en-GB…）。
+    variant.chars().any(|ch| ch.is_ascii_uppercase()) && !variant.starts_with("zh-")
+}
+
+/// 从 `<video_id>.<language>.vtt` 取出语言标签；yt-dlp 重复追加语言时取最后一段。
 pub(super) fn subtitle_language_tag(path: &Path, video_id: &str) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -493,7 +546,69 @@ pub(super) fn subtitle_language_tag(path: &Path, video_id: &str) -> String {
         .and_then(|rest| rest.strip_suffix(".vtt"))
         .unwrap_or_default()
         .trim_matches('.')
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
         .to_string()
+}
+
+fn best_english_track(
+    metadata: &Value,
+    field: &str,
+    kind: SubtitleTrackKind,
+) -> Option<SubtitleTrack> {
+    let mut languages = metadata
+        .get(field)?
+        .as_object()?
+        .iter()
+        .filter(|(language, formats)| {
+            is_english_subtitle_language(language)
+                && formats
+                    .as_array()
+                    .is_some_and(|formats| !formats.is_empty())
+        })
+        .map(|(language, _)| language.clone())
+        .collect::<Vec<_>>();
+    languages.sort_by(|left, right| {
+        subtitle_language_rank(left)
+            .cmp(&subtitle_language_rank(right))
+            .then_with(|| left.cmp(right))
+    });
+    languages
+        .into_iter()
+        .next()
+        .map(|language| SubtitleTrack { language, kind })
+}
+
+fn select_subtitle_track(metadata: &Value) -> Option<SubtitleTrack> {
+    best_english_track(metadata, "subtitles", SubtitleTrackKind::Manual).or_else(|| {
+        best_english_track(metadata, "automatic_captions", SubtitleTrackKind::Automatic)
+    })
+}
+
+fn parse_subtitle_tracks(stdout: &str) -> Result<Value> {
+    let json = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .context("yt-dlp 未返回字幕轨道信息")?;
+    serde_json::from_str(json).context("yt-dlp 字幕轨道 JSON 无效")
+}
+
+fn subtitle_download_args(track: &SubtitleTrack) -> Vec<String> {
+    vec![
+        "--skip-download".into(),
+        match track.kind {
+            SubtitleTrackKind::Manual => "--write-subs".into(),
+            SubtitleTrackKind::Automatic => "--write-auto-subs".into(),
+        },
+        "--sub-langs".into(),
+        track.language.clone(),
+        "--sub-format".into(),
+        "vtt".into(),
+        "--no-playlist".into(),
+        "--no-overwrites".into(),
+    ]
 }
 
 impl Pipeline {
@@ -609,25 +724,56 @@ impl Pipeline {
         work: &Path,
     ) -> Result<Option<PathBuf>> {
         let mut stage = StageGuard::start(&self.db, job_id, "subtitle_download", None, None, None)?;
-        let mut cmd = ytdlp_command(&self.config.youtube);
-        cmd.args([
+        if let Some(cached) = pick_subtitle_file(work, video_id)? {
+            let detail = format!("cache:{}", cached.to_string_lossy());
+            stage.finish("completed", 0, 0, Some(&detail))?;
+            return Ok(Some(cached));
+        }
+
+        // 先做一次有界的元数据查询，再只下载选中的单条轨道。不能直接使用
+        // `en.*`：它会匹配所有“英文源翻译成其他语言”的自动字幕。
+        let mut probe = ytdlp_command(&self.config.youtube);
+        probe.args([
+            "--print",
+            SUBTITLE_TRACKS_TEMPLATE,
             "--skip-download",
-            "--write-subs",
-            "--write-auto-subs",
-            "--sub-langs",
-            "en.*,en",
-            "--sub-format",
-            "vtt",
             "--no-playlist",
-            "--no-overwrites",
         ]);
-        cmd.arg("-o")
+        probe.arg(url);
+        let probed = match run_monitored(probe, Duration::from_secs(120)).await {
+            Ok(output) => output,
+            Err(error) => {
+                let elapsed = stage.elapsed_ms();
+                return Err(stage.fail(error, elapsed, 0)).context("字幕轨道查询失败");
+            }
+        };
+        let metadata = match parse_subtitle_tracks(&probed.stdout) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Err(stage.fail(error, probed.duration_ms, probed.peak_rss_kib))
+                    .context("字幕轨道查询失败");
+            }
+        };
+        let Some(track) = select_subtitle_track(&metadata) else {
+            stage.finish(
+                "missing",
+                probed.duration_ms,
+                probed.peak_rss_kib,
+                Some("no English subtitle track"),
+            )?;
+            return Ok(None);
+        };
+
+        let mut download = ytdlp_command(&self.config.youtube);
+        download.args(subtitle_download_args(&track));
+        download
+            .arg("-o")
             .arg(work.join(format!("{video_id}.%(language)s.%(ext)s")));
-        cmd.arg(url);
-        let result = run_monitored(cmd, Duration::from_secs(180)).await;
+        download.arg(url);
+        let result = run_monitored(download, Duration::from_secs(180)).await;
         match result {
             Ok(out) => {
-                let found = pick_subtitle_file(work, video_id)?;
+                let found = pick_subtitle_file_for_language(work, video_id, &track.language)?;
                 let status = if found.is_some() {
                     "completed"
                 } else {
@@ -635,13 +781,26 @@ impl Pipeline {
                 };
                 let detail = found
                     .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned());
-                stage.finish(status, out.duration_ms, out.peak_rss_kib, detail.as_deref())?;
+                    .map(|path| {
+                        format!(
+                            "{}:{}:{}",
+                            track.kind.label(),
+                            track.language,
+                            path.to_string_lossy()
+                        )
+                    })
+                    .unwrap_or_else(|| format!("{}:{}", track.kind.label(), track.language));
+                stage.finish(
+                    status,
+                    probed.duration_ms + out.duration_ms,
+                    probed.peak_rss_kib.max(out.peak_rss_kib),
+                    Some(&detail),
+                )?;
                 Ok(found)
             }
             Err(error) => {
                 let elapsed = stage.elapsed_ms();
-                Err(stage.fail(error, elapsed, 0)).context("字幕下载失败")
+                Err(stage.fail(error, elapsed, probed.peak_rss_kib)).context("字幕下载失败")
             }
         }
     }
@@ -1333,10 +1492,13 @@ mod tests {
     fn subtitle_pick_is_deterministic_and_prefers_exact_english() {
         let temp = tempfile::tempdir().unwrap();
         let work = temp.path();
-        // `--sub-langs "en.*,en"` 可能同时落盘多个变体，read_dir 顺序不可靠。
+        // 旧版 `en.*` 会留下翻译轨道；yt-dlp 还可能重复追加语言标签。
         for name in [
             "vid.en-US.vtt",
             "vid.en-orig.vtt",
+            "vid.en.en-ar.vtt",
+            "vid.en.en-zh-Hans.vtt",
+            "vid.en.en.vtt",
             "vid.en.vtt",
             "vid.en-GB.vtt",
         ] {
@@ -1347,19 +1509,85 @@ mod tests {
         std::fs::write(work.join("vid.zz.vtt"), "").unwrap();
         assert_eq!(
             pick_subtitle_file(work, "vid").unwrap(),
-            Some(work.join("vid.en.vtt"))
+            Some(work.join("vid.en.en.vtt"))
         );
 
-        // 没有精确 en 时按语言标签字典序取第一个，重复调用结果一致。
+        // 同为精确 en 时按路径稳定排序；移除后优先 en-orig，不选 en-ar。
+        std::fs::remove_file(work.join("vid.en.en.vtt")).unwrap();
+        assert_eq!(
+            pick_subtitle_file(work, "vid").unwrap(),
+            Some(work.join("vid.en.vtt"))
+        );
         std::fs::remove_file(work.join("vid.en.vtt")).unwrap();
         let first = pick_subtitle_file(work, "vid").unwrap();
-        assert_eq!(first, Some(work.join("vid.en-GB.vtt")));
+        assert_eq!(first, Some(work.join("vid.en-orig.vtt")));
         assert_eq!(pick_subtitle_file(work, "vid").unwrap(), first);
+
+        std::fs::remove_file(work.join("vid.en-orig.vtt")).unwrap();
+        std::fs::remove_file(work.join("vid.en-US.vtt")).unwrap();
+        std::fs::remove_file(work.join("vid.en-GB.vtt")).unwrap();
+        assert_eq!(pick_subtitle_file(work, "vid").unwrap(), None);
 
         std::fs::remove_dir_all(work.join("empty")).ok();
         assert_eq!(
             pick_subtitle_file(temp.path().join("nope").as_path(), "vid").ok(),
             None
         );
+    }
+
+    #[test]
+    fn subtitle_track_selection_prefers_one_manual_english_track() {
+        let metadata = serde_json::json!({
+            "subtitles": {
+                "en-US": [{"ext": "vtt"}],
+                "en": [{"ext": "vtt"}],
+                "fr": [{"ext": "vtt"}]
+            },
+            "automatic_captions": {
+                "en": [{"ext": "vtt"}],
+                "en-ar": [{"ext": "vtt"}],
+                "en-zh-Hans": [{"ext": "vtt"}]
+            }
+        });
+        let track = select_subtitle_track(&metadata).unwrap();
+        assert_eq!(
+            track,
+            SubtitleTrack {
+                language: "en".into(),
+                kind: SubtitleTrackKind::Manual,
+            }
+        );
+        let args = subtitle_download_args(&track);
+        assert!(args.contains(&"--write-subs".to_string()));
+        assert!(!args.contains(&"--write-auto-subs".to_string()));
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "en").count(), 1);
+    }
+
+    #[test]
+    fn subtitle_track_selection_falls_back_to_original_automatic_english() {
+        let metadata = parse_subtitle_tracks(
+            "warning on stdout\n{\"subtitles\":{},\"automatic_captions\":{\"en-ar\":[{}],\"en-zh-Hans\":[{}],\"en-orig\":[{}]}}\n",
+        )
+        .unwrap();
+        let track = select_subtitle_track(&metadata).unwrap();
+        assert_eq!(
+            track,
+            SubtitleTrack {
+                language: "en-orig".into(),
+                kind: SubtitleTrackKind::Automatic,
+            }
+        );
+        let args = subtitle_download_args(&track);
+        assert!(args.contains(&"--write-auto-subs".to_string()));
+        assert!(!args.contains(&"--write-subs".to_string()));
+
+        let translated_only = serde_json::json!({
+            "subtitles": {},
+            "automatic_captions": {
+                "en-ar": [{}],
+                "en-zh-Hans": [{}]
+            }
+        });
+        assert_eq!(select_subtitle_track(&translated_only), None);
     }
 }
