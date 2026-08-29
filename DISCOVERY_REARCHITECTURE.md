@@ -1,6 +1,9 @@
-# y2b-rs 频道发现架构重建
+# y2b-rs 频道发现架构重建（历史设计文档）
 
-本文记录 `feat/discovery-rearchitecture` 分支完成的 Phase 0–4、数据库变更、配置项，以及部署和回滚要求。所有迁移都是幂等、向前追加式迁移。
+> [!NOTE]
+> 本文归档已经合入主线的 Phase 0–4 发现架构设计。下文的 v11–v15 是各阶段当时的迁移快照，不代表当前数据库终点；当前 schema 为 **v19**，v16–v19 的队列租约、暂停安全和投稿 attempt 一致性改造不在本文范围内。部署、恢复和质量门禁以 [README](README.md) 为准。
+
+所有迁移都是幂等、向前追加式迁移；本文保留原阶段说明用于追溯，不再作为独立 feature 分支的上线手册。
 
 ## Phase 0：止血与持久化调度
 
@@ -258,17 +261,18 @@ WebSub 是秒级发现的最终通道。程序侧只需配置并运行 `y2b watc
    环境文件应只允许服务账户读取，并确认运行 `y2b watch` 的进程实际加载了该文件。不要把 key 提交到 Git。
 3. WebSub 代理必须保留 GET query、POST body 和 `X-Hub-Signature`，且 body 上限不得低于 128 KB。
 
-## 部署前检查清单
+## 当前部署前检查清单
 
-- 确认部署提交位于 `feat/discovery-rearchitecture`，并记录待部署 commit ID；不要误用本地未提交文件。
-- 保存当前二进制、配置文件、环境文件和 SQLite 数据库的可恢复备份。
-- 在数据库副本上执行迁移，确认 schema version 为 15，并执行 SQLite integrity/quick check。
+- 记录待部署的主线 commit ID，并使用该提交生成的完整 release 输入；不要误用本地未提交文件。
+- 保存当前整套应用文件、配置文件、环境文件和 SQLite 数据库的可恢复备份，并进入 maintenance hold。
+- 在数据库副本上执行迁移，确认 schema version 为 19，并执行 SQLite integrity/quick check。
 - 执行：
 
   ```text
   cargo fmt --check
-  cargo clippy --all-targets -- -D warnings
+  cargo clippy --all-targets --all-features -- -D warnings
   cargo test
+  npm run check
   ```
 
 - 使用实际部署配置运行 `config-check`；WebSub 未准备好时必须保持 `enabled = false`。
@@ -279,10 +283,10 @@ WebSub 是秒级发现的最终通道。程序侧只需配置并运行 `y2b watc
 
 ## 回滚
 
-1. 停止产生新写入后，保留故障现场数据库副本和日志。
-2. 恢复部署前的二进制和配置；旧版本会忽略新增表/列，但不会处理 `video_candidates` 中尚未晋级的候选。
-3. 如果只回滚二进制，可保留 v15 数据库；迁移均为追加式。不过应记录未晋级候选，避免回滚期间形成发现空档。
-4. 如需完全恢复部署前状态，在明确接受丢失部署后新增任务/候选/配额/租约状态的前提下，恢复部署前数据库备份。
-5. 恢复后重新执行配置检查、数据库完整性检查、队列状态检查和发现健康检查，再恢复正常运行。
+1. 进入 maintenance hold 并停止产生新写入后，保留故障现场数据库副本、当前 v19 应用文件和日志。
+2. 完整切回部署前的二进制与配套资源，不要只替换二进制；旧版本可能不理解 v16–v19 的租约和投稿状态。
+3. 只有经兼容性确认的 release 才能继续使用 v19 数据库；否则通过 `restore.sh` 恢复与旧 release 匹配的完整数据库备份。
+4. 恢复数据库前要明确接受丢失部署后新增任务、候选、配额、租约和投稿 attempt 状态，并单独记录 `upload_uncertain` 供人工核对。
+5. 恢复后重新执行配置检查、数据库完整性检查、schema v19／目标版本检查、队列状态检查和发现健康检查，全部通过后再释放 hold。
 
-不要通过删除迁移记录或手工删除新增列来回滚；SQLite 的列删除会扩大风险，使用二进制回滚或完整数据库备份恢复。
+不要通过删除迁移记录或手工删除新增列来回滚；SQLite 的列删除会扩大风险，使用完整应用文件回滚或数据库备份恢复。
