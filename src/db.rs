@@ -71,6 +71,8 @@ pub(crate) const SUBTITLE_CLAIM_KIND: &str = "subtitle";
 pub(crate) const UPLOAD_CLAIM_KIND: &str = "upload";
 pub const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
 pub const BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
+/// 当前二进制能够完整理解的数据库迁移版本。
+pub const CURRENT_SCHEMA_VERSION: i64 = 19;
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -439,9 +441,11 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_upload_attempts_job
               ON upload_attempts(job_id, started_at DESC);
-            INSERT OR IGNORE INTO schema_migrations(version,applied_at)
-              VALUES(19,CURRENT_TIMESTAMP);
             "#,
+        )?;
+        self.conn().execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,CURRENT_TIMESTAMP)",
+            [CURRENT_SCHEMA_VERSION],
         )?;
         Ok(())
     }
@@ -2454,7 +2458,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         let migrated: (String, Option<String>, String) = db
             .conn()
             .query_row(
@@ -2538,7 +2542,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             db.list_channels().unwrap()[0].transfer_mode,
             TransferMode::Translated
@@ -2558,7 +2562,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         assert!(
             db.create_job(NewJob {
                 channel_id: None,
@@ -3995,7 +3999,7 @@ mod tests {
         drop(db);
 
         let reopened = Database::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 19);
+        assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         assert!(reopened.is_over_duration_video("too-long", 7200).unwrap());
         reopened
             .record_over_duration_video("too-long", None, 8000, "9000s > 8000s")
