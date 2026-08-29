@@ -113,6 +113,21 @@ impl Drop for DownloadOutputGuard {
     }
 }
 
+fn bounded_dimensions(width: u64, height: u64, max_pixels: u64) -> (u64, u64) {
+    if width.saturating_mul(height) <= max_pixels {
+        return (width, height);
+    }
+    if max_pixels == 0 {
+        return (0, 0);
+    }
+    let scale = (max_pixels as f64 / width.saturating_mul(height) as f64).sqrt();
+    let bounded_width = ((width as f64 * scale).floor() as u64).max(1);
+    let bounded_height = ((height as f64 * scale).floor() as u64)
+        .min(max_pixels / bounded_width)
+        .max(1);
+    (bounded_width, bounded_height)
+}
+
 fn download_format_selector(meta: &VideoMetadata, max_pixels: u64, max_fps: f64) -> String {
     let vertical = matches!((meta.width, meta.height), (Some(width), Some(height)) if height >= width)
         || meta.url.contains("/shorts/")
@@ -120,11 +135,14 @@ fn download_format_selector(meta: &VideoMetadata, max_pixels: u64, max_fps: f64)
             .webpage_url
             .as_deref()
             .is_some_and(|url| url.contains("/shorts/"));
-    let ((primary_width, primary_height), (secondary_width, secondary_height)) = if vertical {
+    let (primary, secondary) = if vertical {
         ((1080, 1920), (1920, 1080))
     } else {
         ((1920, 1080), (1080, 1920))
     };
+    let (primary_width, primary_height) = bounded_dimensions(primary.0, primary.1, max_pixels);
+    let (secondary_width, secondary_height) =
+        bounded_dimensions(secondary.0, secondary.1, max_pixels);
     let square = (max_pixels as f64).sqrt().floor() as u64;
     format!(
         "bv*[vcodec^=avc1][fps<={max_fps}][width<={primary_width}][height<={primary_height}]+ba[acodec^=mp4a]/bv*[vcodec^=avc1][fps<={max_fps}][width<={secondary_width}][height<={secondary_height}]+ba[acodec^=mp4a]/bv*[vcodec^=avc1][fps<={max_fps}][width<={square}][height<={square}]+ba[acodec^=mp4a]/b[vcodec^=avc1][acodec^=mp4a][fps<={max_fps}][width<={primary_width}][height<={primary_height}]/b[vcodec^=avc1][acodec^=mp4a][fps<={max_fps}][width<={secondary_width}][height<={secondary_height}]/bv*[fps<={max_fps}][width<={primary_width}][height<={primary_height}]+ba/bv*[fps<={max_fps}][width<={secondary_width}][height<={secondary_height}]+ba/b[fps<={max_fps}][width<={primary_width}][height<={primary_height}]/b[fps<={max_fps}][width<={secondary_width}][height<={secondary_height}]"
@@ -183,7 +201,14 @@ fn remove_raw_video_outputs(work: &Path, video_id: &str) -> Result<usize> {
     Ok(removed)
 }
 
-fn media_duration_from_probe(output: &str) -> Result<f64> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MediaProbe {
+    duration: f64,
+    width: u64,
+    height: u64,
+}
+
+fn media_from_probe(output: &str) -> Result<MediaProbe> {
     let value: Value = serde_json::from_str(output).context("ffprobe 输出不是 JSON")?;
     let duration = value
         .pointer("/format/duration")
@@ -196,7 +221,59 @@ fn media_duration_from_probe(output: &str) -> Result<f64> {
     if !duration.is_finite() || duration <= 0.0 {
         bail!("ffprobe 返回无效视频时长: {duration}")
     }
-    Ok(duration)
+
+    let streams = value["streams"]
+        .as_array()
+        .context("ffprobe 输出缺少 streams")?;
+    let video_streams = streams
+        .iter()
+        .filter(|stream| stream["codec_type"].as_str() == Some("video"))
+        .collect::<Vec<_>>();
+    if video_streams.is_empty() {
+        bail!("ffprobe 未发现视频流")
+    }
+    let dimensions = video_streams.iter().find_map(|stream| {
+        let width = stream["width"]
+            .as_u64()
+            .or_else(|| stream["width"].as_str()?.parse().ok())?;
+        let height = stream["height"]
+            .as_u64()
+            .or_else(|| stream["height"].as_str()?.parse().ok())?;
+        (width > 0 && height > 0).then_some((width, height))
+    });
+    let (width, height) = dimensions.context("ffprobe 视频流缺少有效 width/height")?;
+    if !streams
+        .iter()
+        .any(|stream| stream["codec_type"].as_str() == Some("audio"))
+    {
+        bail!("ffprobe 未发现音频流")
+    }
+    Ok(MediaProbe {
+        duration,
+        width,
+        height,
+    })
+}
+
+fn validate_media(
+    probe: MediaProbe,
+    expected_duration: Option<f64>,
+    max_pixels: u64,
+) -> Result<()> {
+    validate_video_duration(probe.duration, expected_duration)?;
+    let pixels = probe
+        .width
+        .checked_mul(probe.height)
+        .context("视频尺寸乘积溢出")?;
+    if max_pixels == 0 || pixels > max_pixels {
+        bail!(
+            "视频尺寸 {}x{}={} 像素，超过 max_pixels={max_pixels}",
+            probe.width,
+            probe.height,
+            pixels
+        )
+    }
+    Ok(())
 }
 
 fn validate_video_duration(actual: f64, expected: Option<f64>) -> Result<()> {
@@ -831,7 +908,7 @@ impl Pipeline {
             "-v",
             "error",
             "-show_entries",
-            "format=duration",
+            "stream=codec_type,width,height:format=duration",
             "-of",
             "json",
         ])
@@ -843,22 +920,31 @@ impl Pipeline {
                 return Err(stage.fail(error, elapsed, 0));
             }
         };
-        let actual_duration = match media_duration_from_probe(&out.stdout).and_then(|actual| {
-            validate_video_duration(actual, expected_duration)?;
-            Ok(actual)
+        let probe = match media_from_probe(&out.stdout).and_then(|probe| {
+            validate_media(probe, expected_duration, self.config.youtube.max_pixels)?;
+            Ok(probe)
         }) {
-            Ok(duration) => duration,
+            Ok(probe) => probe,
             Err(error) => {
                 return Err(stage.fail(error, out.duration_ms, out.peak_rss_kib));
             }
         };
         let detail = match expected_duration {
             Some(expected) => format!(
-                "{}; duration={actual_duration:.3}s; expected={expected:.3}s; drift={:.3}s",
+                "{}; duration={:.3}s; expected={expected:.3}s; drift={:.3}s; dimensions={}x{}",
                 path.display(),
-                (actual_duration - expected).abs()
+                probe.duration,
+                (probe.duration - expected).abs(),
+                probe.width,
+                probe.height
             ),
-            None => format!("{}; duration={actual_duration:.3}s", path.display()),
+            None => format!(
+                "{}; duration={:.3}s; dimensions={}x{}",
+                path.display(),
+                probe.duration,
+                probe.width,
+                probe.height
+            ),
         };
         stage.finish(
             "completed",
@@ -882,7 +968,8 @@ impl Pipeline {
         ])
         .arg(path);
         let out = run_monitored(cmd, Duration::from_secs(60)).await?;
-        serde_json::from_str::<Value>(&out.stdout).context("ffprobe 输出不是 JSON")?;
+        let probe = media_from_probe(&out.stdout)?;
+        validate_media(probe, None, self.config.youtube.max_pixels)?;
         stage.finish(
             "completed",
             out.duration_ms,
@@ -1005,14 +1092,64 @@ mod tests {
     }
 
     #[test]
-    fn downloaded_video_duration_rejects_skipped_fragments() {
-        let output = r#"{"format":{"duration":"1493.947000"}}"#;
-        let actual = media_duration_from_probe(output).unwrap();
-        validate_video_duration(actual, Some(1494.0)).unwrap();
+    fn downloaded_video_probe_rejects_incomplete_media() {
+        let output = r#"{"streams":[{"codec_type":"video","width":1920,"height":1080},{"codec_type":"audio"}],"format":{"duration":"1493.947000"}}"#;
+        let probe = media_from_probe(output).unwrap();
+        validate_media(probe, Some(1494.0), 2_073_600).unwrap();
 
         let error = validate_video_duration(1439.0, Some(1494.0)).unwrap_err();
         assert!(error.to_string().contains("相差 55.000s"));
-        assert!(media_duration_from_probe(r#"{"format":{}}"#).is_err());
+        assert!(media_from_probe(r#"{"streams":[],"format":{"duration":"1"}}"#).is_err());
+        assert!(
+            media_from_probe(
+                r#"{"streams":[{"codec_type":"video","width":1920,"height":1080}],"format":{"duration":"1"}}"#
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("音频流")
+        );
+        assert!(
+            media_from_probe(
+                r#"{"streams":[{"codec_type":"video","width":0,"height":1080},{"codec_type":"audio"}],"format":{"duration":"1"}}"#
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("width/height")
+        );
+        assert!(
+            media_from_probe(r#"{"streams":[{"codec_type":"audio"}],"format":{"duration":"1"}}"#)
+                .is_err()
+        );
+        assert!(media_from_probe(r#"{"streams":[],"format":{}}"#).is_err());
+    }
+
+    #[test]
+    fn max_pixels_limits_every_selector_and_probed_dimensions() {
+        let selector = download_format_selector(&metadata(), 921_600, 60.0);
+        let dimensions = regex::Regex::new(r"\[width<=(\d+)\]\[height<=(\d+)\]").unwrap();
+        let pairs = dimensions
+            .captures_iter(&selector)
+            .map(|capture| {
+                (
+                    capture[1].parse::<u64>().unwrap(),
+                    capture[2].parse::<u64>().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!pairs.is_empty());
+        assert!(
+            pairs
+                .iter()
+                .all(|(width, height)| width * height <= 921_600)
+        );
+
+        let oversized = MediaProbe {
+            duration: 60.0,
+            width: 1920,
+            height: 1080,
+        };
+        let error = validate_media(oversized, None, 921_600).unwrap_err();
+        assert!(error.to_string().contains("max_pixels=921600"));
     }
 
     #[test]
