@@ -60,6 +60,7 @@ const JOB_COLUMNS: &str = "id,channel_id,video_id,url,title,status,transfer_mode
 const AI_USAGE_SELECT: &str = "COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(cache_read_tokens),0),COALESCE(SUM(cache_write_tokens),0),COALESCE(SUM(total_tokens),0),SUM(cost)";
 /// 原始调用与已归档汇总的统一用量数据源。
 const AI_USAGE_ROWS: &str = "(SELECT job_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost FROM ai_calls UNION ALL SELECT job_id,input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cost FROM ai_usage_rollups) usage";
+const UNCERTAIN_UPLOAD_RECOVERY_ERROR: &str = "服务重启时上传结果不确定，请确认 Bilibili 后再处理";
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -1184,7 +1185,10 @@ impl Database {
         // 状态串里保留 downloading/segmenting/translating/rendering：这些变体已从
         // JobStatus 移除（从未被构造），但旧数据库里可能还留着这样的行，恢复时要一并捞回。
         let recovered=c.execute("UPDATE jobs SET status='queued',error='服务重启后自动恢复',retry_at=NULL,updated_at=? WHERE status IN ('inspecting','processing','downloading','segmenting','translating','rendering')",[&now])?;
-        c.execute("UPDATE jobs SET status='paused',error='服务重启时上传结果不确定，请确认 Bilibili 后手动重试',updated_at=? WHERE status IN ('uploading')",[&now])?;
+        c.execute(
+            "UPDATE jobs SET status='paused',error=?,updated_at=? WHERE status IN ('uploading')",
+            params![UNCERTAIN_UPLOAD_RECOVERY_ERROR, &now],
+        )?;
         c.execute(
             "UPDATE stage_runs SET status='failed',finished_at=?,duration_ms=COALESCE(duration_ms,CAST(MAX(0,(julianday(?) - julianday(started_at))*86400000) AS INTEGER)),detail=COALESCE(detail,'服务重启中断阶段') WHERE status='running'",
             params![&now, &now],
@@ -1452,11 +1456,22 @@ impl Database {
 
     pub fn retry_job(&self, id: &str) -> Result<()> {
         let changed = self.conn().execute(
-            "UPDATE jobs SET status=CASE WHEN prepared_upload_json IS NOT NULL THEN 'ready_to_upload' ELSE 'queued' END,attempt=0,error=NULL,retry_at=NULL,updated_at=? WHERE id=?",
-            params![Utc::now().to_rfc3339(), id],
+            "UPDATE jobs SET status=CASE WHEN prepared_upload_json IS NOT NULL THEN 'ready_to_upload' ELSE 'queued' END,attempt=0,error=NULL,retry_at=NULL,updated_at=? \
+             WHERE id=? AND (status IN ('dead_letter','failed') OR (status='paused' AND error IS NOT ?))",
+            params![Utc::now().to_rfc3339(), id, UNCERTAIN_UPLOAD_RECOVERY_ERROR],
         )?;
         if changed == 0 {
-            anyhow::bail!("任务不存在: {id}")
+            let current = self
+                .get_job(id)?
+                .with_context(|| format!("任务不存在: {id}"))?;
+            if current.status == JobStatus::Paused
+                && current.error.as_deref() == Some(UNCERTAIN_UPLOAD_RECOVERY_ERROR)
+            {
+                anyhow::bail!(
+                    "任务 {id} 的投稿结果不确定；请先在 Bilibili 确认，禁止直接重试以免重复投稿"
+                )
+            }
+            anyhow::bail!("任务 {id} 当前状态 {} 不允许重试", current.status)
         }
         Ok(())
     }
@@ -2641,6 +2656,53 @@ mod tests {
         assert_eq!(job.attempt, 0);
         assert!(job.error.is_none());
         assert_eq!(db.prepared_upload(&id).unwrap(), Some(plan));
+    }
+
+    #[test]
+    fn retry_job_rejects_completed_active_and_uncertain_upload_states() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "unsafe-retry",
+                url: "https://youtu.be/unsafe-retry",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+
+        for status in [
+            JobStatus::Queued,
+            JobStatus::Inspecting,
+            JobStatus::Processing,
+            JobStatus::ReadyToUpload,
+            JobStatus::Uploading,
+            JobStatus::UploadRetryWait,
+            JobStatus::Completed,
+            JobStatus::RetryWait,
+        ] {
+            if matches!(status, JobStatus::RetryWait | JobStatus::UploadRetryWait) {
+                db.defer_job_retry(&id, status, "waiting", 60).unwrap();
+            } else {
+                db.update_job_status(&id, status, None).unwrap();
+            }
+            assert!(db.retry_job(&id).is_err(), "{status} 不应允许手动重试");
+            assert_eq!(db.get_job(&id).unwrap().unwrap().status, status);
+        }
+
+        db.update_job_status(
+            &id,
+            JobStatus::Paused,
+            Some(UNCERTAIN_UPLOAD_RECOVERY_ERROR),
+        )
+        .unwrap();
+        let error = db.retry_job(&id).unwrap_err().to_string();
+        assert!(error.contains("投稿结果不确定"));
+        assert_eq!(db.get_job(&id).unwrap().unwrap().status, JobStatus::Paused);
     }
 
     #[test]

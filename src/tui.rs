@@ -509,8 +509,10 @@ fn app(
                                 Err(e) => format!("重新排队失败: {e}"),
                             };
                         } else {
-                            db.retry_job(&j.id)?;
-                            notice = format!("已重新排队 {}", j.video_id);
+                            notice = match db.retry_job(&j.id) {
+                                Ok(()) => format!("已重新排队 {}", j.video_id),
+                                Err(e) => format!("重新排队失败: {e}"),
+                            };
                         }
                     }
                 }
