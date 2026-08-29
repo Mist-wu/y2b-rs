@@ -819,17 +819,103 @@ fn backup(config: &Config, db: &Database) -> Result<PathBuf> {
     prune(&weekly, config.storage.weekly_backups)?;
     Ok(dest)
 }
+fn is_database_backup_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(stamp) = name
+        .strip_prefix("state-")
+        .and_then(|name| name.strip_suffix(".db"))
+    else {
+        return false;
+    };
+    let bytes = stamp.as_bytes();
+    match bytes.len() {
+        // 每日备份：state-YYYYMMDD.db；每周备份：state-YYYY-WNN.db。
+        8 => {
+            bytes.iter().all(u8::is_ascii_digit)
+                || (bytes[0..4].iter().all(u8::is_ascii_digit)
+                    && &bytes[4..6] == b"-W"
+                    && bytes[6..8].iter().all(u8::is_ascii_digit))
+        }
+        // 小时备份：state-YYYYMMDD-HHMMSS.db。
+        15 => {
+            bytes[0..8].iter().all(u8::is_ascii_digit)
+                && bytes[8] == b'-'
+                && bytes[9..15].iter().all(u8::is_ascii_digit)
+        }
+        _ => false,
+    }
+}
+
 fn prune(dir: &std::path::Path, keep: usize) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
     let mut files = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            (entry.file_type().ok()?.is_file() && is_database_backup_name(&entry.file_name()))
+                .then_some(entry)
+        })
         .collect::<Vec<_>>();
-    files.sort_by_key(|e| e.file_name());
+    files.sort_by_key(|entry| entry.file_name());
     while files.len() > keep {
-        let e = files.remove(0);
-        std::fs::remove_file(e.path())?;
+        let entry = files.remove(0);
+        std::fs::remove_file(entry.path())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn prune_ignores_directories_symlinks_and_unrecognized_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let backups = temporary.path().join("hourly");
+        std::fs::create_dir(&backups).unwrap();
+        let old = backups.join("state-20260830-010000.db");
+        let new = backups.join("state-20260830-020000.db");
+        let manual = backups.join("state.db.before-restore.20260830");
+        let directory = backups.join("state-20260829-000000.db");
+        let target = temporary.path().join("symlink-target.db");
+        let link = backups.join("state-20260828-000000.db");
+        std::fs::write(&old, "old").unwrap();
+        std::fs::write(&new, "new").unwrap();
+        std::fs::write(&manual, "manual").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&target, "target").unwrap();
+        symlink(&target, &link).unwrap();
+
+        prune(&backups, 1).unwrap();
+
+        assert!(!old.exists());
+        assert!(new.exists());
+        assert!(manual.exists());
+        assert!(directory.is_dir());
+        assert!(link.is_symlink());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "target");
+    }
+
+    #[test]
+    fn backup_name_filter_accepts_only_the_three_generated_shapes() {
+        for name in [
+            "state-20260830-010203.db",
+            "state-20260830.db",
+            "state-2026-W35.db",
+        ] {
+            assert!(is_database_backup_name(std::ffi::OsStr::new(name)));
+        }
+        for name in [
+            "state.db",
+            "state.db.before-restore.20260830",
+            "state-20260830-010203.db.tmp",
+            "state-2026-W.db",
+        ] {
+            assert!(!is_database_backup_name(std::ffi::OsStr::new(name)));
+        }
+    }
 }
