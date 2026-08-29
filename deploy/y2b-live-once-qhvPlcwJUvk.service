@@ -1,0 +1,28 @@
+[Unit]
+Description=y2b-rs one-shot Brawl Talk capture qhvPlcwJUvk
+Wants=network-online.target
+After=network-online.target y2b-watch.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/y2b/live-once/qhvPlcwJUvk
+Environment=HOME=/root
+Environment=TZ=UTC
+Environment=PI_CODING_AGENT_DIR=/var/lib/y2b/pi-agent
+EnvironmentFile=/etc/y2b/y2b.env
+UnsetEnvironment=DEEPSEEK_API_KEY
+ExecStart=/opt/y2b/scripts/live_once.py --video-id qhvPlcwJUvk --url https://www.youtube.com/watch?v=qhvPlcwJUvk --title 乱斗抢先看 --main-start 2026-08-29T23:00:00+08:00 --hold-at 2026-08-29T22:00:00+08:00 --keep-before-seconds 10 --work-dir /var/lib/y2b/live-once/qhvPlcwJUvk
+Restart=on-failure
+RestartSec=15s
+MemoryAccounting=yes
+MemoryHigh=800M
+MemoryMax=1200M
+MemorySwapMax=1G
+TasksMax=256
+LimitNOFILE=65536
+TimeoutStopSec=45s
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
