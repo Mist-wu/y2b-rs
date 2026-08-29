@@ -553,7 +553,27 @@ def build_production_glossary(
     }
 
 
-def main() -> int:
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", default="azureuser@20.89.60.23")
     parser.add_argument(
@@ -561,15 +581,15 @@ def main() -> int:
         default=PI_MODEL,
         help=f"Fixed Pi model ({PI_MODEL}); empty means extraction only",
     )
-    parser.add_argument("--batch-size", type=int, default=300)
-    parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--batch-size", type=positive_int, default=300)
+    parser.add_argument("--timeout", type=positive_int, default=180)
     parser.add_argument("--extension", default="/opt/y2b/pi/y2b-extension.ts")
     parser.add_argument("--policy", default="/opt/y2b/pi/audit-policy.json")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--workers", type=positive_int, default=16)
     parser.add_argument("--game-version", default="68.250")
-    parser.add_argument("--shard-index", type=int, default=0)
-    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--shard-index", type=nonnegative_int, default=0)
+    parser.add_argument("--shard-count", type=positive_int, default=1)
     parser.add_argument(
         "--terms-file",
         type=pathlib.Path,
@@ -590,12 +610,22 @@ def main() -> int:
         type=pathlib.Path,
         default=pathlib.Path("/tmp/y2b-brawl-glossary-audit.json"),
     )
-    args = parser.parse_args()
-    if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
+    args = parser.parse_args(argv)
+    if args.shard_index >= args.shard_count:
         parser.error("--shard-index must be within [0, --shard-count)")
     models = [model.strip() for model in args.models.split(",") if model.strip()]
     if models not in ([], [PI_MODEL]):
         parser.error(f"--models must be {PI_MODEL!r} or empty")
+    if bool(args.production_from) != bool(args.production_output):
+        parser.error("--production-from and --production-output must be used together")
+    if args.production_from and args.shard_count != 1:
+        parser.error("production glossary generation requires --shard-count 1")
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    models = [model.strip() for model in args.models.split(",") if model.strip()]
 
     if args.terms_file:
         extracted = json.loads(args.terms_file.read_text(encoding="utf-8"))
@@ -633,10 +663,8 @@ def main() -> int:
             f"{len(terms)} terms",
             flush=True,
         )
-    if bool(args.production_from) != bool(args.production_output):
-        parser.error("--production-from and --production-output must be used together")
-    if args.production_from and args.shard_count != 1:
-        parser.error("production glossary generation requires --shard-count 1")
+    if not terms:
+        raise SystemExit("selected shard must contain at least one term")
     if args.production_from and args.production_output:
         previous = json.loads(args.production_from.read_text(encoding="utf-8"))
         production = build_production_glossary(terms, source_metadata, previous)

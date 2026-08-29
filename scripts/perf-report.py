@@ -146,17 +146,25 @@ def summarize(path: Path, clock_ticks: int) -> dict[str, Any]:
     }
 
 
-def parse_args() -> argparse.Namespace:
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("logs", nargs="+", type=Path)
-    parser.add_argument("--clock-ticks", type=int, default=100)
-    return parser.parse_args()
+    parser.add_argument("--clock-ticks", type=positive_int, default=100)
+    return parser.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args()
-    if args.clock_ticks <= 0:
-        raise SystemExit("--clock-ticks must be positive")
     reports = [summarize(path, args.clock_ticks) for path in args.logs]
     print(json.dumps({"reports": reports}, ensure_ascii=False, indent=2))
 

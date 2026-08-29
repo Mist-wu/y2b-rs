@@ -116,6 +116,48 @@ class CredentialTopologyTests(unittest.TestCase):
                 self.gid,
             )
 
+    def test_check_rejects_symlinked_credential_file(self) -> None:
+        self.install()
+        real_auth = self.root / "real-auth.json"
+        self.auth_file.replace(real_auth)
+        self.auth_file.symlink_to(real_auth)
+
+        with self.assertRaisesRegex(MODULE.TopologyError, "regular file.*symlink"):
+            MODULE.check_topology(
+                self.auth_dir,
+                self.auth_file,
+                self.global_auth,
+                self.env_file,
+                self.uid,
+                self.gid,
+            )
+
+    def test_install_rejects_non_regular_auth_target(self) -> None:
+        self.auth_dir.mkdir(mode=0o700)
+        self.auth_file.mkdir()
+        before_global = self.global_auth.read_bytes()
+        before_env = self.env_file.read_bytes()
+
+        with self.assertRaisesRegex(MODULE.TopologyError, "regular file"):
+            self.install()
+
+        self.assertTrue(self.auth_file.is_dir())
+        self.assertEqual(self.global_auth.read_bytes(), before_global)
+        self.assertEqual(self.env_file.read_bytes(), before_env)
+
+    def test_lock_open_rejects_symlink_and_non_regular_path(self) -> None:
+        target = self.root / "lock-target"
+        target.write_text("", encoding="utf-8")
+        link = self.root / "lock-link"
+        link.symlink_to(target)
+        with self.assertRaisesRegex(MODULE.TopologyError, "symlink"):
+            MODULE.open_lock_file(link)
+
+        fifo = self.root / "lock-fifo"
+        os.mkfifo(fifo)
+        with self.assertRaisesRegex(MODULE.TopologyError, "regular file"):
+            MODULE.open_lock_file(fifo)
+
 
 if __name__ == "__main__":
     unittest.main()
