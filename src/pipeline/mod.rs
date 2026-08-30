@@ -9,6 +9,7 @@ use crate::model::{Job, JobStatus, PreparedUpload, TransferMode, VideoMetadata};
 use crate::monitor::{Monitor, exceeds_duration_limit, is_live_content_pending, ytdlp_command};
 use crate::process::run_monitored;
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::future::Future;
@@ -34,6 +35,59 @@ pub use upload::NEXT_BILIBILI_SUBMIT_AT;
 /// YouTube 的整数秒元数据与容器时长会有轻微舍入差异；超过这个范围通常意味着
 /// HLS 分片被跳过或合并出的文件不完整。
 const MAX_VIDEO_DURATION_DRIFT_SECONDS: f64 = 3.0;
+const COVER_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const COVER_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const COVER_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const COVER_RESPONSE_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+fn cover_http_client_with_timeouts(
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent("y2b-rs/0.1")
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .read_timeout(read_timeout)
+        .build()
+}
+
+fn cover_http_client() -> reqwest::Client {
+    cover_http_client_with_timeouts(
+        COVER_HTTP_CONNECT_TIMEOUT,
+        COVER_HTTP_REQUEST_TIMEOUT,
+        COVER_HTTP_READ_TIMEOUT,
+    )
+    .expect("固定封面 HTTP 客户端配置必须有效")
+}
+
+/// 流式读取封面响应；每次追加前先核对剩余额度，内存占用不会随超限正文增长。
+async fn read_cover_response_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit_u64)
+    {
+        bail!("封面响应体超过上限 {limit} 字节")
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(limit);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            bail!("封面响应体超过上限 {limit} 字节")
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct AiCircuitBreaker {
@@ -57,7 +111,7 @@ pub struct Pipeline {
     pub config: Config,
     pub db: Database,
     ai_circuit_breaker: AiCircuitBreaker,
-    /// 复用的 HTTP 客户端（目前只用于拉 YouTube 封面）。每次调用新建
+    /// 复用的有界 HTTP 客户端（目前只用于拉 YouTube 封面）。每次调用新建
     /// `reqwest::Client` 会重建 TLS 配置和连接池，没有必要。
     http: reqwest::Client,
 }
@@ -113,6 +167,21 @@ impl Drop for DownloadOutputGuard {
     }
 }
 
+fn bounded_dimensions(width: u64, height: u64, max_pixels: u64) -> (u64, u64) {
+    if width.saturating_mul(height) <= max_pixels {
+        return (width, height);
+    }
+    if max_pixels == 0 {
+        return (0, 0);
+    }
+    let scale = (max_pixels as f64 / width.saturating_mul(height) as f64).sqrt();
+    let bounded_width = ((width as f64 * scale).floor() as u64).max(1);
+    let bounded_height = ((height as f64 * scale).floor() as u64)
+        .min(max_pixels / bounded_width)
+        .max(1);
+    (bounded_width, bounded_height)
+}
+
 fn download_format_selector(meta: &VideoMetadata, max_pixels: u64, max_fps: f64) -> String {
     let vertical = matches!((meta.width, meta.height), (Some(width), Some(height)) if height >= width)
         || meta.url.contains("/shorts/")
@@ -120,11 +189,14 @@ fn download_format_selector(meta: &VideoMetadata, max_pixels: u64, max_fps: f64)
             .webpage_url
             .as_deref()
             .is_some_and(|url| url.contains("/shorts/"));
-    let ((primary_width, primary_height), (secondary_width, secondary_height)) = if vertical {
+    let (primary, secondary) = if vertical {
         ((1080, 1920), (1920, 1080))
     } else {
         ((1920, 1080), (1080, 1920))
     };
+    let (primary_width, primary_height) = bounded_dimensions(primary.0, primary.1, max_pixels);
+    let (secondary_width, secondary_height) =
+        bounded_dimensions(secondary.0, secondary.1, max_pixels);
     let square = (max_pixels as f64).sqrt().floor() as u64;
     format!(
         "bv*[vcodec^=avc1][fps<={max_fps}][width<={primary_width}][height<={primary_height}]+ba[acodec^=mp4a]/bv*[vcodec^=avc1][fps<={max_fps}][width<={secondary_width}][height<={secondary_height}]+ba[acodec^=mp4a]/bv*[vcodec^=avc1][fps<={max_fps}][width<={square}][height<={square}]+ba[acodec^=mp4a]/b[vcodec^=avc1][acodec^=mp4a][fps<={max_fps}][width<={primary_width}][height<={primary_height}]/b[vcodec^=avc1][acodec^=mp4a][fps<={max_fps}][width<={secondary_width}][height<={secondary_height}]/bv*[fps<={max_fps}][width<={primary_width}][height<={primary_height}]+ba/bv*[fps<={max_fps}][width<={secondary_width}][height<={secondary_height}]+ba/b[fps<={max_fps}][width<={primary_width}][height<={primary_height}]/b[fps<={max_fps}][width<={secondary_width}][height<={secondary_height}]"
@@ -183,7 +255,14 @@ fn remove_raw_video_outputs(work: &Path, video_id: &str) -> Result<usize> {
     Ok(removed)
 }
 
-fn media_duration_from_probe(output: &str) -> Result<f64> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MediaProbe {
+    duration: f64,
+    width: u64,
+    height: u64,
+}
+
+fn media_from_probe(output: &str) -> Result<MediaProbe> {
     let value: Value = serde_json::from_str(output).context("ffprobe 输出不是 JSON")?;
     let duration = value
         .pointer("/format/duration")
@@ -196,7 +275,59 @@ fn media_duration_from_probe(output: &str) -> Result<f64> {
     if !duration.is_finite() || duration <= 0.0 {
         bail!("ffprobe 返回无效视频时长: {duration}")
     }
-    Ok(duration)
+
+    let streams = value["streams"]
+        .as_array()
+        .context("ffprobe 输出缺少 streams")?;
+    let video_streams = streams
+        .iter()
+        .filter(|stream| stream["codec_type"].as_str() == Some("video"))
+        .collect::<Vec<_>>();
+    if video_streams.is_empty() {
+        bail!("ffprobe 未发现视频流")
+    }
+    let dimensions = video_streams.iter().find_map(|stream| {
+        let width = stream["width"]
+            .as_u64()
+            .or_else(|| stream["width"].as_str()?.parse().ok())?;
+        let height = stream["height"]
+            .as_u64()
+            .or_else(|| stream["height"].as_str()?.parse().ok())?;
+        (width > 0 && height > 0).then_some((width, height))
+    });
+    let (width, height) = dimensions.context("ffprobe 视频流缺少有效 width/height")?;
+    if !streams
+        .iter()
+        .any(|stream| stream["codec_type"].as_str() == Some("audio"))
+    {
+        bail!("ffprobe 未发现音频流")
+    }
+    Ok(MediaProbe {
+        duration,
+        width,
+        height,
+    })
+}
+
+fn validate_media(
+    probe: MediaProbe,
+    expected_duration: Option<f64>,
+    max_pixels: u64,
+) -> Result<()> {
+    validate_video_duration(probe.duration, expected_duration)?;
+    let pixels = probe
+        .width
+        .checked_mul(probe.height)
+        .context("视频尺寸乘积溢出")?;
+    if max_pixels == 0 || pixels > max_pixels {
+        bail!(
+            "视频尺寸 {}x{}={} 像素，超过 max_pixels={max_pixels}",
+            probe.width,
+            probe.height,
+            pixels
+        )
+    }
+    Ok(())
 }
 
 fn validate_video_duration(actual: f64, expected: Option<f64>) -> Result<()> {
@@ -223,6 +354,129 @@ where
 
 fn requires_translated_pipeline(mode: TransferMode) -> bool {
     mode == TransferMode::Translated
+}
+
+const TRANSLATION_CACHE_PROVENANCE_SCHEMA: u32 = 1;
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TranslationCacheProvenance {
+    schema: u32,
+    video_id: String,
+    source_lang: String,
+    target_lang: String,
+    provider: String,
+    model: String,
+    thinking: String,
+    policy_path: String,
+    policy_sha256: Option<String>,
+}
+
+fn translation_cache_paths(work: &Path, video_id: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let segmented = work.join(format!("{video_id}.en.segmented.json"));
+    let translated = work.join(format!("{video_id}.en-zh-CN.translated.json"));
+    let provenance = work.join(format!("{video_id}.en-zh-CN.translated.provenance.json"));
+    (segmented, translated, provenance)
+}
+
+fn expected_translation_provenance(config: &Config, video_id: &str) -> TranslationCacheProvenance {
+    use sha2::{Digest, Sha256};
+
+    let policy_sha256 = fs::read(&config.ai.policy)
+        .ok()
+        .map(|content| hex::encode(Sha256::digest(content)));
+    TranslationCacheProvenance {
+        schema: TRANSLATION_CACHE_PROVENANCE_SCHEMA,
+        video_id: video_id.to_string(),
+        source_lang: config.translation.source_lang.clone(),
+        target_lang: config.translation.target_lang.clone(),
+        provider: config.ai.provider.clone(),
+        model: config.ai.translation_model.clone(),
+        thinking: config.ai.thinking.clone(),
+        policy_path: config.ai.policy.to_string_lossy().into_owned(),
+        policy_sha256,
+    }
+}
+
+fn write_translation_provenance(
+    path: &Path,
+    provenance: &TranslationCacheProvenance,
+) -> Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("translation.provenance.json");
+    let temporary = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        fs::write(&temporary, serde_json::to_vec_pretty(provenance)?)?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn validate_translation_cache(config: &Config, video_id: &str, work: &Path) -> Result<()> {
+    let (segmented, translated, provenance_path) = translation_cache_paths(work, video_id);
+    let source =
+        subtitle_flow::load_segmented_cache(&segmented)?.context("翻译缓存缺少有效分句来源")?;
+    let provenance: TranslationCacheProvenance =
+        serde_json::from_slice(&fs::read(&provenance_path).with_context(|| {
+            format!(
+                "读取翻译缓存 provenance 失败: {}",
+                provenance_path.display()
+            )
+        })?)
+        .context("翻译缓存 provenance 不是有效 JSON")?;
+    let expected = expected_translation_provenance(config, video_id);
+    if provenance.source_lang != expected.source_lang
+        || provenance.target_lang != expected.target_lang
+    {
+        bail!(
+            "翻译缓存语言对 {}->{} 与当前 {}->{} 不匹配",
+            provenance.source_lang,
+            provenance.target_lang,
+            expected.source_lang,
+            expected.target_lang
+        )
+    }
+    if provenance != expected {
+        bail!("翻译缓存 provenance 与当前视频、模型或策略不匹配")
+    }
+    subtitle_flow::load_translation_checkpoint(&translated, &source)?
+        .context("翻译缓存文件不存在")?;
+    Ok(())
+}
+
+fn quarantine_cache(path: &Path) -> Result<Option<PathBuf>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cache");
+    let quarantined = path.with_file_name(format!("{name}.corrupt-{}", uuid::Uuid::new_v4()));
+    fs::rename(path, &quarantined)
+        .with_context(|| format!("隔离损坏缓存失败: {}", path.display()))?;
+    Ok(Some(quarantined))
+}
+
+fn quarantine_invalid_vtt_caches(work: &Path, video_id: &str) -> Result<Vec<PathBuf>> {
+    let mut quarantined = Vec::new();
+    while let Some(path) = subtitle_flow::pick_subtitle_file(work, video_id)? {
+        if crate::subtitle::parse_vtt(&path).is_ok() {
+            break;
+        }
+        if let Some(path) = quarantine_cache(&path)? {
+            quarantined.push(path);
+        }
+    }
+    Ok(quarantined)
 }
 
 /// 任务重试退避基数与上限：第 n 次失败后等待 `min(5min × 2^n, 1h)`。
@@ -365,7 +619,7 @@ impl Pipeline {
             config,
             db,
             ai_circuit_breaker,
-            http: reqwest::Client::new(),
+            http: cover_http_client(),
         }
     }
 
@@ -601,8 +855,22 @@ impl Pipeline {
             return Ok(());
         }
 
+        self.validate_subtitle_caches(&job.id, &meta.id, &work)?;
         let video_fut = self.download_video(&job.id, &job.url, &meta, &work);
-        let subtitle_fut = self.prepare_translated_subtitle(job, &meta, &work);
+        let subtitle_fut = async {
+            let result = self.prepare_translated_subtitle(job, &meta, &work).await;
+            let (_, translated, provenance_path) = translation_cache_paths(&work, &meta.id);
+            if translated.exists() {
+                let provenance = expected_translation_provenance(&self.config, &meta.id);
+                if let Err(error) = write_translation_provenance(&provenance_path, &provenance) {
+                    if result.is_ok() {
+                        return Err(error).context("写入翻译缓存 provenance 失败");
+                    }
+                    tracing::warn!(error = %error, "写入失败任务的翻译缓存 provenance 失败");
+                }
+            }
+            result
+        };
         let (video, subtitle) = try_join_branches(video_fut, subtitle_fut).await?;
         self.db
             .set_job_paths(&job.id, Some(&video.to_string_lossy()))?;
@@ -694,7 +962,7 @@ impl Pipeline {
                 .send()
                 .await?
                 .error_for_status()?;
-            let bytes = response.bytes().await?;
+            let bytes = read_cover_response_body(response, COVER_RESPONSE_BODY_LIMIT).await?;
             if bytes.is_empty() {
                 bail!("YouTube 封面为空")
             }
@@ -721,6 +989,45 @@ impl Pipeline {
             }
             Err(error) => Err(stage.fail(error, duration_ms, 0)).context("下载 YouTube 封面失败"),
         }
+    }
+
+    fn validate_subtitle_caches(&self, job_id: &str, video_id: &str, work: &Path) -> Result<()> {
+        for quarantined in quarantine_invalid_vtt_caches(work, video_id)? {
+            self.db.event(
+                Some(job_id),
+                "warn",
+                &format!("原始 VTT 缓存损坏，已隔离: {}", quarantined.display()),
+            )?;
+        }
+
+        let (segmented, translated, provenance) = translation_cache_paths(work, video_id);
+        if segmented.exists()
+            && let Err(error) = subtitle_flow::load_segmented_cache(&segmented)
+        {
+            quarantine_cache(&segmented)?;
+            quarantine_cache(&translated)?;
+            quarantine_cache(&provenance)?;
+            self.db.event(
+                Some(job_id),
+                "warn",
+                &format!("分句缓存损坏，已连同翻译缓存隔离: {error:#}"),
+            )?;
+            return Ok(());
+        }
+        if translated.exists()
+            && let Err(error) = validate_translation_cache(&self.config, video_id, work)
+        {
+            quarantine_cache(&translated)?;
+            quarantine_cache(&provenance)?;
+            self.db.event(
+                Some(job_id),
+                "warn",
+                &format!("翻译缓存不完整或 provenance 失配，已隔离: {error:#}"),
+            )?;
+        } else if !translated.exists() && provenance.exists() {
+            quarantine_cache(&provenance)?;
+        }
+        Ok(())
     }
 
     fn ensure_disk(&self) -> Result<()> {
@@ -836,7 +1143,7 @@ impl Pipeline {
             "-v",
             "error",
             "-show_entries",
-            "format=duration",
+            "stream=codec_type,width,height:format=duration",
             "-of",
             "json",
         ])
@@ -848,22 +1155,31 @@ impl Pipeline {
                 return Err(stage.fail(error, elapsed, 0));
             }
         };
-        let actual_duration = match media_duration_from_probe(&out.stdout).and_then(|actual| {
-            validate_video_duration(actual, expected_duration)?;
-            Ok(actual)
+        let probe = match media_from_probe(&out.stdout).and_then(|probe| {
+            validate_media(probe, expected_duration, self.config.youtube.max_pixels)?;
+            Ok(probe)
         }) {
-            Ok(duration) => duration,
+            Ok(probe) => probe,
             Err(error) => {
                 return Err(stage.fail(error, out.duration_ms, out.peak_rss_kib));
             }
         };
         let detail = match expected_duration {
             Some(expected) => format!(
-                "{}; duration={actual_duration:.3}s; expected={expected:.3}s; drift={:.3}s",
+                "{}; duration={:.3}s; expected={expected:.3}s; drift={:.3}s; dimensions={}x{}",
                 path.display(),
-                (actual_duration - expected).abs()
+                probe.duration,
+                (probe.duration - expected).abs(),
+                probe.width,
+                probe.height
             ),
-            None => format!("{}; duration={actual_duration:.3}s", path.display()),
+            None => format!(
+                "{}; duration={:.3}s; dimensions={}x{}",
+                path.display(),
+                probe.duration,
+                probe.width,
+                probe.height
+            ),
         };
         stage.finish(
             "completed",
@@ -887,7 +1203,8 @@ impl Pipeline {
         ])
         .arg(path);
         let out = run_monitored(cmd, Duration::from_secs(60)).await?;
-        serde_json::from_str::<Value>(&out.stdout).context("ffprobe 输出不是 JSON")?;
+        let probe = media_from_probe(&out.stdout)?;
+        validate_media(probe, None, self.config.youtube.max_pixels)?;
         stage.finish(
             "completed",
             out.duration_ms,
@@ -926,7 +1243,7 @@ impl Pipeline {
 mod tests {
     use super::*;
     use crate::db::NewJob;
-    use crate::pipeline::testing::metadata;
+    use crate::pipeline::testing::{cue, metadata};
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
@@ -1010,14 +1327,182 @@ mod tests {
     }
 
     #[test]
-    fn downloaded_video_duration_rejects_skipped_fragments() {
-        let output = r#"{"format":{"duration":"1493.947000"}}"#;
-        let actual = media_duration_from_probe(output).unwrap();
-        validate_video_duration(actual, Some(1494.0)).unwrap();
+    fn downloaded_video_probe_rejects_incomplete_media() {
+        let output = r#"{"streams":[{"codec_type":"video","width":1920,"height":1080},{"codec_type":"audio"}],"format":{"duration":"1493.947000"}}"#;
+        let probe = media_from_probe(output).unwrap();
+        validate_media(probe, Some(1494.0), 2_073_600).unwrap();
 
         let error = validate_video_duration(1439.0, Some(1494.0)).unwrap_err();
         assert!(error.to_string().contains("相差 55.000s"));
-        assert!(media_duration_from_probe(r#"{"format":{}}"#).is_err());
+        assert!(media_from_probe(r#"{"streams":[],"format":{"duration":"1"}}"#).is_err());
+        assert!(
+            media_from_probe(
+                r#"{"streams":[{"codec_type":"video","width":1920,"height":1080}],"format":{"duration":"1"}}"#
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("音频流")
+        );
+        assert!(
+            media_from_probe(
+                r#"{"streams":[{"codec_type":"video","width":0,"height":1080},{"codec_type":"audio"}],"format":{"duration":"1"}}"#
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("width/height")
+        );
+        assert!(
+            media_from_probe(r#"{"streams":[{"codec_type":"audio"}],"format":{"duration":"1"}}"#)
+                .is_err()
+        );
+        assert!(media_from_probe(r#"{"streams":[],"format":{}}"#).is_err());
+    }
+
+    #[test]
+    fn max_pixels_limits_every_selector_and_probed_dimensions() {
+        let selector = download_format_selector(&metadata(), 921_600, 60.0);
+        let dimensions = regex::Regex::new(r"\[width<=(\d+)\]\[height<=(\d+)\]").unwrap();
+        let pairs = dimensions
+            .captures_iter(&selector)
+            .map(|capture| {
+                (
+                    capture[1].parse::<u64>().unwrap(),
+                    capture[2].parse::<u64>().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!pairs.is_empty());
+        assert!(
+            pairs
+                .iter()
+                .all(|(width, height)| width * height <= 921_600)
+        );
+
+        let oversized = MediaProbe {
+            duration: 60.0,
+            width: 1920,
+            height: 1080,
+        };
+        let error = validate_media(oversized, None, 921_600).unwrap_err();
+        assert!(error.to_string().contains("max_pixels=921600"));
+    }
+
+    #[tokio::test]
+    async fn cover_client_times_out_when_server_stalls() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = cover_http_client_with_timeouts(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let error = client
+            .get(format!("http://{address}/stalled-cover"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout(), "无响应封面服务应触发超时: {error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "封面 HTTP 超时没有及时中止"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn oversized_cover_body_is_rejected_while_streaming() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let payload = "x".repeat(65);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{payload}\r\n0\r\n\r\n",
+                payload.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = cover_http_client_with_timeouts(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let response = client
+            .get(format!("http://{address}/large-cover"))
+            .send()
+            .await
+            .unwrap();
+        let error = read_cover_response_body(response, 64).await.unwrap_err();
+        assert!(
+            error.to_string().contains("封面响应体超过上限 64 字节"),
+            "超大封面响应未被流式限长: {error:#}"
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn corrupt_raw_vtt_cache_is_quarantined_before_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let corrupt = temp.path().join("vid.en.vtt");
+        std::fs::write(&corrupt, "WEBVTT\n\nnot a cue\n").unwrap();
+
+        let quarantined = quarantine_invalid_vtt_caches(temp.path(), "vid").unwrap();
+        assert_eq!(quarantined.len(), 1);
+        assert!(!corrupt.exists());
+        assert!(quarantined[0].exists());
+        assert_eq!(
+            subtitle_flow::pick_subtitle_file(temp.path(), "vid").unwrap(),
+            None,
+            "隔离后必须走 yt-dlp 重新下载"
+        );
+    }
+
+    #[test]
+    fn translation_cache_requires_current_language_and_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.ai.policy = temp.path().join("policy.json");
+        std::fs::write(&config.ai.policy, "{}\n").unwrap();
+        let (segmented, translated, provenance_path) = translation_cache_paths(temp.path(), "vid");
+        let source = vec![cue(0, "hello")];
+        crate::subtitle::save_json(&source, &segmented).unwrap();
+        let mut completed = source;
+        completed[0].translation = Some("你好".into());
+        crate::subtitle::save_json(&completed, &translated).unwrap();
+        let provenance = expected_translation_provenance(&config, "vid");
+        write_translation_provenance(&provenance_path, &provenance).unwrap();
+        validate_translation_cache(&config, "vid", temp.path()).unwrap();
+
+        config.translation.target_lang = "zh-TW".into();
+        let error = validate_translation_cache(&config, "vid", temp.path()).unwrap_err();
+        assert!(error.to_string().contains("语言对"));
+        config.translation.target_lang = "zh-CN".into();
+        completed[0].source = "different source".into();
+        crate::subtitle::save_json(&completed, &translated).unwrap();
+        assert!(
+            validate_translation_cache(&config, "vid", temp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("不匹配")
+        );
+        std::fs::remove_file(&provenance_path).unwrap();
+        assert!(validate_translation_cache(&config, "vid", temp.path()).is_err());
     }
 
     #[test]

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -143,7 +144,17 @@ def snapshot(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-def parse_args() -> argparse.Namespace:
+def positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("must be a positive number") from error
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return parsed
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", required=True)
     parser.add_argument("--output", required=True)
@@ -152,9 +163,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cgroup", default="/sys/fs/cgroup/system.slice/y2b-watch.service"
     )
-    parser.add_argument("--interval", type=float, default=30.0)
-    parser.add_argument("--duration", type=float, default=36_000.0)
-    return parser.parse_args()
+    parser.add_argument("--interval", type=positive_float, default=30.0)
+    parser.add_argument("--duration", type=positive_float, default=36_000.0)
+    return parser.parse_args(argv)
 
 
 def main() -> None:

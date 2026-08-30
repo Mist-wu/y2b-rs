@@ -25,21 +25,23 @@ const INLINE_ATOM_MAX_WORDS: usize = 8;
 
 pub fn parse_vtt(path: &Path) -> Result<Vec<Cue>> {
     let raw = fs::read_to_string(path)?;
-    let timing =
-        Regex::new(r"(?m)^(\d{2}:)?\d{2}:\d{2}\.\d{3}\s+-->\s+(\d{2}:)?\d{2}:\d{2}\.\d{3}")?;
+    let timing = Regex::new(
+        r"^(?<start>(?:\d{2,}:)?\d{2}:\d{2}\.\d{3})[ \t]+-->[ \t]+(?<end>(?:\d{2,}:)?\d{2}:\d{2}\.\d{3})(?:[ \t]+.*)?$",
+    )?;
     let tags = Regex::new(r"<[^>]+>")?;
-    let inline_timing = Regex::new(r"<(?:(?:\d{2}):)?\d{2}:\d{2}\.\d{3}>")?;
+    let inline_timing = Regex::new(r"<(?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3}>")?;
     let mut blocks = Vec::new();
     for block in raw.replace("\r\n", "\n").split("\n\n") {
         let lines: Vec<_> = block.lines().collect();
-        let Some(i) = lines.iter().position(|l| timing.is_match(l)) else {
+        let Some((i, captures)) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(index, line)| timing.captures(line).map(|captures| (index, captures)))
+        else {
             continue;
         };
-        let Some((a, b)) = lines[i].split_once(" --> ") else {
-            continue;
-        };
-        let start = parse_ts(a)?;
-        let end = parse_ts(b.split_whitespace().next().unwrap_or(b))?;
+        let start = parse_ts(&captures["start"])?;
+        let end = parse_ts(&captures["end"])?;
         let raw_source = lines[i + 1..].join("\n");
         let source = clean_vtt_text(&raw_source, &tags);
         if !source.is_empty() {
@@ -95,17 +97,122 @@ fn music_marker_regex() -> &'static Regex {
 /// YouTube WebVTT 会把说话人提示写成 `&gt;&gt;`。源字幕先解码但保留 `>>`，
 /// 让分句和翻译仍能识别说话人切换；成品字幕再移除，避免 B站显示 HTML 实体或
 /// 箭头。背景音乐只删除方括号/括号形式的标签和音符，不删除正常语句中的“音乐”。
+fn decode_named_html_entity(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "amp" => "&",
+        "apos" => "'",
+        "gt" => ">",
+        "lt" => "<",
+        "quot" => "\"",
+        "nbsp" => "\u{00a0}",
+        "lrm" => "\u{200e}",
+        "rlm" => "\u{200f}",
+        "copy" => "©",
+        "reg" => "®",
+        "trade" => "™",
+        "hellip" => "…",
+        "ndash" => "–",
+        "mdash" => "—",
+        "lsquo" => "‘",
+        "rsquo" => "’",
+        "ldquo" => "“",
+        "rdquo" => "”",
+        "bull" => "•",
+        "middot" => "·",
+        "times" => "×",
+        "divide" => "÷",
+        "cent" => "¢",
+        "pound" => "£",
+        "yen" => "¥",
+        "euro" => "€",
+        "deg" => "°",
+        "plusmn" => "±",
+        "micro" => "µ",
+        "para" => "¶",
+        "sect" => "§",
+        "laquo" => "«",
+        "raquo" => "»",
+        "iexcl" => "¡",
+        "iquest" => "¿",
+        _ => return None,
+    })
+}
+
+fn decode_numeric_html_entity(value: &str) -> Option<char> {
+    let (digits, radix) = value
+        .strip_prefix(['x', 'X'])
+        .map_or((value, 10), |digits| (digits, 16));
+    if digits.is_empty() {
+        return None;
+    }
+    let number = u32::from_str_radix(digits, radix).ok()?;
+    let windows_1252 = match number {
+        0x80 => Some('€'),
+        0x82 => Some('‚'),
+        0x83 => Some('ƒ'),
+        0x84 => Some('„'),
+        0x85 => Some('…'),
+        0x86 => Some('†'),
+        0x87 => Some('‡'),
+        0x88 => Some('ˆ'),
+        0x89 => Some('‰'),
+        0x8a => Some('Š'),
+        0x8b => Some('‹'),
+        0x8c => Some('Œ'),
+        0x8e => Some('Ž'),
+        0x91 => Some('‘'),
+        0x92 => Some('’'),
+        0x93 => Some('“'),
+        0x94 => Some('”'),
+        0x95 => Some('•'),
+        0x96 => Some('–'),
+        0x97 => Some('—'),
+        0x98 => Some('˜'),
+        0x99 => Some('™'),
+        0x9a => Some('š'),
+        0x9b => Some('›'),
+        0x9c => Some('œ'),
+        0x9e => Some('ž'),
+        0x9f => Some('Ÿ'),
+        _ => None,
+    };
+    windows_1252
+        .or_else(|| char::from_u32(number).filter(|_| number != 0))
+        .or(Some('\u{fffd}'))
+}
+
+/// 按 HTML 的单次字符引用规则解码；未知实体保持原样，`&amp;gt;` 不会被二次解码。
+fn decode_html_entities(raw: &str) -> String {
+    let mut decoded = String::with_capacity(raw.len());
+    let mut remaining = raw;
+    while let Some(start) = remaining.find('&') {
+        decoded.push_str(&remaining[..start]);
+        let entity = &remaining[start + 1..];
+        let Some(end) = entity.find(';').filter(|end| *end <= 32) else {
+            decoded.push('&');
+            remaining = entity;
+            continue;
+        };
+        let name = &entity[..end];
+        let replacement = name
+            .strip_prefix('#')
+            .and_then(decode_numeric_html_entity)
+            .map(|character| character.to_string())
+            .or_else(|| decode_named_html_entity(name).map(str::to_string));
+        if let Some(replacement) = replacement {
+            decoded.push_str(&replacement);
+            remaining = &entity[end + 1..];
+        } else {
+            decoded.push('&');
+            remaining = entity;
+        }
+    }
+    decoded.push_str(remaining);
+    decoded
+}
+
 fn normalize_caption_text(raw: &str, remove_speaker_markers: bool) -> String {
-    // `&amp;` 必须最后解码，避免把 `&amp;gt;` 错误地二次解码成 `>`。
-    let decoded = raw
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&nbsp;", " ")
-        .replace("&lrm;", "\u{200e}")
-        .replace("&rlm;", "\u{200f}")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&");
+    let decoded = decode_html_entities(raw);
     let without_music = music_marker_regex().replace_all(&decoded, "");
     let speaker_cleaned = if remove_speaker_markers {
         without_music.replace(">>", "").replace("＞＞", "")
@@ -477,6 +584,22 @@ Nice.
     }
 
     #[test]
+    fn vtt_timing_accepts_standard_whitespace_and_long_hours() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("captions.vtt");
+        fs::write(
+            &path,
+            "WEBVTT\n\nfirst cue\n00:00:01.000\t-->   00:00:02.500 align:start\nHello\n\n123:04:05.006 --> 123:04:06.007\nWorld\n",
+        )
+        .unwrap();
+
+        let cues = parse_vtt(&path).unwrap();
+        assert_eq!(cues.len(), 2);
+        assert_eq!((cues[0].start, cues[0].end), (1.0, 2.5));
+        assert_eq!(cues[1].start, 123.0 * 3600.0 + 4.0 * 60.0 + 5.006);
+    }
+
+    #[test]
     fn vtt_cleanup_decodes_entities_and_removes_music_markers() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("captions.vtt");
@@ -517,6 +640,20 @@ Brown noise and chill music.
         assert_eq!(
             sanitize_caption_text("A &amp; B &amp;gt; C"),
             "A & B &gt; C"
+        );
+    }
+
+    #[test]
+    fn html_entities_decode_named_decimal_and_hex_references_once() {
+        assert_eq!(
+            sanitize_caption_text(
+                "Tom&nbsp;&amp; Jerry&#39;s &#x201c;show&#x201d;&hellip; &#128512; &amp;gt;"
+            ),
+            "Tom & Jerry's “show”… 😀 &gt;"
+        );
+        assert_eq!(
+            sanitize_caption_text("unknown &nope; entity"),
+            "unknown &nope; entity"
         );
     }
 
