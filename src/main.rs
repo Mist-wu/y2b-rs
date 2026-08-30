@@ -516,39 +516,81 @@ async fn main() -> Result<()> {
 /// 于是一次几分钟的 `poll_all`（每条新条目都要跑一次 yt-dlp）会让调度分支完全
 /// 停摆，准备/上传 worker 拉不起来。拆开后调度循环只做轻量 DB 查询，可以稳定
 /// 保持 1 秒节奏。
+type CriticalTaskResult = (&'static str, Result<()>);
+
 async fn watch(config_path: PathBuf, config: Config, db: Database) -> Result<()> {
     let recovered = db.recover_incomplete_jobs()?;
     if recovered > 0 {
         tracing::warn!(count = recovered, "已恢复服务重启前的未完成任务");
     }
     let monitor = Monitor::new(config.clone(), db.clone())?;
-    let discovery = tokio::spawn(discovery_loop(
-        monitor,
-        config.monitor.poll_seconds,
-        config.monitor.reconcile_hours,
-    ));
-    let priority_discovery = tokio::spawn(priority_discovery_loop(Monitor::new(
-        config.clone(),
-        db.clone(),
-    )?));
-    let gate = tokio::spawn(gate_loop(Monitor::new(config.clone(), db.clone())?));
-    let maintenance = tokio::spawn(maintenance_loop(config.clone(), db.clone()));
-    let mut tasks = vec![discovery, priority_discovery, gate, maintenance];
+    let mut tasks = tokio::task::JoinSet::<CriticalTaskResult>::new();
+    tasks.spawn(async move {
+        discovery_loop(
+            monitor,
+            config.monitor.poll_seconds,
+            config.monitor.reconcile_hours,
+        )
+        .await;
+        ("discovery", Ok(()))
+    });
+    tasks.spawn({
+        let monitor = Monitor::new(config.clone(), db.clone())?;
+        async move {
+            priority_discovery_loop(monitor).await;
+            ("priority discovery", Ok(()))
+        }
+    });
+    tasks.spawn({
+        let monitor = Monitor::new(config.clone(), db.clone())?;
+        async move {
+            gate_loop(monitor).await;
+            ("gate", Ok(()))
+        }
+    });
+    tasks.spawn({
+        let maintenance_config = config.clone();
+        let maintenance_db = db.clone();
+        async move {
+            maintenance_loop(maintenance_config, maintenance_db).await;
+            ("maintenance", Ok(()))
+        }
+    });
     if config.websub.enabled {
         let websub_config = config.websub.clone();
         let websub_db = db.clone();
-        tasks.push(tokio::spawn(async move {
-            if let Err(error) = websub::run(websub_config, websub_db).await {
-                tracing::error!(error = %error, "WebSub 服务退出");
-            }
-        }));
+        tasks.spawn(async move { ("WebSub", websub::run(websub_config, websub_db).await) });
     }
-    let result = schedule_loop(&config_path, &config, &db).await;
-    for task in tasks {
-        task.abort();
-        let _ = task.await;
-    }
+    supervise_watch(tasks, schedule_loop(&config_path, &config, &db)).await
+}
+
+/// scheduler 在前台接收 Ctrl-C；其余关键循环进入 JoinSet。任何循环先结束（包括
+/// panic）都会让 watch 返回错误，避免 systemd 眼中的“服务仍存活但功能已缺失”。
+async fn supervise_watch(
+    mut tasks: tokio::task::JoinSet<CriticalTaskResult>,
+    scheduler: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::pin!(scheduler);
+    let result = tokio::select! {
+        result = &mut scheduler => result.context("关键后台任务 scheduler 失败"),
+        result = tasks.join_next() => critical_task_result(result),
+    };
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
     result
+}
+
+fn critical_task_result(
+    result: Option<std::result::Result<CriticalTaskResult, tokio::task::JoinError>>,
+) -> Result<()> {
+    match result {
+        Some(Ok((name, Ok(())))) => anyhow::bail!("关键后台任务 {name} 意外退出"),
+        Some(Ok((name, Err(error)))) => {
+            Err(error).with_context(|| format!("关键后台任务 {name} 失败"))
+        }
+        Some(Err(error)) => anyhow::bail!("关键后台任务异常结束: {error}"),
+        None => anyhow::bail!("关键后台任务集合意外为空"),
+    }
 }
 
 /// 候选闸门独立运行，逐条拉元数据不会再阻塞 RSS/Data API 等轻量发现源。
@@ -722,6 +764,9 @@ async fn discovery_loop(monitor: Monitor, poll_seconds: u64, reconcile_hours: u6
 }
 
 /// 数据库备份、历史清理和认证续期。
+///
+/// 维护循环本身是关键任务；单次备份、清理和认证检查显式归为非关键操作，失败只
+/// 记录并等待下一轮，不能让一次运维故障退出整个循环。
 async fn maintenance_loop(config: Config, db: Database) {
     let mut backup_tick = tokio::time::interval(Duration::from_secs(6 * 3600));
     backup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1294,5 +1339,40 @@ esac
         );
         let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
         assert!(calls.matches("start\n").count() >= 2);
+
+    #[tokio::test]
+    #[ignore = "由父测试进程单独启动，验证退出码"]
+    async fn critical_task_panic_child_process() {
+        let mut tasks = tokio::task::JoinSet::<CriticalTaskResult>::new();
+        tasks.spawn(async {
+            panic!("测试强制关键后台任务 panic");
+        });
+        supervise_watch(tasks, std::future::pending::<Result<()>>())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn critical_task_panic_makes_process_exit_nonzero() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::critical_task_panic_child_process",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RUST_BACKTRACE", "0")
+            .output()
+            .unwrap();
+        let detail = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "关键任务 panic 后进程仍成功退出");
+        assert!(
+            detail.contains("关键后台任务异常结束"),
+            "进程没有报告关键任务失败: {detail}"
+        );
     }
 }
