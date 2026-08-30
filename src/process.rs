@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
@@ -16,25 +17,29 @@ use tokio::process::Command;
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-async fn read_capped<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+    captured: &Mutex<Vec<u8>>,
+) -> std::io::Result<()> {
     let mut chunk = [0u8; 8192];
     loop {
         let n = r.read(&mut chunk).await?;
         if n == 0 {
             break;
         }
+        let mut buf = captured.lock().unwrap();
         buf.extend_from_slice(&chunk[..n]);
         if buf.len() > MAX_CAPTURE_BYTES + chunk.len() {
             let drop = buf.len() - MAX_CAPTURE_BYTES;
             buf.drain(..drop);
         }
     }
+    let mut buf = captured.lock().unwrap();
     if buf.len() > MAX_CAPTURE_BYTES {
         let drop = buf.len() - MAX_CAPTURE_BYTES;
         buf.drain(..drop);
     }
-    Ok(buf)
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +63,23 @@ pub struct ProcessFailure {
 }
 
 impl ProcessFailure {
+    pub fn output(&self) -> &ProcessOutput {
+        &self.output
+    }
+}
+
+/// 直接子进程已经退出，但 stdout 未在清理宽限期内 EOF。
+///
+/// 后代可能尚未写完 stdout，因此仍按失败处理；已经读取到的两路输出随错误保留，
+/// 供 biliup 投稿结果和其他外部命令事后核对。
+#[derive(Debug, Error)]
+#[error("子进程输出管道清理超时（stdout 可能不完整）: {detail}")]
+pub struct ProcessDrainFailure {
+    detail: String,
+    output: ProcessOutput,
+}
+
+impl ProcessDrainFailure {
     pub fn output(&self) -> &ProcessOutput {
         &self.output
     }
@@ -107,8 +129,14 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
     let mut process_group = ProcessGroupGuard::new(pid);
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-    let mut stdout_task = tokio::spawn(async move { read_capped(&mut stdout).await });
-    let mut stderr_task = tokio::spawn(async move { read_capped(&mut stderr).await });
+    let stdout_capture = Arc::new(Mutex::new(Vec::new()));
+    let stderr_capture = Arc::new(Mutex::new(Vec::new()));
+    let stdout_buffer = Arc::clone(&stdout_capture);
+    let stderr_buffer = Arc::clone(&stderr_capture);
+    let mut stdout_task =
+        tokio::spawn(async move { read_capped(&mut stdout, &stdout_buffer).await });
+    let mut stderr_task =
+        tokio::spawn(async move { read_capped(&mut stderr, &stderr_buffer).await });
     let started = Instant::now();
     let mut sys = System::new();
     let (status, peak) = match tokio::time::timeout(timeout, async {
@@ -138,39 +166,52 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
         }
     };
     // 直接子进程退出并不代表管道已经关闭：PyInstaller 启动的后代可能继续持有
-    // stdout/stderr。drain 同时受调用方总超时和短宽限期约束，不能在成功路径永久等 EOF。
-    let drain_timeout = PIPE_DRAIN_TIMEOUT.min(timeout.saturating_sub(started.elapsed()));
-    let drain_deadline = tokio::time::Instant::now() + drain_timeout;
-    let mut out = None;
-    let mut err = None;
-    while out.is_none() || err.is_none() {
+    // stdout/stderr。宽限期从直接子进程退出时独立起算，不能被总超时的剩余预算截短。
+    let drain_deadline = tokio::time::Instant::now() + PIPE_DRAIN_TIMEOUT;
+    let mut stdout_complete = false;
+    let mut stderr_complete = false;
+    let mut stdout_incomplete = false;
+    while !stdout_complete || !stderr_complete {
         tokio::select! {
-            result = &mut stdout_task, if out.is_none() => out = Some(result??),
-            result = &mut stderr_task, if err.is_none() => err = Some(result??),
+            biased;
+            result = &mut stdout_task, if !stdout_complete => {
+                result??;
+                stdout_complete = true;
+            }
+            result = &mut stderr_task, if !stderr_complete => {
+                result??;
+                stderr_complete = true;
+            }
             _ = tokio::time::sleep_until(drain_deadline) => {
+                let stdout_was_complete = stdout_complete;
                 process_group.kill();
                 let _ = child.start_kill();
-                if out.is_none() {
+                if !stdout_complete {
                     stdout_task.abort();
-                    let _ = stdout_task.await;
+                    let _ = (&mut stdout_task).await;
                 }
-                if err.is_none() {
+                if !stderr_complete {
                     stderr_task.abort();
-                    let _ = stderr_task.await;
+                    let _ = (&mut stderr_task).await;
                 }
                 let _ = child.wait().await;
-                bail!(
-                    "子进程超时: {}s（后代进程仍持有输出管道）",
-                    timeout.as_secs()
-                );
+                if stdout_was_complete {
+                    tracing::warn!(
+                        pid,
+                        "直接子进程已退出，但后代仍持有 stderr；已终止进程组并保留完整 stdout"
+                    );
+                } else {
+                    stdout_incomplete = true;
+                }
+                stdout_complete = true;
+                stderr_complete = true;
             }
         }
     }
-    let out = out.expect("stdout 读取任务应已完成");
-    let err = err.expect("stderr 读取任务应已完成");
-    // 直接子进程已退出且输出管道已全部 EOF，此时确认整组正常收尾；之后即使
-    // 构造返回值失败，也不应再向可能复用的 PID 发信号。
+    // 直接子进程已退出，且 reader 均已完成或显式 abort；此后不会再改动捕获缓冲。
     process_group.disarm();
+    let out = std::mem::take(&mut *stdout_capture.lock().unwrap());
+    let err = std::mem::take(&mut *stderr_capture.lock().unwrap());
     let stdout = String::from_utf8_lossy(&out).to_string();
     let stderr = String::from_utf8_lossy(&err).to_string();
     let output = ProcessOutput {
@@ -179,6 +220,17 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
         duration_ms: started.elapsed().as_millis() as i64,
         peak_rss_kib: peak,
     };
+    if stdout_incomplete {
+        return Err(ProcessDrainFailure {
+            detail: format!(
+                "stdout:\n{}\nstderr:\n{}",
+                tail(&output.stdout, 80),
+                tail(&output.stderr, 80)
+            ),
+            output,
+        }
+        .into());
+    }
     if !status.success() {
         return Err(ProcessFailure {
             code: status.code(),
@@ -234,6 +286,19 @@ pub fn tail(s: &str, lines: usize) -> String {
 mod tests {
     use super::*;
 
+    async fn assert_process_killed(pid: libc::pid_t, message: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal 0 只检查本测试创建的 PID 是否仍存在。
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{message}: {pid}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     #[tokio::test]
     async fn nonzero_exit_preserves_captured_output_for_audit() {
         let mut command = Command::new("sh");
@@ -248,6 +313,22 @@ mod tests {
         assert_eq!(failure.output().stdout, r#"{"type":"agent_end"}"#);
         assert_eq!(failure.output().stderr, "provider error");
         assert!(error.to_string().contains("子进程退出码 Some(7)"));
+    }
+
+    #[tokio::test]
+    async fn near_timeout_success_reliably_returns_complete_output() {
+        for attempt in 1..=4 {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "sleep 1.8; printf 'complete stdout'; printf 'complete stderr' >&2",
+            ]);
+            let output = run_monitored(command, Duration::from_secs(2))
+                .await
+                .unwrap_or_else(|error| panic!("第 {attempt} 次边界运行意外失败: {error:#}"));
+            assert_eq!(output.stdout, "complete stdout", "第 {attempt} 次 stdout");
+            assert_eq!(output.stderr, "complete stderr", "第 {attempt} 次 stderr");
+        }
     }
 
     #[tokio::test]
@@ -287,12 +368,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exited_parent_with_inherited_stdout_is_bounded_and_killed() {
+    async fn completed_stdout_with_inherited_stderr_returns_success() {
         let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("pipe-holder.pid");
-        // 顶层 sh 立即成功退出；后代只持有继承的输出管道，不等待它收尾。
+        let pid_file = dir.path().join("stderr-holder.pid");
+        // 后代的 stdout 已重定向，只有 stderr 继续持有管道；父进程 stdout 可完整 EOF。
         let script = format!(
-            "sh -c 'echo $$ > {}; exec sleep 30' 2>/dev/null & exit 0",
+            "printf 'BV1complete'; printf 'parent stderr' >&2; \
+             sh -c 'echo $$ > {}; exec sleep 30' >/dev/null & exit 0",
+            pid_file.display()
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_monitored(command, Duration::from_secs(1)),
+        )
+        .await
+        .expect("stderr 管道清理发生永久挂起")
+        .expect("完整 stdout 不应因后代持有 stderr 而失败");
+        assert_eq!(output.stdout, "BV1complete");
+        assert_eq!(output.stderr, "parent stderr");
+
+        let descendant: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_killed(descendant, "stderr 管道超时后代进程仍存活").await;
+    }
+
+    #[tokio::test]
+    async fn exited_parent_with_inherited_stdout_preserves_partial_output_in_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("stdout-holder.pid");
+        // 后代只继承 stdout；父进程退出后 stdout 无法 EOF，stderr 则已经完整。
+        let script = format!(
+            "printf 'partial stdout'; printf 'partial stderr' >&2; \
+             sh -c 'echo $$ > {}; exec sleep 30' 2>/dev/null & exit 0",
             pid_file.display()
         );
         let mut command = Command::new("sh");
@@ -300,33 +413,25 @@ mod tests {
 
         let started = Instant::now();
         let error = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(5),
             run_monitored(command, Duration::from_secs(1)),
         )
         .await
-        .expect("父进程退出后等待输出管道发生永久挂起")
+        .expect("父进程退出后等待 stdout 发生永久挂起")
         .unwrap_err();
-        assert!(error.to_string().contains("后代进程仍持有输出管道"));
-        assert!(started.elapsed() < Duration::from_secs(3));
+        let failure = error.downcast_ref::<ProcessDrainFailure>().unwrap();
+        assert_eq!(failure.output().stdout, "partial stdout");
+        assert_eq!(failure.output().stderr, "partial stderr");
+        assert!(error.to_string().contains("partial stdout"));
+        assert!(error.to_string().contains("partial stderr"));
+        assert!(started.elapsed() < Duration::from_secs(5));
 
         let descendant: libc::pid_t = std::fs::read_to_string(&pid_file)
             .unwrap()
             .trim()
             .parse()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            // SAFETY: signal 0 只检查本测试创建的 PID 是否仍存在。
-            let alive = unsafe { libc::kill(descendant, 0) } == 0;
-            if !alive {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "输出管道超时后代进程仍存活: {descendant}"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        assert_process_killed(descendant, "stdout 管道超时后代进程仍存活").await;
     }
 
     #[tokio::test]
