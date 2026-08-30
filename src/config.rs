@@ -332,6 +332,21 @@ impl Config {
             "ai.segment_overlap_cues 必须小于 ai.segment_max_cues"
         );
         anyhow::ensure!(
+            self.ai.context_window_tokens > 0,
+            "ai.context_window_tokens 必须大于 0"
+        );
+        anyhow::ensure!(
+            self.ai.safe_context_tokens > 0,
+            "ai.safe_context_tokens 必须大于 0"
+        );
+        anyhow::ensure!(
+            self.ai.safe_context_tokens <= self.ai.context_window_tokens,
+            "ai.safe_context_tokens 必须小于等于 ai.context_window_tokens"
+        );
+        if let Some(limit) = self.ai.daily_token_limit {
+            anyhow::ensure!(limit > 0, "ai.daily_token_limit 必须大于 0");
+        }
+        anyhow::ensure!(
             self.ai.translation_batch_cues > 0,
             "ai.translation_batch_cues 必须大于 0"
         );
@@ -644,6 +659,35 @@ mod tests {
         let mut config = Config::default();
         config.websub.bind_addr = "not an address".into();
         assert_invalid(&config, "bind_addr");
+    }
+
+    #[test]
+    fn rejects_non_positive_token_limits_and_bad_context_bounds() {
+        for limit in [Some(0), Some(-1)] {
+            let mut config = Config::default();
+            config.ai.daily_token_limit = limit;
+            assert_invalid(&config, "daily_token_limit");
+        }
+
+        let mut config = Config::default();
+        config.ai.context_window_tokens = 0;
+        assert_invalid(&config, "context_window_tokens");
+
+        let mut config = Config::default();
+        config.ai.safe_context_tokens = 0;
+        assert_invalid(&config, "safe_context_tokens");
+
+        let mut config = Config::default();
+        config.ai.safe_context_tokens = config.ai.context_window_tokens + 1;
+        assert_invalid(&config, "safe_context_tokens");
+    }
+
+    #[test]
+    fn accepts_positive_token_limit_and_equal_context_bounds() {
+        let mut config = Config::default();
+        config.ai.daily_token_limit = Some(1);
+        config.ai.safe_context_tokens = config.ai.context_window_tokens;
+        config.validate().unwrap();
     }
 
     #[test]
