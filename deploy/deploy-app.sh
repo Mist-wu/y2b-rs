@@ -147,7 +147,21 @@ python3 "$root_dir/deploy/y2b-set-deepseek-key.py" --check
 command -v "$sqlite3_cmd" >/dev/null 2>&1 || { echo "sqlite3 is required" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
 command -v "$systemctl_cmd" >/dev/null 2>&1 || { echo "systemctl is required" >&2; exit 1; }
-command -v "$mv_cmd" >/dev/null 2>&1 || { echo "支持 mv -T 的 mv 命令不可用" >&2; exit 1; }
+# command -v 只能确认命令存在；停服务前必须实际验证原子切换依赖的 -T。
+command -v "$mv_cmd" >/dev/null 2>&1 || {
+  echo "mv 命令不可用，请检查 Y2B_MV 或安装 mv: $mv_cmd" >&2
+  exit 1
+}
+mv_probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/.y2b-mv-probe.XXXXXXXX")
+if ! (
+  trap 'rm -rf -- "$mv_probe_dir"' EXIT
+  printf 'source\n' >"$mv_probe_dir/source" &&
+    printf 'target\n' >"$mv_probe_dir/target" &&
+    "$mv_cmd" -Tf -- "$mv_probe_dir/source" "$mv_probe_dir/target"
+); then
+  echo "mv 不支持 -T，请安装 GNU coreutils 并将 Y2B_MV 指向 GNU mv: $mv_cmd" >&2
+  exit 1
+fi
 [[ -f "$database" ]] || {
   echo "数据库不存在，maintenance status 不会隐式创建数据库: $database" >&2
   exit 1

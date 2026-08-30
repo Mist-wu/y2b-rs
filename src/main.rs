@@ -1183,9 +1183,13 @@ mod tests {
 
         let deploy = fs::read_to_string(root.join("deploy/deploy-app.sh")).unwrap();
         let sqlite_check = deploy.find("command -v \"$sqlite3_cmd\"").unwrap();
+        let mv_probe = deploy
+            .find("\"$mv_cmd\" -Tf -- \"$mv_probe_dir/source\" \"$mv_probe_dir/target\"")
+            .unwrap();
         let acquire = deploy.find("maintenance acquire").unwrap();
         let idle_wait = deploy.find("\nwait_for_two_idle_checks\n").unwrap();
         assert!(sqlite_check < acquire);
+        assert!(mv_probe < acquire);
         assert!(acquire < idle_wait);
         assert!(deploy.contains(
             "maintenance status \\\n      --database \"$database\" --owner \"$owner\" --json"
@@ -1515,6 +1519,16 @@ exec "{python}" "$@"
             &format!(
                 r#"#!/usr/bin/env bash
 set -euo pipefail
+if [[ "$DEPLOY_TEST_SCENARIO" == mv_without_t ]]; then
+  for argument in "$@"; do
+    case "$argument" in
+      -*T*)
+        echo 'mv: illegal option -- T' >&2
+        exit 64
+        ;;
+    esac
+  done
+fi
 operands=()
 for argument in "$@"; do
   case "$argument" in
@@ -1653,6 +1667,58 @@ PY
             fs::read_link(&fixture.current).unwrap(),
             PathBuf::from(format!("releases/{NEW_DEPLOY_REVISION}"))
         );
+    }
+
+    #[test]
+    fn deploy_rejects_mv_without_t_before_acquiring_hold_or_stopping_service() {
+        let fixture = deploy_fixture("mv_without_t");
+        let mut command = fixture.command(3);
+        command.env("TMPDIR", &fixture.state_dir);
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let detail = output_detail(&output);
+        assert!(detail.contains("mv 不支持 -T"), "{detail}");
+        assert!(!detail.contains("mv 命令不可用"), "{detail}");
+        assert!(!fixture.hold.exists());
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(!events.contains("acquire:"), "{events}");
+        assert!(!fixture.systemctl_log.exists());
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "active\n"
+        );
+        assert!(
+            !fixture
+                .app_root
+                .join("releases")
+                .join(NEW_DEPLOY_REVISION)
+                .exists()
+        );
+        assert!(fs::read_dir(&fixture.state_dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".y2b-mv-probe.")
+        }));
+    }
+
+    #[test]
+    fn deploy_distinguishes_an_unavailable_mv_command() {
+        let fixture = deploy_fixture("success");
+        let mut command = fixture.command(3);
+        command.env("Y2B_MV", fixture.state_dir.join("missing-mv"));
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let detail = output_detail(&output);
+        assert!(
+            detail.contains("mv 命令不可用，请检查 Y2B_MV 或安装 mv"),
+            "{detail}"
+        );
+        assert!(!detail.contains("mv 不支持 -T"), "{detail}");
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(!events.contains("acquire:"), "{events}");
+        assert!(!fixture.systemctl_log.exists());
     }
 
     #[test]
