@@ -101,7 +101,9 @@ for resource in \
   "$root_dir/deploy/y2b-watch.service" \
   "$root_dir/deploy/restore.sh" \
   "$root_dir/deploy/install-ytdlp-pot-provider.sh" \
-  "$root_dir/deploy/y2b-set-deepseek-key.py"; do
+  "$root_dir/deploy/y2b-set-deepseek-key.py" \
+  "$root_dir/scripts/live_once.py" \
+  "$root_dir/deploy/y2b-live-once-qhvPlcwJUvk.service"; do
   [[ -f "$resource" ]] || { echo "missing release resource: $resource" >&2; exit 1; }
 done
 
@@ -666,22 +668,24 @@ if [[ "$legacy_capture_required" == true ]]; then
 fi
 
 # 新资源先写入隐藏 staging，完整后才发布为不可变 releases/<revision>；此时不碰 current。
-install -d -m 0755 "$staging_dir/pi" "$staging_dir/deploy"
+install -d -m 0755 "$staging_dir/pi" "$staging_dir/deploy" "$staging_dir/scripts"
 install -m 0755 "$binary" "$staging_dir/y2b"
 install -m 0644 "$root_dir/pi/y2b-extension.ts" "$staging_dir/pi/y2b-extension.ts"
 install -m 0644 "$root_dir/pi/policy.json" "$staging_dir/pi/policy.json"
 install -m 0644 "$root_dir/pi/audit-policy.json" "$staging_dir/pi/audit-policy.json"
 install -m 0644 "$root_dir/pi/brawl-stars-glossary.json" "$staging_dir/pi/brawl-stars-glossary.json"
 install -m 0644 "$root_dir/Cargo.lock" "$staging_dir/Cargo.lock"
+install -m 0755 "$root_dir/scripts/live_once.py" "$staging_dir/scripts/live_once.py"
 for script in bootstrap-server.sh deploy-app.sh install-ytdlp-pot-provider.sh restore.sh; do
   install -m 0755 "$root_dir/deploy/$script" "$staging_dir/deploy/$script"
 done
 install -m 0755 "$root_dir/deploy/y2b-set-deepseek-key.py" "$staging_dir/deploy/y2b-set-deepseek-key.py"
 install -m 0644 "$root_dir/deploy/y2b-watch.service" "$staging_dir/deploy/y2b-watch.service"
+install -m 0644 "$root_dir/deploy/y2b-live-once-qhvPlcwJUvk.service" "$staging_dir/deploy/y2b-live-once-qhvPlcwJUvk.service"
 "$mv_cmd" -- "$staging_dir" "$release_dir"
 release_created=true
 
-# 服务停止前完成迁移前快照及严格完整性校验；缺文件或非单行 ok 都立即拒绝。
+# 非自举路径由 hold 挡住新领取：先续租，再在停服前在线备份。
 if [[ "$bootstrap_deploy" != true ]]; then
   "$maintenance_y2b" maintenance renew \
     --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
@@ -715,6 +719,7 @@ fi
 install_release_alias "$app_root/pi" 'current/pi'
 install_release_alias "$app_root/Cargo.lock" 'current/Cargo.lock'
 install_release_alias "$app_root/deploy" 'current/deploy'
+install_release_alias "$app_root/scripts" 'current/scripts'
 install_release_alias "$bin_link" "$current_link/y2b"
 install_release_alias "$key_tool_link" "$current_link/deploy/y2b-set-deepseek-key.py"
 
@@ -734,6 +739,8 @@ fi
 
 install -m 0644 "$current_link/deploy/y2b-watch.service" "$unit_temp"
 "$mv_cmd" -Tf -- "$unit_temp" "$unit_path"
+install -m 0644 "$current_link/deploy/y2b-live-once-qhvPlcwJUvk.service" \
+  "$unit_dir/y2b-live-once-qhvPlcwJUvk.service"
 "$systemctl_cmd" daemon-reload
 "$systemctl_cmd" enable "$service"
 "$systemctl_cmd" start "$service"

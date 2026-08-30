@@ -1367,6 +1367,12 @@ elif [[ "$line" == *" maintenance renew "* ]]; then
   fi
   printf 'renewed\n'
 elif [[ "$line" == *" maintenance status "* ]]; then
+  if [[ "$line" != *" --owner "* ]]; then
+    # 健康检查探针：观察者视角不要求持锁，只证明进程能打开数据库并响应。
+    record_event "health-probe:$target"
+    printf '%s\n' '{"checked_at":"test","idle":true,"hold":null,"expired_hold":null,"blockers":[]}'
+    exit 0
+  fi
   owner=$(value_for --owner "$@")
   [[ -f "$DEPLOY_TEST_HOLD" && $(<"$DEPLOY_TEST_HOLD") == "$owner" ]] || exit 1
   count=0
@@ -2044,6 +2050,39 @@ PY
             fs::read_to_string(&fixture.service_state).unwrap(),
             "inactive\n"
         );
+    }
+
+    #[test]
+    fn deploy_ships_live_once_bypass_and_installs_its_unit() {
+        let fixture = deploy_fixture("success");
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        let live_once = fixture
+            .app_root
+            .join("releases")
+            .join(NEW_DEPLOY_REVISION)
+            .join("scripts/live_once.py");
+        assert!(live_once.is_file());
+        assert!(
+            fixture
+                .app_root
+                .join("current/scripts/live_once.py")
+                .is_file()
+        );
+        let unit =
+            fs::read_to_string(fixture.unit_dir.join("y2b-live-once-qhvPlcwJUvk.service")).unwrap();
+        let exec_start = unit
+            .lines()
+            .find(|line| line.starts_with("ExecStart="))
+            .unwrap();
+        let script = exec_start
+            .trim_start_matches("ExecStart=")
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert_eq!(script, "/opt/y2b/current/scripts/live_once.py");
+        let relative = script.strip_prefix("/opt/y2b/").unwrap();
+        assert!(fixture.app_root.join(relative).is_file());
     }
 
     #[test]
