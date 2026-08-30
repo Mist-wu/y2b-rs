@@ -75,7 +75,10 @@ def make_database(path: Path, schema_version: int = EXPECTED_SCHEMA_VERSION) -> 
         CREATE TABLE jobs(
           id TEXT PRIMARY KEY, channel_id INTEGER, video_id TEXT UNIQUE, url TEXT,
           title TEXT, status TEXT, transfer_mode TEXT, published_at TEXT,
-          discovered_at TEXT, error TEXT, created_at TEXT, updated_at TEXT, bvid TEXT
+          discovered_at TEXT, error TEXT, created_at TEXT, updated_at TEXT, bvid TEXT,
+          raw_video_path TEXT, duration_seconds REAL, width INTEGER, height INTEGER,
+          fps REAL, source_metadata_json TEXT, subtitle_attempt INTEGER,
+          subtitle_retry_at TEXT
         );
         CREATE UNIQUE INDEX idx_jobs_bvid_unique
           ON jobs(bvid) WHERE bvid IS NOT NULL;
@@ -694,6 +697,152 @@ class LiveOnceTests(unittest.TestCase):
             ).fetchone()[0]
             connection.close()
             self.assertEqual(status, "uploaded_original_pending_subtitle")
+
+    def test_upload_hold_worker_resumes_until_handoff_is_committed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = arguments(root)
+            args.hold_at = "2020-01-01T00:00:00Z"
+            item = LiveOnce(args)
+            item.save(bvid="BV1uxE16ZE7e")
+
+            def hold() -> bool:
+                return True
+
+            item.ensure_upload_hold = hold  # type: ignore[method-assign]
+            item.start_upload_hold_worker()
+            self.assertIsNotNone(item.hold_thread)
+            item.stop_upload_hold_worker()
+
+            # 交接提交后，即使 state 里已有 BVID 也不再恢复续租。
+            item.save(upload_recorded=True, upload_hold=False)
+            resumed = LiveOnce(args)
+            resumed.ensure_upload_hold = mock.Mock(return_value=True)
+            resumed.start_upload_hold_worker()
+            self.assertIsNone(resumed.hold_thread)
+            resumed.ensure_upload_hold.assert_not_called()
+
+    def test_execute_stops_hold_worker_only_after_handoff_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = arguments(root)
+            args.hold_at = "2020-01-01T00:00:00Z"
+            item = LiveOnce(args)
+            item.acquire_lock = mock.MagicMock()
+            item.validate_schema_version = mock.Mock()
+            item.backup_database = mock.Mock()
+            item.reserve_job = mock.Mock()
+            item.fetch_metadata = mock.Mock()
+            video = root / "video.mp4"
+            bvid = "BV1uxE16ZE7e"
+            item.capture_until_end = mock.Mock(return_value=video)
+            item.upload_video = mock.Mock(return_value=bvid)
+            item.wait_for_subtitle = mock.Mock()
+
+            def hold() -> bool:
+                return True
+
+            item.ensure_upload_hold = hold  # type: ignore[method-assign]
+            item.commit_upload_handoff = mock.Mock(
+                side_effect=RuntimeError("handoff failed")
+            )
+            with self.assertRaisesRegex(RuntimeError, "handoff failed"):
+                item.execute()
+            self.assertIsNotNone(item.hold_thread)
+            self.assertFalse(item.hold_stop.is_set())
+            item.stop_upload_hold_worker()
+
+            item.commit_upload_handoff = mock.Mock(return_value=None)
+            item.execute()
+            item.commit_upload_handoff.assert_called_once_with(video, bvid)
+            self.assertTrue(item.hold_stop.is_set())
+            item.wait_for_subtitle.assert_called_once_with(bvid)
+
+    def _handoff_item(self, root: Path) -> tuple[LiveOnce, str, Path]:
+        args = arguments(root)
+        args.hold_at = "2020-01-01T00:00:00Z"
+        make_database(Path(args.database))
+        item = LiveOnce(args)
+        item.reserve_job()
+        self.assertTrue(item.ensure_upload_hold())
+        bvid = "BV1uxE16ZE7e"
+        connection = sqlite3.connect(args.database)
+        connection.execute(
+            "UPDATE jobs SET bvid=? WHERE video_id='example123'", (bvid,)
+        )
+        connection.commit()
+        connection.close()
+        item.save(
+            bvid=bvid,
+            video_probe={"duration": 10.0, "width": 1920, "height": 1080},
+        )
+        video = root / "video.mp4"
+        video.write_bytes(b"video")
+        return item, bvid, video
+
+    def test_upload_handoff_persists_final_state_and_releases_hold_atomically(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            item, bvid, video = self._handoff_item(root)
+
+            item.commit_upload_handoff(video, bvid)
+
+            connection = sqlite3.connect(item.args.database)
+            status, stored_bvid = connection.execute(
+                "SELECT status,bvid FROM jobs WHERE video_id='example123'"
+            ).fetchone()
+            settings = dict(connection.execute("SELECT key,value FROM settings"))
+            hold_count = connection.execute(
+                "SELECT COUNT(*) FROM maintenance_hold"
+            ).fetchone()[0]
+            actions = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT action FROM maintenance_hold_events ORDER BY id"
+                )
+            ]
+            event_count = connection.execute(
+                "SELECT COUNT(*) FROM events WHERE job_id=?", (item.state["job_id"],)
+            ).fetchone()[0]
+            connection.close()
+            self.assertEqual(status, "uploaded_original_pending_subtitle")
+            self.assertEqual(stored_bvid, bvid)
+            self.assertIn(NEXT_SUBMIT_KEY, settings)
+            self.assertEqual(hold_count, 0)
+            self.assertEqual(actions, ["acquired", "released"])
+            self.assertEqual(event_count, 2)
+            self.assertTrue(item.state.get("upload_recorded"))
+            self.assertFalse(item.state.get("upload_hold"))
+
+    def test_upload_handoff_rolls_back_cooldown_and_hold_when_commit_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            item, bvid, video = self._handoff_item(root)
+
+            with mock.patch.object(
+                item, "record_hold_event", side_effect=RuntimeError("boom")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    item.commit_upload_handoff(video, bvid)
+
+            connection = sqlite3.connect(item.args.database)
+            status, stored_bvid = connection.execute(
+                "SELECT status,bvid FROM jobs WHERE video_id='example123'"
+            ).fetchone()
+            settings = dict(connection.execute("SELECT key,value FROM settings"))
+            hold_count = connection.execute(
+                "SELECT COUNT(*) FROM maintenance_hold"
+            ).fetchone()[0]
+            connection.close()
+            self.assertEqual(status, "paused")
+            self.assertEqual(stored_bvid, bvid)
+            self.assertNotIn(NEXT_SUBMIT_KEY, settings)
+            self.assertEqual(hold_count, 1)
+            self.assertFalse(item.state.get("upload_recorded"))
 
 
 if __name__ == "__main__":
