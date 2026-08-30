@@ -6,9 +6,10 @@ use crate::db::UploadCompletionTiming;
 use crate::model::{Job, JobStatus, PreparedUpload, PublicationMetadata, VideoMetadata};
 use crate::process::{ProcessFailure, run_monitored};
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -104,16 +105,120 @@ fn parse_biliup_submission(output: &str) -> Option<BiliupSubmissionResponse> {
         .next_back()
 }
 
-fn parse_creator_archives(output: &str) -> Vec<(String, String)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreatorArchive {
+    bvid: String,
+    title: String,
+    published_at: Option<DateTime<Utc>>,
+}
+
+fn parse_creator_published_at(value: &str) -> Option<DateTime<Utc>> {
+    let value = value.trim();
+    if let Ok(timestamp) = value.parse::<i64>() {
+        let (seconds, nanos) = if timestamp.unsigned_abs() >= 100_000_000_000 {
+            (
+                timestamp.div_euclid(1_000),
+                timestamp.rem_euclid(1_000) as u32 * 1_000_000,
+            )
+        } else {
+            (timestamp, 0)
+        };
+        if let Some(parsed) = DateTime::from_timestamp(seconds, nanos) {
+            return Some(parsed);
+        }
+    }
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        return Some(parsed.with_timezone(&Utc));
+    }
+    ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]
+        .into_iter()
+        .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
+        .and_then(|parsed| {
+            chrono_tz::Asia::Shanghai
+                .from_local_datetime(&parsed)
+                .single()
+        })
+        .map(|parsed| parsed.with_timezone(&Utc))
+}
+
+fn parse_creator_archives(output: &str) -> Vec<CreatorArchive> {
     output
         .lines()
         .filter_map(|line| {
-            let mut columns = line.splitn(3, '\t');
+            let mut columns = line.split('\t');
             let bvid = columns.next()?.trim();
             let title = columns.next()?.trim();
-            valid_bvid(bvid).then(|| (bvid.to_string(), title.to_string()))
+            valid_bvid(bvid).then(|| CreatorArchive {
+                bvid: bvid.to_string(),
+                title: title.to_string(),
+                published_at: columns.find_map(parse_creator_published_at),
+            })
         })
         .collect()
+}
+
+fn reconciliation_bvid(
+    archives: &[CreatorArchive],
+    expected_title: &str,
+    attempt_started_at: Option<DateTime<Utc>>,
+    occupied_bvids: &HashSet<String>,
+) -> Result<String> {
+    let Some(attempt_started_at) = attempt_started_at else {
+        bail!(
+            "核对证据不足：缺少本次投稿 attempt 开始时间；任务保持 upload_uncertain，请人工提供 BVID"
+        )
+    };
+    let title_matches = archives
+        .iter()
+        .filter(|archive| archive.title == expected_title)
+        .collect::<Vec<_>>();
+    if title_matches.is_empty() {
+        bail!(
+            "创作中心最近稿件中没有标题完全匹配的记录；任务保持 upload_uncertain，请人工提供 BVID: {expected_title}"
+        )
+    }
+    let missing_published_at = title_matches
+        .iter()
+        .filter(|archive| archive.published_at.is_none())
+        .map(|archive| archive.bvid.as_str())
+        .collect::<Vec<_>>();
+    if !missing_published_at.is_empty() {
+        bail!(
+            "核对证据不足：同名稿件 {} 缺少可验证的稿件发布时间；任务保持 upload_uncertain，请人工提供 BVID",
+            missing_published_at.join(", ")
+        )
+    }
+
+    let mut candidates = Vec::new();
+    let mut rejected_evidence = Vec::new();
+    for archive in title_matches {
+        let published_at = archive.published_at.expect("上方已排除缺少发布时间的稿件");
+        if published_at <= attempt_started_at {
+            rejected_evidence.push(format!(
+                "{} 的稿件发布时间 {} 不晚于 attempt 开始时间 {}",
+                archive.bvid,
+                published_at.to_rfc3339(),
+                attempt_started_at.to_rfc3339()
+            ));
+        } else if occupied_bvids.contains(&archive.bvid) {
+            rejected_evidence.push(format!("{} 已被其他 job 占用", archive.bvid));
+        } else {
+            candidates.push(archive.bvid.clone());
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [bvid] => Ok(bvid.clone()),
+        [] => bail!(
+            "核对证据不足：{}；任务保持 upload_uncertain，请人工提供 BVID",
+            rejected_evidence.join("；")
+        ),
+        _ => bail!(
+            "创作中心存在 {} 条同时满足标题、attempt 时间窗、稿件发布时间和 BVID 未占用条件的记录；任务保持 upload_uncertain，请人工提供 BVID",
+            candidates.len()
+        ),
+    }
 }
 
 pub(super) fn ensure_prepared_file(path: &Path, label: &str) -> Result<()> {
@@ -124,8 +229,8 @@ pub(super) fn ensure_prepared_file(path: &Path, label: &str) -> Result<()> {
 }
 
 impl Pipeline {
-    /// 对 `upload_uncertain` 任务读取创作中心最近稿件，按持久化投稿标题唯一匹配。
-    /// 找不到或同名多条时保持不确定态，绝不自动重投。
+    /// 对 `upload_uncertain` 任务读取创作中心最近稿件，同时核对标题、投稿
+    /// attempt 时间窗、稿件发布时间和 BVID 归属；证据不足时绝不自动确认或重投。
     pub async fn reconcile_uncertain_upload(&self, job_id: &str) -> Result<String> {
         let job = self
             .db
@@ -162,25 +267,22 @@ impl Pipeline {
             .arg("--max-pages")
             .arg("5");
         let output = run_monitored(command, Duration::from_secs(120)).await?;
-        let mut matches = parse_creator_archives(&output.stdout)
-            .into_iter()
-            .filter(|(_, title)| title == &publication.title)
-            .map(|(bvid, _)| bvid)
-            .collect::<Vec<_>>();
-        matches.sort_unstable();
-        matches.dedup();
-        let bvid = match matches.as_slice() {
-            [bvid] => bvid.clone(),
-            [] => bail!(
-                "创作中心最近稿件中没有标题完全匹配的记录，任务保持 upload_uncertain: {}",
-                publication.title
-            ),
-            _ => bail!(
-                "创作中心存在 {} 条同名稿件，无法唯一确认，任务保持 upload_uncertain: {}",
-                matches.len(),
-                publication.title
-            ),
-        };
+        let archives = parse_creator_archives(&output.stdout);
+        let mut occupied_bvids = HashSet::new();
+        for archive in archives
+            .iter()
+            .filter(|archive| archive.title == publication.title)
+        {
+            if self.db.bvid_owned_by_other_job(job_id, &archive.bvid)? {
+                occupied_bvids.insert(archive.bvid.clone());
+            }
+        }
+        let bvid = reconciliation_bvid(
+            &archives,
+            &publication.title,
+            self.db.uncertain_upload_started_at(job_id)?,
+            &occupied_bvids,
+        )?;
         let next_submit_at =
             self.bilibili_submission_deadline(self.config.bilibili.submit_interval_seconds)?;
         let subtitle_queued = self.db.confirm_uncertain_upload(
@@ -572,11 +674,92 @@ mod tests {
     }
 
     #[test]
-    fn creator_archive_parser_accepts_only_tsv_rows_with_exact_bvids() {
+    fn creator_archive_parser_requires_exact_bvid_and_reads_publication_time() {
         let rows = parse_creator_archives(
-            "2026-08-30 INFO login ok\nBV1uxE16ZE7e\t标题 A\t\u{1b}[1;92m已通过\u{1b}[0m\nnot-a-bvid\t标题 B\t失败\n",
+            "2026-08-30 INFO login ok\nBV1uxE16ZE7e\t标题 A\t\u{1b}[1;92m已通过\u{1b}[0m\t2026-08-30T01:02:03Z\nnot-a-bvid\t标题 B\t失败\t2026-08-30T01:02:03Z\n",
         );
-        assert_eq!(rows, vec![("BV1uxE16ZE7e".into(), "标题 A".into())]);
+        assert_eq!(
+            rows,
+            vec![CreatorArchive {
+                bvid: "BV1uxE16ZE7e".into(),
+                title: "标题 A".into(),
+                published_at: Some("2026-08-30T01:02:03Z".parse().unwrap()),
+            }]
+        );
+    }
+
+    #[test]
+    fn uncertain_reconciliation_requires_attempt_start_evidence() {
+        let archives = [CreatorArchive {
+            bvid: "BV1uxE16ZE7e".into(),
+            title: "同名稿件".into(),
+            published_at: Some("2026-08-30T01:02:03Z".parse().unwrap()),
+        }];
+        let error = reconciliation_bvid(&archives, "同名稿件", None, &HashSet::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("缺少本次投稿 attempt 开始时间"));
+        assert!(error.contains("请人工提供 BVID"));
+    }
+
+    #[test]
+    fn uncertain_reconciliation_requires_archive_publication_time() {
+        let archives = [CreatorArchive {
+            bvid: "BV1uxE16ZE7e".into(),
+            title: "同名稿件".into(),
+            published_at: None,
+        }];
+        let started_at = "2026-08-30T01:00:00Z".parse().unwrap();
+        let error = reconciliation_bvid(&archives, "同名稿件", Some(started_at), &HashSet::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("缺少可验证的稿件发布时间"));
+        assert!(error.contains("请人工提供 BVID"));
+    }
+
+    #[test]
+    fn uncertain_reconciliation_rejects_same_title_archive_before_attempt() {
+        let archives = [CreatorArchive {
+            bvid: "BV1uxE16ZE7e".into(),
+            title: "同名稿件".into(),
+            published_at: Some("2026-08-30T00:59:59Z".parse().unwrap()),
+        }];
+        let started_at = "2026-08-30T01:00:00Z".parse().unwrap();
+        let error = reconciliation_bvid(&archives, "同名稿件", Some(started_at), &HashSet::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("不晚于 attempt 开始时间"));
+        assert!(error.contains("请人工提供 BVID"));
+    }
+
+    #[test]
+    fn uncertain_reconciliation_requires_unoccupied_bvid() {
+        let archives = [CreatorArchive {
+            bvid: "BV1uxE16ZE7e".into(),
+            title: "同名稿件".into(),
+            published_at: Some("2026-08-30T01:00:01Z".parse().unwrap()),
+        }];
+        let started_at = "2026-08-30T01:00:00Z".parse().unwrap();
+        let occupied = HashSet::from(["BV1uxE16ZE7e".to_string()]);
+        let error = reconciliation_bvid(&archives, "同名稿件", Some(started_at), &occupied)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("已被其他 job 占用"));
+        assert!(error.contains("请人工提供 BVID"));
+    }
+
+    #[test]
+    fn uncertain_reconciliation_accepts_only_complete_evidence() {
+        let archives = [CreatorArchive {
+            bvid: "BV1uxE16ZE7e".into(),
+            title: "同名稿件".into(),
+            published_at: Some("2026-08-30T01:00:01Z".parse().unwrap()),
+        }];
+        let started_at = "2026-08-30T01:00:00Z".parse().unwrap();
+        assert_eq!(
+            reconciliation_bvid(&archives, "同名稿件", Some(started_at), &HashSet::new()).unwrap(),
+            "BV1uxE16ZE7e"
+        );
     }
 
     #[tokio::test]
