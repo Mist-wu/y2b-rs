@@ -36,6 +36,25 @@ pub struct NewVideoCandidate<'a> {
     pub source: CandidateSource,
 }
 
+/// 投稿完成事务共同使用的字幕首次检查时间和全局投稿冷却时间。
+pub struct UploadCompletionTiming {
+    pub subtitle_delay_seconds: i64,
+    pub next_submit_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubtitleAttempt {
+    pub id: String,
+    pub bvid: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubtitleAttemptDecision {
+    Submit(String),
+    QueryOnly(SubtitleAttempt),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DiscoveryQuota {
     pub used: u32,
@@ -72,7 +91,7 @@ pub(crate) const UPLOAD_CLAIM_KIND: &str = "upload";
 pub const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
 pub const BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
 /// 当前二进制能够完整理解的数据库迁移版本。
-pub const CURRENT_SCHEMA_VERSION: i64 = 19;
+pub const CURRENT_SCHEMA_VERSION: i64 = 21;
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -444,9 +463,65 @@ impl Database {
             "#,
         )?;
         self.conn().execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(19,CURRENT_TIMESTAMP)",
+            [],
+        )?;
+        // v20: 一个 BVID 只能归属一个任务。NULL 表示尚未投稿，不参与唯一性约束。
+        // 先单独检查历史重复值，避免把 SQLite 的索引错误直接暴露给运维人员。
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let duplicate: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT bvid,COUNT(*) FROM jobs WHERE bvid IS NOT NULL \
+                 GROUP BY bvid HAVING COUNT(*)>1 ORDER BY bvid LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((bvid, count)) = duplicate {
+            anyhow::bail!(
+                "迁移 v20 失败：jobs.bvid={bvid:?} 已被 {count} 个任务重复占用，请先人工修复重复 BVID"
+            )
+        }
+        tx.execute_batch(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_bvid_unique
+              ON jobs(bvid) WHERE bvid IS NOT NULL;
+            "#,
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(20,CURRENT_TIMESTAMP)",
+            [],
+        )?;
+        tx.commit()?;
+        // v21: CC 字幕提交也使用持久化 attempt。started/uncertain/confirmed/reconciled
+        // 都禁止创建下一次提交；只有平台明确 rejected 后才允许新 attempt。
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS subtitle_attempts(
+              id TEXT PRIMARY KEY,
+              job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+              bvid TEXT NOT NULL,
+              status TEXT NOT NULL CHECK(status IN(
+                'started','rejected','uncertain','confirmed','reconciled'
+              )),
+              detail TEXT,
+              started_at TEXT NOT NULL,
+              finished_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_subtitle_attempts_job
+              ON subtitle_attempts(job_id, started_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_subtitle_attempts_blocking
+              ON subtitle_attempts(job_id)
+              WHERE status IN('started','uncertain','confirmed','reconciled');
+            "#,
+        )?;
+        tx.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,CURRENT_TIMESTAMP)",
             [CURRENT_SCHEMA_VERSION],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1194,6 +1269,16 @@ impl Database {
             [bvid],
         )
     }
+
+    /// 核对投稿时确认候选 BVID 没有归属于另一个任务。
+    pub fn bvid_owned_by_other_job(&self, id: &str, bvid: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE bvid=? AND id<>?)",
+            params![bvid, id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// 已投稿且待补 CC 字幕的任务：完成或已直传待补字幕，且有 BVID。
     pub fn jobs_awaiting_subtitle(&self) -> Result<Vec<Job>> {
         let c = self.conn();
@@ -1451,8 +1536,14 @@ impl Database {
             params![&now, &now],
         )?;
         c.execute(
+            "UPDATE subtitle_attempts SET status='uncertain',detail=COALESCE(detail,'服务重启时字幕提交结果不确定'),finished_at=? \
+             WHERE status='started' AND job_id IN(SELECT id FROM jobs WHERE claim_kind=? \
+               AND (claim_expires_at IS NULL OR claim_expires_at<=?))",
+            params![&now, SUBTITLE_CLAIM_KIND, &now],
+        )?;
+        c.execute(
             "UPDATE jobs SET claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
-             WHERE status='uploaded_original_pending_subtitle' AND claim_kind=? \
+             WHERE status IN('completed','uploaded_original_pending_subtitle') AND claim_kind=? \
                AND (claim_expires_at IS NULL OR claim_expires_at<=?)",
             params![&now, SUBTITLE_CLAIM_KIND, &now],
         )?;
@@ -1570,7 +1661,21 @@ impl Database {
         Ok(Some(attempt_id))
     }
 
-    /// biliup 明确返回成功后，把 attempt 与任务终态放在同一事务提交。
+    /// 返回当前不确定投稿 attempt 的开始时间，供创作中心核对时间窗。
+    pub fn uncertain_upload_started_at(&self, id: &str) -> Result<Option<DateTime<Utc>>> {
+        let started_at = self
+            .conn()
+            .query_row(
+                "SELECT started_at FROM upload_attempts \
+                 WHERE job_id=? AND status='uncertain' ORDER BY started_at DESC LIMIT 1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        started_at.map(parse).transpose().map_err(Into::into)
+    }
+
+    /// biliup 明确返回成功后，把 attempt、任务终态和投稿冷却放在同一事务提交。
     pub fn finish_upload_attempt(
         &self,
         id: &str,
@@ -1578,7 +1683,7 @@ impl Database {
         bvid: &str,
         completion_status: JobStatus,
         mode: TransferMode,
-        subtitle_delay_seconds: i64,
+        timing: UploadCompletionTiming,
     ) -> Result<bool> {
         if !matches!(
             completion_status,
@@ -1596,7 +1701,7 @@ impl Database {
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let subtitle_retry_at = queue_subtitle
-            .then(|| (now + chrono::Duration::seconds(subtitle_delay_seconds)).to_rfc3339());
+            .then(|| (now + chrono::Duration::seconds(timing.subtitle_delay_seconds)).to_rfc3339());
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let attempt_changed = tx.execute(
@@ -1619,6 +1724,17 @@ impl Database {
         )?;
         if attempt_changed != 1 || job_changed != 1 {
             anyhow::bail!("任务 {id} 的投稿 attempt {attempt_id} 已失效")
+        }
+        if let Some(next_submit_at) = timing.next_submit_at {
+            tx.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![
+                    NEXT_BILIBILI_SUBMIT_AT,
+                    next_submit_at.to_rfc3339(),
+                    &now_text
+                ],
+            )?;
         }
         tx.commit()?;
         Ok(queue_subtitle)
@@ -1679,14 +1795,14 @@ impl Database {
         Ok(())
     }
 
-    /// 创作中心已核对到唯一稿件后，安全确认不确定态任务。
+    /// 创作中心已核对到唯一稿件后，连同投稿冷却安全确认不确定态任务。
     pub fn confirm_uncertain_upload(
         &self,
         id: &str,
         bvid: &str,
         completion_status: JobStatus,
         mode: TransferMode,
-        subtitle_delay_seconds: i64,
+        timing: UploadCompletionTiming,
     ) -> Result<bool> {
         if !matches!(
             completion_status,
@@ -1704,7 +1820,7 @@ impl Database {
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let subtitle_retry_at = queue_subtitle
-            .then(|| (now + chrono::Duration::seconds(subtitle_delay_seconds)).to_rfc3339());
+            .then(|| (now + chrono::Duration::seconds(timing.subtitle_delay_seconds)).to_rfc3339());
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let attempt_changed = tx.execute(
@@ -1726,6 +1842,17 @@ impl Database {
         )?;
         if attempt_changed != 1 || changed != 1 {
             anyhow::bail!("任务 {id} 不在有效的投稿结果不确定状态")
+        }
+        if let Some(next_submit_at) = timing.next_submit_at {
+            tx.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![
+                    NEXT_BILIBILI_SUBMIT_AT,
+                    next_submit_at.to_rfc3339(),
+                    &now_text
+                ],
+            )?;
         }
         tx.commit()?;
         Ok(queue_subtitle)
@@ -1913,6 +2040,178 @@ impl Database {
                 id
             ],
         )
+    }
+
+    /// 返回会阻止再次提交的字幕 attempt。rejected 是唯一允许新 attempt 的终态。
+    pub(crate) fn blocking_subtitle_attempt(&self, id: &str) -> Result<Option<SubtitleAttempt>> {
+        self.conn()
+            .query_row(
+                "SELECT id,bvid,status FROM subtitle_attempts \
+                 WHERE job_id=? AND status<>'rejected' \
+                 ORDER BY started_at DESC,id DESC LIMIT 1",
+                [id],
+                |row| {
+                    Ok(SubtitleAttempt {
+                        id: row.get(0)?,
+                        bvid: row.get(1)?,
+                        status: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// 真正调用字幕提交接口前创建 attempt；若已有非 rejected attempt，只允许查询。
+    pub(crate) fn begin_subtitle_attempt(
+        &self,
+        id: &str,
+        bvid: &str,
+    ) -> Result<SubtitleAttemptDecision> {
+        let attempt_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let claim_valid: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=? AND bvid=? \
+             AND status IN('completed','uploaded_original_pending_subtitle') \
+             AND claim_kind=? AND claim_owner=?)",
+            params![id, bvid, SUBTITLE_CLAIM_KIND, self.claim_owner.as_ref()],
+            |row| row.get(0),
+        )?;
+        if !claim_valid {
+            anyhow::bail!("任务 {id} 的字幕领取权已丢失或 BVID 已改变")
+        }
+        let blocking = tx
+            .query_row(
+                "SELECT id,bvid,status FROM subtitle_attempts \
+                 WHERE job_id=? AND status<>'rejected' \
+                 ORDER BY started_at DESC,id DESC LIMIT 1",
+                [id],
+                |row| {
+                    Ok(SubtitleAttempt {
+                        id: row.get(0)?,
+                        bvid: row.get(1)?,
+                        status: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(blocking) = blocking {
+            tx.commit()?;
+            return Ok(SubtitleAttemptDecision::QueryOnly(blocking));
+        }
+        tx.execute(
+            "INSERT INTO subtitle_attempts(id,job_id,bvid,status,started_at) \
+             VALUES(?,?,?,'started',?)",
+            params![&attempt_id, id, bvid, &now],
+        )?;
+        tx.commit()?;
+        Ok(SubtitleAttemptDecision::Submit(attempt_id))
+    }
+
+    /// 平台明确拒绝后结束 attempt；这是唯一允许按策略再次提交的分支。
+    pub(crate) fn reject_subtitle_attempt(
+        &self,
+        id: &str,
+        attempt_id: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE subtitle_attempts SET status='rejected',detail=?,finished_at=? \
+             WHERE id=? AND job_id=? AND status='started'",
+            params![detail, Utc::now().to_rfc3339(), attempt_id, id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} 已失效")
+        }
+        Ok(())
+    }
+
+    /// 响应丢失、超时或进程中断后固定为 uncertain，之后只能查询平台。
+    pub(crate) fn mark_subtitle_attempt_uncertain(
+        &self,
+        id: &str,
+        attempt_id: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE subtitle_attempts SET status='uncertain',detail=?,finished_at=? \
+             WHERE id=? AND job_id=? AND status IN('started','uncertain')",
+            params![detail, Utc::now().to_rfc3339(), attempt_id, id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} 已失效")
+        }
+        Ok(())
+    }
+
+    /// 平台明确返回成功后，把 attempt 与任务/领取终态放在同一事务。
+    pub(crate) fn finish_subtitle_attempt(
+        &self,
+        id: &str,
+        attempt_id: &str,
+        mark_completed: bool,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let attempt_changed = tx.execute(
+            "UPDATE subtitle_attempts SET status='confirmed',detail='Bilibili 明确返回字幕提交成功',finished_at=? \
+             WHERE id=? AND job_id=? AND status='started'",
+            params![&now, attempt_id, id],
+        )?;
+        let job_changed = tx.execute(
+            "UPDATE jobs SET status=CASE WHEN ? THEN 'completed' ELSE status END,error=NULL,subtitle_retry_at=CASE WHEN ? THEN NULL ELSE subtitle_retry_at END,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE id=? AND claim_kind=? AND claim_owner=?",
+            params![
+                mark_completed,
+                mark_completed,
+                &now,
+                id,
+                SUBTITLE_CLAIM_KIND,
+                self.claim_owner.as_ref()
+            ],
+        )?;
+        if attempt_changed != 1 || job_changed != 1 {
+            anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} 已失效")
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 查询到平台已有 zh 字幕后，把不确定 attempt 核对为 reconciled 并完成任务。
+    pub(crate) fn reconcile_subtitle_attempt(
+        &self,
+        id: &str,
+        attempt_id: &str,
+        mark_completed: bool,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let attempt_changed = tx.execute(
+            "UPDATE subtitle_attempts SET status='reconciled',detail='查询到平台已有 zh 字幕',finished_at=? \
+             WHERE id=? AND job_id=? AND status IN('started','uncertain')",
+            params![&now, attempt_id, id],
+        )?;
+        let job_changed = tx.execute(
+            "UPDATE jobs SET status=CASE WHEN ? THEN 'completed' ELSE status END,error=NULL,subtitle_retry_at=CASE WHEN ? THEN NULL ELSE subtitle_retry_at END,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE id=? AND claim_kind=? AND claim_owner=?",
+            params![
+                mark_completed,
+                mark_completed,
+                &now,
+                id,
+                SUBTITLE_CLAIM_KIND,
+                self.claim_owner.as_ref()
+            ],
+        )?;
+        if attempt_changed != 1 || job_changed != 1 {
+            anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} 无法核对")
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// CC 补交失败：计数加一并推迟 `delay_seconds` 后才允许再次领取。
@@ -2600,6 +2899,137 @@ mod tests {
             db.get_job("job-v3").unwrap().unwrap().transfer_mode,
             TransferMode::Translated
         );
+    }
+
+    #[test]
+    fn migrates_v19_without_losing_jobs_or_bvids() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("v19.db");
+        let old = Database::open(&path).unwrap();
+        let id = old
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "v19-video",
+                url: "https://youtu.be/v19-video",
+                title: Some("v19 保留稿件"),
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        old.set_job_bvid(&id, "BV1uxE16ZE7e").unwrap();
+        old.conn()
+            .execute_batch(
+                "DROP TABLE subtitle_attempts; \
+                 DROP INDEX idx_jobs_bvid_unique; \
+                 DELETE FROM schema_migrations WHERE version>=20;",
+            )
+            .unwrap();
+        drop(old);
+
+        let migrated = Database::open(&path).unwrap();
+        assert_eq!(migrated.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        let job = migrated.get_job(&id).unwrap().unwrap();
+        assert_eq!(job.title.as_deref(), Some("v19 保留稿件"));
+        assert_eq!(job.bvid.as_deref(), Some("BV1uxE16ZE7e"));
+        let index_exists: bool = migrated
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type='index' AND name='idx_jobs_bvid_unique')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_exists);
+        let subtitle_attempts_exists: bool = migrated
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type='table' AND name='subtitle_attempts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(subtitle_attempts_exists);
+    }
+
+    #[test]
+    fn v20_migration_reports_duplicate_bvid_before_creating_index() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("v19-duplicate-bvid.db");
+        let old = Database::open(&path).unwrap();
+        let mut ids = Vec::new();
+        for video_id in ["duplicate-one", "duplicate-two"] {
+            ids.push(
+                old.create_job(NewJob {
+                    channel_id: None,
+                    video_id,
+                    url: &format!("https://youtu.be/{video_id}"),
+                    title: None,
+                    published: None,
+                    updated: None,
+                    transfer_mode: TransferMode::Direct,
+                })
+                .unwrap()
+                .unwrap(),
+            );
+        }
+        old.conn()
+            .execute_batch(
+                "DROP TABLE subtitle_attempts; \
+                 DROP INDEX idx_jobs_bvid_unique; \
+                 DELETE FROM schema_migrations WHERE version>=20;",
+            )
+            .unwrap();
+        old.conn()
+            .execute(
+                "UPDATE jobs SET bvid='BV1uxE16ZE7e' WHERE id IN (?,?)",
+                params![&ids[0], &ids[1]],
+            )
+            .unwrap();
+        drop(old);
+
+        let error = match Database::open(&path) {
+            Ok(_) => panic!("重复 BVID 不应迁移成功"),
+            Err(error) => error,
+        };
+        let detail = error.to_string();
+        assert!(detail.contains("迁移 v20 失败"), "{detail}");
+        assert!(detail.contains("BV1uxE16ZE7e"), "{detail}");
+        assert!(detail.contains("2 个任务重复占用"), "{detail}");
+    }
+
+    #[test]
+    fn jobs_bvid_is_unique_but_allows_multiple_nulls() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("unique-bvid.db")).unwrap();
+        let mut ids = Vec::new();
+        for video_id in ["null-bvid-one", "null-bvid-two"] {
+            ids.push(
+                db.create_job(NewJob {
+                    channel_id: None,
+                    video_id,
+                    url: &format!("https://youtu.be/{video_id}"),
+                    title: None,
+                    published: None,
+                    updated: None,
+                    transfer_mode: TransferMode::Direct,
+                })
+                .unwrap()
+                .unwrap(),
+            );
+        }
+        assert!(
+            ids.iter()
+                .all(|id| db.get_job(id).unwrap().unwrap().bvid.is_none())
+        );
+
+        db.set_job_bvid(&ids[0], "BV1uxE16ZE7e").unwrap();
+        let error = db.set_job_bvid(&ids[1], "BV1uxE16ZE7e").unwrap_err();
+        assert!(error.to_string().contains("UNIQUE constraint failed"));
+        assert!(db.get_job(&ids[1]).unwrap().unwrap().bvid.is_none());
     }
 
     #[test]
@@ -3305,6 +3735,25 @@ mod tests {
         );
     }
 
+    fn claimed_subtitle_job(db: &Database, video_id: &str, bvid: &str) -> (String, Job) {
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id,
+                url: &format!("https://youtu.be/{video_id}"),
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        db.set_job_bvid(&id, bvid).unwrap();
+        db.queue_pending_subtitle(&id, -1).unwrap();
+        let job = db.claim_next_pending_subtitle_job(16).unwrap().unwrap();
+        (id, job)
+    }
+
     #[test]
     fn subtitle_claim_blocks_automatic_and_manual_duplicate_submission() {
         let t = tempfile::tempdir().unwrap();
@@ -3359,6 +3808,238 @@ mod tests {
                 .defer_claimed_pending_subtitle(&id, "stale", 60)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn uncertain_subtitle_attempt_allows_only_query_and_reconciliation() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("subtitle-uncertain.db")).unwrap();
+        let (id, _) = claimed_subtitle_job(&db, "subtitle-response-lost", "BV1subtitle1");
+        let attempt_id = match db.begin_subtitle_attempt(&id, "BV1subtitle1").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("首次字幕提交未创建 attempt: {decision:?}"),
+        };
+        // 故障注入：平台已经接受，但客户端响应丢失。
+        db.mark_subtitle_attempt_uncertain(&id, &attempt_id, "平台响应丢失")
+            .unwrap();
+        db.defer_claimed_pending_subtitle(&id, "仅查询平台", -1)
+            .unwrap();
+        db.claim_next_pending_subtitle_job(16).unwrap().unwrap();
+
+        let blocking = db.begin_subtitle_attempt(&id, "BV1subtitle1").unwrap();
+        assert_eq!(
+            blocking,
+            SubtitleAttemptDecision::QueryOnly(SubtitleAttempt {
+                id: attempt_id.clone(),
+                bvid: "BV1subtitle1".into(),
+                status: "uncertain".into(),
+            })
+        );
+        let attempt_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM subtitle_attempts WHERE job_id=?",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_count, 1, "不确定结果后又创建了第二次 submit");
+
+        // 只读查询一旦看到平台已有 zh，才把 attempt 核对成功。
+        db.reconcile_subtitle_attempt(&id, &attempt_id, true)
+            .unwrap();
+        assert_eq!(
+            db.get_job(&id).unwrap().unwrap().status,
+            JobStatus::Completed
+        );
+        let status: String = db
+            .conn()
+            .query_row(
+                "SELECT status FROM subtitle_attempts WHERE id=?",
+                [&attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "reconciled");
+    }
+
+    #[test]
+    fn exhausted_uncertain_subtitle_attempt_stays_manual_and_query_only() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("subtitle-manual.db")).unwrap();
+        let (id, _) = claimed_subtitle_job(&db, "subtitle-manual", "BV1subtitle6");
+        let attempt_id = match db.begin_subtitle_attempt(&id, "BV1subtitle6").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("首次字幕提交未创建 attempt: {decision:?}"),
+        };
+        db.mark_subtitle_attempt_uncertain(&id, &attempt_id, "长期无法确认")
+            .unwrap();
+        db.exhaust_claimed_pending_subtitle(&id, 16, "投稿结果无法确认，已转人工")
+            .unwrap();
+
+        assert!(db.next_pending_subtitle_job(16).unwrap().is_none());
+        let job = db.get_job(&id).unwrap().unwrap();
+        assert_eq!(job.subtitle_attempt, 16);
+        assert!(job.error.as_deref().unwrap().contains("已转人工"));
+        db.claim_subtitle_job_now(&id).unwrap().unwrap();
+        assert!(matches!(
+            db.begin_subtitle_attempt(&id, "BV1subtitle6").unwrap(),
+            SubtitleAttemptDecision::QueryOnly(_)
+        ));
+    }
+
+    #[test]
+    fn rejected_subtitle_attempt_allows_policy_retry() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("subtitle-rejected.db")).unwrap();
+        let (id, _) = claimed_subtitle_job(&db, "subtitle-rejected", "BV1subtitle2");
+        let first_attempt = match db.begin_subtitle_attempt(&id, "BV1subtitle2").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("首次字幕提交未创建 attempt: {decision:?}"),
+        };
+        db.reject_subtitle_attempt(&id, &first_attempt, "code=1001 平台明确拒绝")
+            .unwrap();
+
+        let second_attempt = match db.begin_subtitle_attempt(&id, "BV1subtitle2").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("rejected 后未允许策略重试: {decision:?}"),
+        };
+        assert_ne!(first_attempt, second_attempt);
+        let statuses: Vec<String> = db
+            .conn()
+            .prepare("SELECT status FROM subtitle_attempts WHERE job_id=? ORDER BY started_at,id")
+            .unwrap()
+            .query_map([&id], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(statuses, ["rejected", "started"]);
+    }
+
+    #[test]
+    fn interrupted_subtitle_attempt_becomes_uncertain_after_restart() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("subtitle-interrupted.db");
+        let first = Database::open(&path).unwrap();
+        let (id, _) = claimed_subtitle_job(&first, "subtitle-interrupted", "BV1subtitle3");
+        let attempt_id = match first.begin_subtitle_attempt(&id, "BV1subtitle3").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("首次字幕提交未创建 attempt: {decision:?}"),
+        };
+        first
+            .conn()
+            .execute(
+                "UPDATE jobs SET claim_expires_at=? WHERE id=?",
+                params![
+                    (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
+                    &id
+                ],
+            )
+            .unwrap();
+
+        let restarted = Database::open(&path).unwrap();
+        restarted.recover_incomplete_jobs().unwrap();
+        let attempt = restarted.blocking_subtitle_attempt(&id).unwrap().unwrap();
+        assert_eq!(attempt.id, attempt_id);
+        assert_eq!(attempt.status, "uncertain");
+        restarted
+            .claim_next_pending_subtitle_job(16)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            restarted
+                .begin_subtitle_attempt(&id, "BV1subtitle3")
+                .unwrap(),
+            SubtitleAttemptDecision::QueryOnly(_)
+        ));
+        let attempt_count: i64 = restarted
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM subtitle_attempts WHERE job_id=?",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_count, 1);
+    }
+
+    #[test]
+    fn subtitle_success_with_local_commit_failure_blocks_resubmit() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("subtitle-commit-failure.db")).unwrap();
+        let (id, _) = claimed_subtitle_job(&db, "subtitle-commit-failure", "BV1subtitle5");
+        let attempt_id = match db.begin_subtitle_attempt(&id, "BV1subtitle5").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("首次字幕提交未创建 attempt: {decision:?}"),
+        };
+        db.conn()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_subtitle_job_finish
+                BEFORE UPDATE ON jobs
+                WHEN OLD.id=NEW.id AND NEW.claim_kind IS NULL
+                BEGIN
+                  SELECT RAISE(ABORT, '模拟字幕平台成功后的本地提交失败');
+                END;
+                "#,
+            )
+            .unwrap();
+
+        let error = db
+            .finish_subtitle_attempt(&id, &attempt_id, true)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("模拟字幕平台成功后的本地提交失败")
+        );
+        let status: String = db
+            .conn()
+            .query_row(
+                "SELECT status FROM subtitle_attempts WHERE id=?",
+                [&attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "started", "事务失败后 attempt 被写成了半完成状态");
+        db.mark_subtitle_attempt_uncertain(&id, &attempt_id, "本地确认事务失败")
+            .unwrap();
+        db.conn()
+            .execute_batch("DROP TRIGGER fail_subtitle_job_finish")
+            .unwrap();
+        db.defer_claimed_pending_subtitle(&id, "仅查询平台", -1)
+            .unwrap();
+        db.claim_next_pending_subtitle_job(16).unwrap().unwrap();
+        assert!(matches!(
+            db.begin_subtitle_attempt(&id, "BV1subtitle5").unwrap(),
+            SubtitleAttemptDecision::QueryOnly(_)
+        ));
+    }
+
+    #[test]
+    fn confirmed_subtitle_attempt_finishes_with_job_atomically() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("subtitle-confirmed.db")).unwrap();
+        let (id, _) = claimed_subtitle_job(&db, "subtitle-confirmed", "BV1subtitle4");
+        let attempt_id = match db.begin_subtitle_attempt(&id, "BV1subtitle4").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("首次字幕提交未创建 attempt: {decision:?}"),
+        };
+        db.finish_subtitle_attempt(&id, &attempt_id, true).unwrap();
+
+        assert_eq!(
+            db.get_job(&id).unwrap().unwrap().status,
+            JobStatus::Completed
+        );
+        let status: String = db
+            .conn()
+            .query_row(
+                "SELECT status FROM subtitle_attempts WHERE id=?",
+                [&attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "confirmed");
     }
 
     #[test]
@@ -3497,7 +4178,10 @@ mod tests {
                 "BV1uxE16ZE7e",
                 JobStatus::Completed,
                 TransferMode::Translated,
-                90,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: 90,
+                    next_submit_at: None,
+                },
             )
             .is_err()
         );
@@ -3507,6 +4191,7 @@ mod tests {
         );
         assert!(db.prepared_upload(&id).unwrap().is_some());
 
+        let next_submit_at = Utc::now() + chrono::Duration::minutes(30);
         assert!(
             db.finish_upload_attempt(
                 &id,
@@ -3514,7 +4199,10 @@ mod tests {
                 "BV1uxE16ZE7e",
                 JobStatus::Completed,
                 TransferMode::Translated,
-                90,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: 90,
+                    next_submit_at: Some(next_submit_at),
+                },
             )
             .unwrap()
         );
@@ -3532,6 +4220,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attempt, ("succeeded".into(), Some("BV1uxE16ZE7e".into())));
+        assert_eq!(
+            db.get_setting(NEXT_BILIBILI_SUBMIT_AT).unwrap(),
+            Some(next_submit_at.to_rfc3339())
+        );
+    }
+
+    #[test]
+    fn upload_completion_commit_failure_never_reopens_submission() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("upload-commit-failure.db");
+        let db = Database::open(&path).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "upload-commit-failure",
+                url: "https://youtu.be/upload-commit-failure",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        db.queue_prepared_upload(
+            &id,
+            &PreparedUpload::Submission {
+                video_path: "/tmp/upload-commit-failure.mp4".into(),
+                cover_path: "/tmp/upload-commit-failure.jpg".into(),
+                mode: TransferMode::Direct,
+                completion_status: JobStatus::Completed,
+            },
+        )
+        .unwrap();
+        let attempt_id = db.begin_prepared_upload(&id).unwrap().unwrap();
+        db.conn()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_upload_cooldown
+                BEFORE INSERT ON settings
+                WHEN NEW.key='bilibili.next_submit_at'
+                BEGIN
+                  SELECT RAISE(ABORT, '模拟平台成功后的本地提交失败');
+                END;
+                "#,
+            )
+            .unwrap();
+
+        let error = db
+            .finish_upload_attempt(
+                &id,
+                &attempt_id,
+                "BV1uxE16ZE7e",
+                JobStatus::Completed,
+                TransferMode::Direct,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: 90,
+                    next_submit_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("模拟平台成功后的本地提交失败"));
+        // 整个完成事务已回滚；调用方随后必须把唯一 attempt 固定在不确定态。
+        db.mark_upload_attempt_uncertain(&id, &attempt_id, "平台已成功，本地提交失败")
+            .unwrap();
+        assert_eq!(
+            db.get_job(&id).unwrap().unwrap().status,
+            JobStatus::UploadUncertain
+        );
+        assert!(db.get_setting(NEXT_BILIBILI_SUBMIT_AT).unwrap().is_none());
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert!(reopened.next_ready_to_upload_job().unwrap().is_none());
+        assert!(reopened.begin_prepared_upload(&id).unwrap().is_none());
+        let attempts: i64 = reopened
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM upload_attempts WHERE job_id=?",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
     }
 
     #[test]
@@ -3632,7 +4403,10 @@ mod tests {
                 "BV17x411w7KC",
                 JobStatus::UploadedOriginalPendingSubtitle,
                 TransferMode::Direct,
-                90,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: 90,
+                    next_submit_at: None,
+                },
             )
             .unwrap()
         );
@@ -3717,7 +4491,7 @@ mod tests {
                 title: None,
                 published: None,
                 updated: None,
-                transfer_mode: TransferMode::Direct,
+                transfer_mode: TransferMode::Translated,
             })
             .unwrap()
             .unwrap();
@@ -3726,7 +4500,7 @@ mod tests {
             &PreparedUpload::Submission {
                 video_path: "/tmp/confirmed.mp4".into(),
                 cover_path: "/tmp/confirmed.jpg".into(),
-                mode: TransferMode::Direct,
+                mode: TransferMode::Translated,
                 completion_status: JobStatus::Completed,
             },
         )
@@ -3734,30 +4508,41 @@ mod tests {
         let attempt_id = db.begin_prepared_upload(&id).unwrap().unwrap();
         db.mark_upload_attempt_uncertain(&id, &attempt_id, "lost response")
             .unwrap();
+        let next_submit_at = Utc::now() + chrono::Duration::minutes(30);
         assert!(
-            !db.confirm_uncertain_upload(
+            db.confirm_uncertain_upload(
                 &id,
                 "BV17x411w7KC",
                 JobStatus::Completed,
-                TransferMode::Direct,
-                90,
+                TransferMode::Translated,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: 90,
+                    next_submit_at: Some(next_submit_at),
+                },
             )
             .unwrap()
         );
 
         let job = db.get_job(&id).unwrap().unwrap();
-        assert_eq!(job.status, JobStatus::Completed);
+        assert_eq!(job.status, JobStatus::UploadedOriginalPendingSubtitle);
         assert_eq!(job.bvid.as_deref(), Some("BV17x411w7KC"));
         assert!(db.prepared_upload(&id).unwrap().is_none());
-        let status: String = db
+        let (status, subtitle_retry_at): (String, Option<String>) = db
             .conn()
             .query_row(
-                "SELECT status FROM upload_attempts WHERE id=?",
+                "SELECT upload_attempts.status,jobs.subtitle_retry_at \
+                 FROM upload_attempts JOIN jobs ON jobs.id=upload_attempts.job_id \
+                 WHERE upload_attempts.id=?",
                 [&attempt_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(status, "reconciled");
+        assert!(subtitle_retry_at.is_some(), "核对成功后没有排入字幕队列");
+        assert_eq!(
+            db.get_setting(NEXT_BILIBILI_SUBMIT_AT).unwrap(),
+            Some(next_submit_at.to_rfc3339())
+        );
     }
 
     #[test]
