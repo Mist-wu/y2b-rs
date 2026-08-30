@@ -992,6 +992,7 @@ fn prune(dir: &std::path::Path, keep: usize) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Output;
 
@@ -1367,6 +1368,7 @@ esac
         );
         let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
         assert!(calls.matches("start\n").count() >= 2);
+    }
 
     #[tokio::test]
     #[ignore = "由父测试进程单独启动，验证退出码"]
@@ -1402,6 +1404,8 @@ esac
             detail.contains("关键后台任务异常结束"),
             "进程没有报告关键任务失败: {detail}"
         );
+    }
+
     use std::os::unix::fs::symlink;
 
     #[test]
