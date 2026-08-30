@@ -36,6 +36,12 @@ pub struct NewVideoCandidate<'a> {
     pub source: CandidateSource,
 }
 
+/// 投稿完成事务共同使用的字幕首次检查时间和全局投稿冷却时间。
+pub struct UploadCompletionTiming {
+    pub subtitle_delay_seconds: i64,
+    pub next_submit_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DiscoveryQuota {
     pub used: u32,
@@ -1570,7 +1576,7 @@ impl Database {
         Ok(Some(attempt_id))
     }
 
-    /// biliup 明确返回成功后，把 attempt 与任务终态放在同一事务提交。
+    /// biliup 明确返回成功后，把 attempt、任务终态和投稿冷却放在同一事务提交。
     pub fn finish_upload_attempt(
         &self,
         id: &str,
@@ -1578,7 +1584,7 @@ impl Database {
         bvid: &str,
         completion_status: JobStatus,
         mode: TransferMode,
-        subtitle_delay_seconds: i64,
+        timing: UploadCompletionTiming,
     ) -> Result<bool> {
         if !matches!(
             completion_status,
@@ -1596,7 +1602,7 @@ impl Database {
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let subtitle_retry_at = queue_subtitle
-            .then(|| (now + chrono::Duration::seconds(subtitle_delay_seconds)).to_rfc3339());
+            .then(|| (now + chrono::Duration::seconds(timing.subtitle_delay_seconds)).to_rfc3339());
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let attempt_changed = tx.execute(
@@ -1619,6 +1625,17 @@ impl Database {
         )?;
         if attempt_changed != 1 || job_changed != 1 {
             anyhow::bail!("任务 {id} 的投稿 attempt {attempt_id} 已失效")
+        }
+        if let Some(next_submit_at) = timing.next_submit_at {
+            tx.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![
+                    NEXT_BILIBILI_SUBMIT_AT,
+                    next_submit_at.to_rfc3339(),
+                    &now_text
+                ],
+            )?;
         }
         tx.commit()?;
         Ok(queue_subtitle)
@@ -1679,14 +1696,14 @@ impl Database {
         Ok(())
     }
 
-    /// 创作中心已核对到唯一稿件后，安全确认不确定态任务。
+    /// 创作中心已核对到唯一稿件后，连同投稿冷却安全确认不确定态任务。
     pub fn confirm_uncertain_upload(
         &self,
         id: &str,
         bvid: &str,
         completion_status: JobStatus,
         mode: TransferMode,
-        subtitle_delay_seconds: i64,
+        timing: UploadCompletionTiming,
     ) -> Result<bool> {
         if !matches!(
             completion_status,
@@ -1704,7 +1721,7 @@ impl Database {
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let subtitle_retry_at = queue_subtitle
-            .then(|| (now + chrono::Duration::seconds(subtitle_delay_seconds)).to_rfc3339());
+            .then(|| (now + chrono::Duration::seconds(timing.subtitle_delay_seconds)).to_rfc3339());
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let attempt_changed = tx.execute(
@@ -1726,6 +1743,17 @@ impl Database {
         )?;
         if attempt_changed != 1 || changed != 1 {
             anyhow::bail!("任务 {id} 不在有效的投稿结果不确定状态")
+        }
+        if let Some(next_submit_at) = timing.next_submit_at {
+            tx.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![
+                    NEXT_BILIBILI_SUBMIT_AT,
+                    next_submit_at.to_rfc3339(),
+                    &now_text
+                ],
+            )?;
         }
         tx.commit()?;
         Ok(queue_subtitle)
@@ -3497,7 +3525,10 @@ mod tests {
                 "BV1uxE16ZE7e",
                 JobStatus::Completed,
                 TransferMode::Translated,
-                90,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: 90,
+                    next_submit_at: None,
+                },
             )
             .is_err()
         );
@@ -3507,6 +3538,7 @@ mod tests {
         );
         assert!(db.prepared_upload(&id).unwrap().is_some());
 
+        let next_submit_at = Utc::now() + chrono::Duration::minutes(30);
         assert!(
             db.finish_upload_attempt(
                 &id,
@@ -3514,7 +3546,10 @@ mod tests {
                 "BV1uxE16ZE7e",
                 JobStatus::Completed,
                 TransferMode::Translated,
-                90,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: 90,
+                    next_submit_at: Some(next_submit_at),
+                },
             )
             .unwrap()
         );
@@ -3532,6 +3567,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attempt, ("succeeded".into(), Some("BV1uxE16ZE7e".into())));
+        assert_eq!(
+            db.get_setting(NEXT_BILIBILI_SUBMIT_AT).unwrap(),
+            Some(next_submit_at.to_rfc3339())
+        );
+    }
+
+    #[test]
+    fn upload_completion_commit_failure_never_reopens_submission() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("upload-commit-failure.db");
+        let db = Database::open(&path).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "upload-commit-failure",
+                url: "https://youtu.be/upload-commit-failure",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        db.queue_prepared_upload(
+            &id,
+            &PreparedUpload::Submission {
+                video_path: "/tmp/upload-commit-failure.mp4".into(),
+                cover_path: "/tmp/upload-commit-failure.jpg".into(),
+                mode: TransferMode::Direct,
+                completion_status: JobStatus::Completed,
+            },
+        )
+        .unwrap();
+        let attempt_id = db.begin_prepared_upload(&id).unwrap().unwrap();
+        db.conn()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_upload_cooldown
+                BEFORE INSERT ON settings
+                WHEN NEW.key='bilibili.next_submit_at'
+                BEGIN
+                  SELECT RAISE(ABORT, '模拟平台成功后的本地提交失败');
+                END;
+                "#,
+            )
+            .unwrap();
+
+        let error = db
+            .finish_upload_attempt(
+                &id,
+                &attempt_id,
+                "BV1uxE16ZE7e",
+                JobStatus::Completed,
+                TransferMode::Direct,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: 90,
+                    next_submit_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("模拟平台成功后的本地提交失败"));
+        // 整个完成事务已回滚；调用方随后必须把唯一 attempt 固定在不确定态。
+        db.mark_upload_attempt_uncertain(&id, &attempt_id, "平台已成功，本地提交失败")
+            .unwrap();
+        assert_eq!(
+            db.get_job(&id).unwrap().unwrap().status,
+            JobStatus::UploadUncertain
+        );
+        assert!(db.get_setting(NEXT_BILIBILI_SUBMIT_AT).unwrap().is_none());
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert!(reopened.next_ready_to_upload_job().unwrap().is_none());
+        assert!(reopened.begin_prepared_upload(&id).unwrap().is_none());
+        let attempts: i64 = reopened
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM upload_attempts WHERE job_id=?",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
     }
 
     #[test]
@@ -3632,7 +3750,10 @@ mod tests {
                 "BV17x411w7KC",
                 JobStatus::UploadedOriginalPendingSubtitle,
                 TransferMode::Direct,
-                90,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: 90,
+                    next_submit_at: None,
+                },
             )
             .unwrap()
         );
@@ -3717,7 +3838,7 @@ mod tests {
                 title: None,
                 published: None,
                 updated: None,
-                transfer_mode: TransferMode::Direct,
+                transfer_mode: TransferMode::Translated,
             })
             .unwrap()
             .unwrap();
@@ -3726,7 +3847,7 @@ mod tests {
             &PreparedUpload::Submission {
                 video_path: "/tmp/confirmed.mp4".into(),
                 cover_path: "/tmp/confirmed.jpg".into(),
-                mode: TransferMode::Direct,
+                mode: TransferMode::Translated,
                 completion_status: JobStatus::Completed,
             },
         )
@@ -3734,30 +3855,41 @@ mod tests {
         let attempt_id = db.begin_prepared_upload(&id).unwrap().unwrap();
         db.mark_upload_attempt_uncertain(&id, &attempt_id, "lost response")
             .unwrap();
+        let next_submit_at = Utc::now() + chrono::Duration::minutes(30);
         assert!(
-            !db.confirm_uncertain_upload(
+            db.confirm_uncertain_upload(
                 &id,
                 "BV17x411w7KC",
                 JobStatus::Completed,
-                TransferMode::Direct,
-                90,
+                TransferMode::Translated,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: 90,
+                    next_submit_at: Some(next_submit_at),
+                },
             )
             .unwrap()
         );
 
         let job = db.get_job(&id).unwrap().unwrap();
-        assert_eq!(job.status, JobStatus::Completed);
+        assert_eq!(job.status, JobStatus::UploadedOriginalPendingSubtitle);
         assert_eq!(job.bvid.as_deref(), Some("BV17x411w7KC"));
         assert!(db.prepared_upload(&id).unwrap().is_none());
-        let status: String = db
+        let (status, subtitle_retry_at): (String, Option<String>) = db
             .conn()
             .query_row(
-                "SELECT status FROM upload_attempts WHERE id=?",
+                "SELECT upload_attempts.status,jobs.subtitle_retry_at \
+                 FROM upload_attempts JOIN jobs ON jobs.id=upload_attempts.job_id \
+                 WHERE upload_attempts.id=?",
                 [&attempt_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(status, "reconciled");
+        assert!(subtitle_retry_at.is_some(), "核对成功后没有排入字幕队列");
+        assert_eq!(
+            db.get_setting(NEXT_BILIBILI_SUBMIT_AT).unwrap(),
+            Some(next_submit_at.to_rfc3339())
+        );
     }
 
     #[test]
