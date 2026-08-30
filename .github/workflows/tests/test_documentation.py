@@ -72,6 +72,13 @@ class DocumentationTests(unittest.TestCase):
             self.readme,
         )
 
+    def test_dependency_audit_documents_the_lru_unsound_advisory(self) -> None:
+        cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        self.assertIn("RUSTSEC-2026-0253", cargo)
+        self.assertIn("ratatui-core", cargo)
+        self.assertIn("layout-cache", cargo)
+        self.assertIn("lru >= 0.18.2", cargo)
+
 
 if __name__ == "__main__":
     unittest.main()
