@@ -12,7 +12,9 @@ database=${Y2B_DATABASE:-"$state_dir/state.db"}
 service=${Y2B_SERVICE:-y2b-watch.service}
 sqlite3_cmd=${Y2B_SQLITE3:-sqlite3}
 systemctl_cmd=${Y2B_SYSTEMCTL:-systemctl}
-expected_schema=${Y2B_SCHEMA_VERSION:-19}
+y2b_cmd=${Y2B_BIN:-y2b}
+schema_override=${Y2B_SCHEMA_VERSION:-}
+expected_schema=
 
 temp_db=
 check_output=
@@ -100,10 +102,6 @@ read_schema() {
 # 所有可能拒绝恢复的预检都必须发生在停服务之前。
 [[ -f "$backup" ]] || { echo "备份文件不存在: $backup" >&2; exit 1; }
 [[ -d "$state_dir" ]] || { echo "数据目录不存在: $state_dir" >&2; exit 1; }
-[[ "$expected_schema" =~ ^[0-9]+$ ]] || {
-  echo "期望 schema 版本无效: $expected_schema" >&2
-  exit 1
-}
 command -v "$sqlite3_cmd" >/dev/null 2>&1 || {
   echo "sqlite3 是所有 restore 的必需依赖: $sqlite3_cmd" >&2
   exit 1
@@ -112,6 +110,22 @@ command -v "$systemctl_cmd" >/dev/null 2>&1 || {
   echo "systemctl 不可用: $systemctl_cmd" >&2
   exit 1
 }
+if [[ -n "$schema_override" ]]; then
+  expected_schema=$schema_override
+else
+  command -v "$y2b_cmd" >/dev/null 2>&1 || {
+    echo "y2b 不可用，无法读取当前 schema 版本: $y2b_cmd" >&2
+    exit 1
+  }
+  if ! expected_schema=$("$y2b_cmd" schema-version); then
+    echo "无法从 y2b 读取当前 schema 版本" >&2
+    exit 1
+  fi
+fi
+if [[ ! "$expected_schema" =~ ^[0-9]+$ ]] || (( expected_schema <= 0 )); then
+  echo "期望 schema 版本无效: $expected_schema" >&2
+  exit 1
+fi
 
 temp_db=$(mktemp "$state_dir/.state.db.restore.XXXXXXXX")
 cp -- "$backup" "$temp_db"
@@ -129,6 +143,20 @@ backup_schema=$(read_schema "$temp_db")
 if [[ ! "$backup_schema" =~ ^[0-9]+$ ]] || (( backup_schema <= 0 )); then
   echo "备份 schema 版本不可读" >&2
   exit 1
+fi
+if (( backup_schema > expected_schema )); then
+  echo "备份 schema v${backup_schema} 高于当前二进制 v${expected_schema}，无法降级恢复" >&2
+  exit 1
+fi
+if (( backup_schema < expected_schema )); then
+  command -v "$y2b_cmd" >/dev/null 2>&1 || {
+    echo "y2b 不可用，无法把 schema v$backup_schema 迁移到 v$expected_schema: $y2b_cmd" >&2
+    exit 1
+  }
+  "$y2b_cmd" migrate --help >/dev/null 2>&1 || {
+    echo "当前 y2b 不支持显式数据库迁移" >&2
+    exit 1
+  }
 fi
 
 set +e
@@ -159,11 +187,22 @@ mv -f -- "$temp_db" "$database"
 temp_db=
 rm -f -- "$database-wal" "$database-shm"
 
+if (( backup_schema < expected_schema )); then
+  if ! migration_schema=$("$y2b_cmd" migrate --database "$database"); then
+    echo "数据库从 schema v$backup_schema 迁移到 v$expected_schema 失败" >&2
+    exit 1
+  fi
+  [[ "$migration_schema" == "$expected_schema" ]] || {
+    echo "y2b 迁移后报告 schema v${migration_schema}，期望 v$expected_schema" >&2
+    exit 1
+  }
+fi
+
 if [[ "$was_active" == true ]]; then
   "$systemctl_cmd" start "$service"
 fi
 
-# active 服务启动后可能正在执行迁移，短暂等待 schema 到达当前版本。
+# active 服务启动时可能短暂占用数据库；迁移本身已经在恢复服务状态前显式完成。
 migrated_schema=
 for _ in {1..30}; do
   if migrated_schema=$(read_schema "$database" 2>/dev/null) &&

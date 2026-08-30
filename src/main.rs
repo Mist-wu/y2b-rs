@@ -14,6 +14,7 @@ const GATE_BATCH: usize = 50;
 use y2b_rs::{
     Database, check,
     config::{AI_MODEL, AI_PROVIDER, AI_THINKING, AI_TRANSLATION_MODEL, Config},
+    db::CURRENT_SCHEMA_VERSION,
     model::{ChannelPriority, JobStatus, TransferMode},
     monitor::Monitor,
     pipeline::{self, AiCircuitBreaker, Pipeline},
@@ -38,6 +39,13 @@ enum Cmd {
     Init,
     /// 只读取并校验配置，不打开数据库或启动外部进程。
     ConfigCheck,
+    /// 输出当前二进制支持的数据库 schema 版本，不读取配置或数据库。
+    SchemaVersion,
+    /// 显式打开指定数据库并执行全部待应用迁移。
+    Migrate {
+        #[arg(long, value_name = "PATH")]
+        database: PathBuf,
+    },
     Check {
         #[arg(long)]
         write_baseline: bool,
@@ -150,6 +158,15 @@ enum WebSubCmd {
     },
 }
 
+fn current_schema_version() -> i64 {
+    CURRENT_SCHEMA_VERSION
+}
+
+fn migrate_database(path: &std::path::Path) -> Result<i64> {
+    let db = Database::open(path)?;
+    db.schema_version()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -158,6 +175,17 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    match &cli.command {
+        Cmd::SchemaVersion => {
+            println!("{}", current_schema_version());
+            return Ok(());
+        }
+        Cmd::Migrate { database } => {
+            println!("{}", migrate_database(database)?);
+            return Ok(());
+        }
+        _ => {}
+    }
     let mut config = Config::load(&cli.config)?;
     if matches!(cli.command, Cmd::ConfigCheck) {
         println!(
@@ -175,7 +203,7 @@ async fn main() -> Result<()> {
     let db = Database::open(&config.runtime.database)?;
     match cli.command {
         Cmd::Init => unreachable!(),
-        Cmd::ConfigCheck => unreachable!(),
+        Cmd::ConfigCheck | Cmd::SchemaVersion | Cmd::Migrate { .. } => unreachable!(),
         Cmd::Check { write_baseline } => {
             let checks = check::run(&config, &db).await;
             finish_check(&config, &checks, write_baseline).await?;
@@ -961,6 +989,27 @@ mod tests {
         assert!(sqlite_check < first_idle_check);
     }
 
+    #[test]
+    fn schema_version_command_and_restore_default_follow_the_rust_constant() {
+        let cli = Cli::try_parse_from(["y2b", "schema-version"]).unwrap();
+        assert!(matches!(cli.command, Cmd::SchemaVersion));
+        assert_eq!(current_schema_version(), CURRENT_SCHEMA_VERSION);
+
+        let restore =
+            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/restore.sh"))
+                .unwrap();
+        assert!(restore.contains("\"$y2b_cmd\" schema-version"));
+        assert!(!restore.contains("Y2B_SCHEMA_VERSION:-19"));
+    }
+
+    #[test]
+    fn migrate_command_opens_the_explicit_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        assert_eq!(migrate_database(&database).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert!(database.exists());
+    }
+
     fn write_executable(path: &Path, content: &str) {
         fs::write(path, content).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
@@ -974,8 +1023,10 @@ mod tests {
         backup: PathBuf,
         sqlite3: PathBuf,
         systemctl: PathBuf,
+        y2b: PathBuf,
         service_state: PathBuf,
         systemctl_log: PathBuf,
+        y2b_log: PathBuf,
         fail_start_once: PathBuf,
     }
 
@@ -986,7 +1037,7 @@ mod tests {
         fs::create_dir_all(&state_dir).unwrap();
         fs::create_dir_all(&bin_dir).unwrap();
         let backup = temp.path().join("backup.db");
-        fs::write(&backup, "new-v19").unwrap();
+        fs::write(&backup, format!("new-v{CURRENT_SCHEMA_VERSION}")).unwrap();
 
         let sqlite3 = bin_dir.join("sqlite3");
         write_executable(
@@ -1005,9 +1056,15 @@ case "$query" in
     ;;
   *sqlite_master*) printf '4\n' ;;
   *MAX\(version\)*)
-    if grep -q 'v18' "$database"; then printf '18\n'; else printf '19\n'; fi
+    content=$(<"$database")
+    if [[ "$content" =~ v([0-9]+) ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+      echo "无法读取测试 schema" >&2
+      exit 2
+    fi
     ;;
-  *) echo "unexpected sqlite query: $query" >&2; exit 2 ;;
+  *) echo "未预期的 sqlite 查询: $query" >&2; exit 2 ;;
 esac
 "#,
         );
@@ -1035,6 +1092,27 @@ case "$1" in
 esac
 "#,
         );
+        let y2b = bin_dir.join("y2b");
+        let y2b_script = r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$RESTORE_TEST_Y2B_LOG"
+case "${1:-}" in
+  schema-version) printf '__CURRENT_SCHEMA__\n' ;;
+  migrate)
+    if [[ ${2:-} == --help ]]; then exit 0; fi
+    [[ ${2:-} == --database && -n ${3:-} ]] || exit 2
+    database=$3
+    content=$(<"$database")
+    prefix=${content%v*}
+    printf '%sv__CURRENT_SCHEMA__' "$prefix" >"$database"
+    printf '__CURRENT_SCHEMA__\n'
+    ;;
+  *) exit 2 ;;
+esac
+"#
+        .replace("__CURRENT_SCHEMA__", &CURRENT_SCHEMA_VERSION.to_string());
+        write_executable(&y2b, &y2b_script);
+
         let service_state = temp.path().join("service-state");
         fs::write(
             &service_state,
@@ -1048,8 +1126,10 @@ esac
             backup,
             sqlite3,
             systemctl,
+            y2b,
             service_state,
             systemctl_log: PathBuf::new(),
+            y2b_log: PathBuf::new(),
             fail_start_once: PathBuf::new(),
         }
         .with_runtime_paths()
@@ -1059,6 +1139,7 @@ esac
         fn with_runtime_paths(mut self) -> Self {
             let root = self.service_state.parent().unwrap();
             self.systemctl_log = root.join("systemctl.log");
+            self.y2b_log = root.join("y2b.log");
             self.fail_start_once = root.join("fail-start-once");
             self
         }
@@ -1068,10 +1149,14 @@ esac
                 .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/deploy/restore.sh"))
                 .arg(&self.backup)
                 .env("Y2B_STATE_DIR", &self.state_dir)
+                .env_remove("Y2B_DATABASE")
+                .env_remove("Y2B_SCHEMA_VERSION")
                 .env("Y2B_SQLITE3", sqlite3)
                 .env("Y2B_SYSTEMCTL", &self.systemctl)
+                .env("Y2B_BIN", &self.y2b)
                 .env("RESTORE_TEST_SERVICE_STATE", &self.service_state)
                 .env("RESTORE_TEST_SYSTEMCTL_LOG", &self.systemctl_log)
+                .env("RESTORE_TEST_Y2B_LOG", &self.y2b_log)
                 .env("RESTORE_TEST_FAIL_START_ONCE", &self.fail_start_once)
                 .output()
                 .unwrap()
@@ -1093,11 +1178,15 @@ esac
         );
         assert_eq!(
             fs::read_to_string(fixture.state_dir.join("state.db")).unwrap(),
-            "new-v19"
+            format!("new-v{CURRENT_SCHEMA_VERSION}")
         );
         assert_eq!(
             fs::read_to_string(&fixture.service_state).unwrap(),
             "inactive\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.y2b_log).unwrap(),
+            "schema-version\n"
         );
     }
 
@@ -1105,13 +1194,72 @@ esac
     fn restore_rejects_corrupt_backup_before_stopping_service() {
         let fixture = restore_fixture(true);
         let database = fixture.state_dir.join("state.db");
-        fs::write(&database, "old-v19").unwrap();
-        fs::write(&fixture.backup, "damaged-v19").unwrap();
+        let old = format!("old-v{CURRENT_SCHEMA_VERSION}");
+        fs::write(&database, &old).unwrap();
+        fs::write(
+            &fixture.backup,
+            format!("damaged-v{CURRENT_SCHEMA_VERSION}"),
+        )
+        .unwrap();
 
         let output = fixture.run();
         assert!(!output.status.success());
-        assert_eq!(fs::read_to_string(database).unwrap(), "old-v19");
+        assert_eq!(fs::read_to_string(database).unwrap(), old);
         assert!(!fixture.systemctl_log.exists());
+    }
+
+    #[test]
+    fn restore_rejects_newer_backup_before_touching_current_database() {
+        let fixture = restore_fixture(true);
+        let database = fixture.state_dir.join("state.db");
+        let old = format!("old-v{CURRENT_SCHEMA_VERSION}");
+        fs::write(&database, &old).unwrap();
+        fs::write(
+            &fixture.backup,
+            format!("future-v{}", CURRENT_SCHEMA_VERSION + 1),
+        )
+        .unwrap();
+
+        let output = fixture.run();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("无法降级恢复"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(database).unwrap(), old);
+        assert!(!fixture.systemctl_log.exists());
+        assert_eq!(
+            fs::read_to_string(&fixture.y2b_log).unwrap(),
+            "schema-version\n"
+        );
+    }
+
+    #[test]
+    fn restore_migrates_v17_backup_while_service_remains_inactive() {
+        let fixture = restore_fixture(false);
+        let database = fixture.state_dir.join("state.db");
+        fs::write(&database, format!("old-v{CURRENT_SCHEMA_VERSION}")).unwrap();
+        fs::write(&fixture.backup, "weekly-v17").unwrap();
+
+        let output = fixture.run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(database).unwrap(),
+            format!("weekly-v{CURRENT_SCHEMA_VERSION}")
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "inactive\n"
+        );
+        let y2b_calls = fs::read_to_string(&fixture.y2b_log).unwrap();
+        assert!(y2b_calls.contains("schema-version\n"));
+        assert!(y2b_calls.contains("migrate --help\n"));
+        assert!(y2b_calls.contains("migrate --database "));
     }
 
     #[test]
@@ -1128,12 +1276,13 @@ esac
     fn restore_rolls_back_database_when_service_start_fails() {
         let fixture = restore_fixture(true);
         let database = fixture.state_dir.join("state.db");
-        fs::write(&database, "old-v19").unwrap();
+        let old = format!("old-v{CURRENT_SCHEMA_VERSION}");
+        fs::write(&database, &old).unwrap();
         fs::write(&fixture.fail_start_once, "fail\n").unwrap();
 
         let output = fixture.run();
         assert!(!output.status.success());
-        assert_eq!(fs::read_to_string(database).unwrap(), "old-v19");
+        assert_eq!(fs::read_to_string(database).unwrap(), old);
         assert_eq!(
             fs::read_to_string(&fixture.service_state).unwrap(),
             "active\n"
