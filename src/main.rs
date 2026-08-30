@@ -45,6 +45,9 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         database: PathBuf,
     },
+    /// 获取维护锁或查询部署前空闲状态；所有操作都显式指定数据库。
+    #[command(subcommand)]
+    Maintenance(MaintenanceCmd),
     Check {
         #[arg(long)]
         write_baseline: bool,
@@ -71,6 +74,46 @@ enum Cmd {
     #[command(subcommand)]
     Websub(WebSubCmd),
 }
+#[derive(Subcommand)]
+enum MaintenanceCmd {
+    /// 原子获取带租约的维护锁。
+    Acquire {
+        #[arg(long, value_name = "PATH")]
+        database: PathBuf,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value_t = 300)]
+        lease_seconds: i64,
+    },
+    /// 为当前持有者续租。
+    Renew {
+        #[arg(long, value_name = "PATH")]
+        database: PathBuf,
+        #[arg(long)]
+        owner: String,
+        #[arg(long, default_value_t = 300)]
+        lease_seconds: i64,
+    },
+    /// 释放当前持有者自己的维护锁。
+    Release {
+        #[arg(long, value_name = "PATH")]
+        database: PathBuf,
+        #[arg(long)]
+        owner: String,
+    },
+    /// 输出完整空闲状态；`owner` 用于排除调用方自己持有的锁。
+    Status {
+        #[arg(long, value_name = "PATH")]
+        database: PathBuf,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum ChannelCmd {
     Add {
@@ -166,6 +209,75 @@ fn migrate_database(path: &std::path::Path) -> Result<i64> {
     db.schema_version()
 }
 
+fn run_maintenance_command(command: &MaintenanceCmd) -> Result<()> {
+    match command {
+        MaintenanceCmd::Acquire {
+            database,
+            owner,
+            reason,
+            lease_seconds,
+        } => {
+            let db = Database::open_existing(database)?;
+            if !db.acquire_maintenance_hold(owner, reason, *lease_seconds)? {
+                let holder = db
+                    .maintenance_hold()?
+                    .map(|hold| format!("{}（到期 {}）", hold.owner, hold.expires_at))
+                    .unwrap_or_else(|| "未知持有者".into());
+                anyhow::bail!("维护锁获取失败，当前持有者: {holder}")
+            }
+            println!("维护锁已获取: owner={owner} lease_seconds={lease_seconds}");
+        }
+        MaintenanceCmd::Renew {
+            database,
+            owner,
+            lease_seconds,
+        } => {
+            let db = Database::open_existing(database)?;
+            anyhow::ensure!(
+                db.renew_maintenance_hold(owner, *lease_seconds)?,
+                "维护锁续租失败：owner 不匹配或租约已经到期"
+            );
+            println!("维护锁已续租: owner={owner} lease_seconds={lease_seconds}");
+        }
+        MaintenanceCmd::Release { database, owner } => {
+            let db = Database::open_existing(database)?;
+            anyhow::ensure!(
+                db.release_maintenance_hold(owner)?,
+                "维护锁释放失败：owner 不匹配"
+            );
+            println!("维护锁已释放: owner={owner}");
+        }
+        MaintenanceCmd::Status {
+            database,
+            owner,
+            json,
+        } => {
+            let db = Database::open_existing(database)?;
+            let status = db.maintenance_status(owner.as_deref())?;
+            if *json {
+                println!("{}", serde_json::to_string(&status)?);
+            } else {
+                println!("idle={}", status.idle);
+                if let Some(hold) = &status.hold {
+                    println!(
+                        "hold\towner={}\texpires_at={}\treason={}",
+                        hold.owner, hold.expires_at, hold.reason
+                    );
+                }
+                for blocker in &status.blockers {
+                    println!(
+                        "{}\t{}\t{}",
+                        blocker.kind,
+                        blocker.count,
+                        blocker.details.join(",")
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -181,6 +293,10 @@ async fn main() -> Result<()> {
         }
         Cmd::Migrate { database } => {
             println!("{}", migrate_database(database)?);
+            return Ok(());
+        }
+        Cmd::Maintenance(command) => {
+            run_maintenance_command(command)?;
             return Ok(());
         }
         _ => {}
@@ -207,7 +323,9 @@ async fn main() -> Result<()> {
     let db = Database::open(&config.runtime.database)?;
     match cli.command {
         Cmd::Init => unreachable!(),
-        Cmd::ConfigCheck | Cmd::SchemaVersion | Cmd::Migrate { .. } => unreachable!(),
+        Cmd::ConfigCheck | Cmd::SchemaVersion | Cmd::Migrate { .. } | Cmd::Maintenance(_) => {
+            unreachable!()
+        }
         Cmd::Check { write_baseline } => {
             let checks = check::run(&config, &db).await;
             finish_check(&config, &checks, write_baseline).await?;
@@ -1066,6 +1184,29 @@ mod tests {
         let sqlite_check = deploy.find("command -v sqlite3").unwrap();
         let first_idle_check = deploy.find("\nassert_idle\n").unwrap();
         assert!(sqlite_check < first_idle_check);
+    }
+
+    #[test]
+    fn maintenance_status_command_uses_an_explicit_database_and_json_output() {
+        let cli = Cli::try_parse_from([
+            "y2b",
+            "maintenance",
+            "status",
+            "--database",
+            "/tmp/state.db",
+            "--owner",
+            "deploy:test",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Cmd::Maintenance(MaintenanceCmd::Status {
+                database,
+                owner: Some(owner),
+                json: true,
+            }) if database == Path::new("/tmp/state.db") && owner == "deploy:test"
+        ));
     }
 
     #[test]
