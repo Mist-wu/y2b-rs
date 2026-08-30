@@ -1187,7 +1187,7 @@ mod tests {
             .find("\"$mv_cmd\" -Tf -- \"$mv_probe_dir/source\" \"$mv_probe_dir/target\"")
             .unwrap();
         let acquire = deploy.find("maintenance acquire").unwrap();
-        let idle_wait = deploy.find("\nwait_for_two_idle_checks\n").unwrap();
+        let idle_wait = deploy.find("wait_for_two_idle_checks_bootstrap").unwrap();
         assert!(sqlite_check < acquire);
         assert!(mv_probe < acquire);
         assert!(acquire < idle_wait);
@@ -1276,11 +1276,24 @@ mod tests {
         systemctl_log: PathBuf,
         events: PathBuf,
         scenario: &'static str,
+        schema_version: i64,
         credential_owner: String,
         path: String,
     }
 
     fn deploy_fixture(scenario: &'static str) -> DeployFixture {
+        deploy_fixture_with_layout(scenario, false, CURRENT_SCHEMA_VERSION)
+    }
+
+    fn deploy_fixture_legacy(scenario: &'static str, schema_version: i64) -> DeployFixture {
+        deploy_fixture_with_layout(scenario, true, schema_version)
+    }
+
+    fn deploy_fixture_with_layout(
+        scenario: &'static str,
+        legacy: bool,
+        schema_version: i64,
+    ) -> DeployFixture {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let bin_dir = root.join("stub-bin");
@@ -1290,16 +1303,21 @@ mod tests {
         let local_bin = root.join("usr/local/bin");
         let local_sbin = root.join("usr/local/sbin");
         let old_release = app_root.join("releases").join(OLD_DEPLOY_REVISION);
-        for directory in [
+        let mut directories = vec![
             bin_dir.clone(),
-            old_release.join("pi"),
-            old_release.join("deploy"),
             state_dir.join("backups"),
             unit_dir.clone(),
             local_bin.clone(),
             local_sbin.clone(),
             root.join("etc/y2b"),
-        ] {
+        ];
+        if legacy {
+            directories.push(app_root.join("pi"));
+        } else {
+            directories.push(old_release.join("pi"));
+            directories.push(old_release.join("deploy"));
+        }
+        for directory in directories {
             fs::create_dir_all(directory).unwrap();
         }
 
@@ -1379,7 +1397,9 @@ elif [[ "$line" == *" config-check "* ]]; then
 elif [[ "$line" == *" migrate --database "* ]]; then
   printf 'new-database\n' >"$DEPLOY_TEST_DATABASE"
   record_event "migrate:$target"
-  printf '22\n'
+  printf '__SCHEMA__\n'
+elif [[ "$line" == *" schema-version "* ]]; then
+  printf '__SCHEMA__\n'
 elif [[ "$line" == *" check "* ]]; then
   content=$(<"$DEPLOY_TEST_DATABASE")
   record_event "check:$target:$content"
@@ -1387,31 +1407,63 @@ else
   echo "未预期的 y2b 参数: $*" >&2
   exit 2
 fi
+"#
+        .replace("__SCHEMA__", &CURRENT_SCHEMA_VERSION.to_string());
+        let old_y2b_stub = r#"#!/usr/bin/env bash
+set -euo pipefail
+printf 'old-binary args=%s\n' "$*" >>"$DEPLOY_TEST_OLD_Y2B_LOG"
+line=" $* "
+if [[ "$line" == *" maintenance "* ]]; then
+  echo "error: unrecognized subcommand 'maintenance'" >&2
+  exit 2
+fi
+if [[ "$line" == *" check "* ]]; then
+  printf 'old-check\n'
+  exit 0
+fi
+if [[ "$line" == *" config-check "* ]]; then
+  printf 'old-config-ok\n'
+  exit 0
+fi
+echo "未预期的旧版 y2b 参数: $*" >&2
+exit 2
 "#;
         let candidate = bin_dir.join("y2b");
-        write_executable(&candidate, y2b_stub);
-        write_executable(&old_release.join("y2b"), y2b_stub);
-
-        for resource in [
-            "y2b-extension.ts",
-            "policy.json",
-            "audit-policy.json",
-            "brawl-stars-glossary.json",
-        ] {
-            fs::write(old_release.join("pi").join(resource), resource).unwrap();
-        }
-        fs::write(old_release.join("Cargo.lock"), "old lock\n").unwrap();
-        write_executable(
-            &old_release.join("deploy/y2b-set-deepseek-key.py"),
-            "#!/usr/bin/env python3\n",
-        );
+        write_executable(&candidate, &y2b_stub);
 
         let current = app_root.join("current");
-        symlink(format!("releases/{OLD_DEPLOY_REVISION}"), &current).unwrap();
-        symlink("current/pi", app_root.join("pi")).unwrap();
-        symlink("current/Cargo.lock", app_root.join("Cargo.lock")).unwrap();
-        symlink("current/deploy", app_root.join("deploy")).unwrap();
-        symlink(current.join("y2b"), local_bin.join("y2b")).unwrap();
+        if legacy {
+            write_executable(&local_bin.join("y2b"), old_y2b_stub);
+            for resource in [
+                "y2b-extension.ts",
+                "policy.json",
+                "audit-policy.json",
+                "brawl-stars-glossary.json",
+            ] {
+                fs::write(app_root.join("pi").join(resource), resource).unwrap();
+            }
+            fs::write(app_root.join("Cargo.lock"), "old lock\n").unwrap();
+        } else {
+            write_executable(&old_release.join("y2b"), &y2b_stub);
+            for resource in [
+                "y2b-extension.ts",
+                "policy.json",
+                "audit-policy.json",
+                "brawl-stars-glossary.json",
+            ] {
+                fs::write(old_release.join("pi").join(resource), resource).unwrap();
+            }
+            fs::write(old_release.join("Cargo.lock"), "old lock\n").unwrap();
+            write_executable(
+                &old_release.join("deploy/y2b-set-deepseek-key.py"),
+                "#!/usr/bin/env python3\n",
+            );
+            symlink(format!("releases/{OLD_DEPLOY_REVISION}"), &current).unwrap();
+            symlink("current/pi", app_root.join("pi")).unwrap();
+            symlink("current/Cargo.lock", app_root.join("Cargo.lock")).unwrap();
+            symlink("current/deploy", app_root.join("deploy")).unwrap();
+            symlink(current.join("y2b"), local_bin.join("y2b")).unwrap();
+        }
 
         let database = state_dir.join("state.db");
         fs::write(&database, "old-database\n").unwrap();
@@ -1468,9 +1520,7 @@ fi
 "#,
         );
 
-        write_executable(
-            &bin_dir.join("sqlite3"),
-            r#"#!/usr/bin/env bash
+        let sqlite3_stub = r#"#!/usr/bin/env bash
 set -euo pipefail
 database=$1
 query=$2
@@ -1488,12 +1538,30 @@ elif [[ "$query" == *integrity_check* ]]; then
   else
     printf 'ok\n'
   fi
+elif [[ "$query" == *schema_migrations* ]]; then
+  content=$(<"$database")
+  if [[ "$content" == new-database* ]]; then
+    printf '__SCHEMA__\n'
+  else
+    printf '%s\n' "${DEPLOY_TEST_SCHEMA_VERSION:-__SCHEMA__}"
+  fi
+elif [[ "$query" == *"COUNT(*) FROM jobs"* ]]; then
+  if [[ -n "${DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS:-}" ]]; then
+    count=0
+    [[ ! -f "$DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS" ]] || count=$(<"$DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS")
+    ((count += 1))
+    printf '%s\n' "$count" >"$DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS"
+  fi
+  printf '0\n'
+elif [[ "$query" == *"COUNT(*) FROM stage_runs"* ]]; then
+  printf '0\n'
 else
   echo "未预期的 sqlite3 查询: $query" >&2
   exit 2
 fi
-"#,
-        );
+"#
+        .replace("__SCHEMA__", &CURRENT_SCHEMA_VERSION.to_string());
+        write_executable(&bin_dir.join("sqlite3"), &sqlite3_stub);
 
         let python = std::process::Command::new("python3")
             .args(["-c", "import sys; print(sys.executable)"])
@@ -1590,6 +1658,7 @@ PY
             systemctl_log,
             events,
             scenario,
+            schema_version,
             credential_owner,
             path,
         }
@@ -1624,6 +1693,18 @@ PY
                 .env("Y2B_HOLD_LEASE_SECONDS", "60")
                 .env("Y2B_RELEASE_KEEP", "5")
                 .env("DEPLOY_TEST_SCENARIO", self.scenario)
+                .env(
+                    "DEPLOY_TEST_SCHEMA_VERSION",
+                    self.schema_version.to_string(),
+                )
+                .env(
+                    "DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS",
+                    self.state_dir.join("bootstrap-idle-checks"),
+                )
+                .env(
+                    "DEPLOY_TEST_OLD_Y2B_LOG",
+                    self.state_dir.join("old-y2b.log"),
+                )
                 .env("DEPLOY_TEST_CURRENT", &self.current)
                 .env("DEPLOY_TEST_DATABASE", &self.database)
                 .env("DEPLOY_TEST_HOLD", &self.hold)
@@ -1862,6 +1943,105 @@ PY
             fs::read_to_string(&fixture.service_state).unwrap(),
             "active\n"
         );
+    }
+
+    #[test]
+    fn deploy_bootstraps_first_deploy_without_hold_and_completes() {
+        let fixture = deploy_fixture_legacy("success", 17);
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        let detail = output_detail(&output);
+        assert!(detail.contains("自举部署"), "{detail}");
+        assert!(detail.contains("TOCTOU"), "{detail}");
+        // 自举模式不获取维护锁，也不会留下 hold
+        assert!(!fixture.hold.exists());
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(!events.contains("acquire:"), "{events}");
+        // 完成原子切换并迁移数据库
+        assert_eq!(
+            fs::read_link(&fixture.current).unwrap(),
+            PathBuf::from(format!("releases/{NEW_DEPLOY_REVISION}"))
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.database).unwrap(),
+            "new-database\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "active\n"
+        );
+    }
+
+    #[test]
+    fn deploy_bootstrap_still_runs_two_idle_checks_backup_and_atomic_switch() {
+        let fixture = deploy_fixture_legacy("success", 17);
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        // 每次自举空闲检查都会先查 jobs.status；连续两次 idle 才会继续。
+        let idle_checks =
+            fs::read_to_string(fixture.state_dir.join("bootstrap-idle-checks")).unwrap();
+        let idle_checks: usize = idle_checks.trim().parse().unwrap();
+        assert!(idle_checks >= 2, "自举空闲检查次数不足: {idle_checks}");
+        // 迁移前备份存在且通过完整性校验后保留为唯一备份文件
+        let backups: Vec<_> = fs::read_dir(fixture.state_dir.join("backups/deploy"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(backups.len(), 1, "迁移前备份数量: {backups:?}");
+        // 原子切换：current 最终是符号链接并指向新 release
+        let metadata = fs::symlink_metadata(&fixture.current).unwrap();
+        assert!(metadata.file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(&fixture.current).unwrap(),
+            PathBuf::from(format!("releases/{NEW_DEPLOY_REVISION}"))
+        );
+    }
+
+    #[test]
+    fn deploy_after_bootstrap_uses_full_hold_path() {
+        let fixture = deploy_fixture_legacy("success", 17);
+        let first = fixture.run(3);
+        assert!(first.status.success(), "{}", output_detail(&first));
+        let first_events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(!first_events.contains("acquire:"), "{first_events}");
+
+        // 第二次部署：数据库已迁移到当前 schema，必须走完整 hold 路径而非自举。
+        let second = fixture
+            .command(3)
+            .env("Y2B_REVISION", "cccccccccccc")
+            .output()
+            .unwrap();
+        assert!(second.status.success(), "{}", output_detail(&second));
+        let second_detail = output_detail(&second);
+        assert!(!second_detail.contains("自举部署"), "{second_detail}");
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(events.contains("acquire:"), "{events}");
+        assert!(events.contains("release:releases/cccccccccccc"), "{events}");
+        assert_eq!(
+            fs::read_link(&fixture.current).unwrap(),
+            PathBuf::from("releases/cccccccccccc")
+        );
+    }
+
+    #[test]
+    fn deploy_legacy_uses_new_binary_for_maintenance() {
+        let fixture = deploy_fixture_legacy("success", CURRENT_SCHEMA_VERSION);
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        // 旧扁平二进制不支持 maintenance（stub 遇 maintenance 即 exit 2）；
+        // 部署成功说明维护操作走的是新上传的二进制，而非旧的 /usr/local/bin/y2b。
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(events.contains("acquire:"), "{events}");
+        assert!(
+            events.contains(&format!("release:releases/{NEW_DEPLOY_REVISION}")),
+            "{events}"
+        );
+        assert!(!fixture.hold.exists());
+        let old_log = fixture.state_dir.join("old-y2b.log");
+        if old_log.exists() {
+            let old_calls = fs::read_to_string(&old_log).unwrap();
+            assert!(!old_calls.contains("maintenance"), "{old_calls}");
+        }
     }
 
     struct RestoreFixture {
