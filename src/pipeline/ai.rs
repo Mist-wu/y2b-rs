@@ -3,7 +3,7 @@ use super::Pipeline;
 use crate::config::BatchMode;
 use crate::db::Database;
 use crate::model::AiUsage;
-use crate::process::{ProcessFailure, ProcessOutput, run_monitored};
+use crate::process::{ProcessOutput, process_error_output, run_monitored};
 use crate::subtitle::Cue;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -180,6 +180,15 @@ fn classify_process_error(error: anyhow::Error) -> anyhow::Error {
     classify_global_fault(&error.to_string(), None)
         .map(Into::into)
         .unwrap_or(error)
+}
+
+fn recover_usage_from_process_error(error: &anyhow::Error) -> (AiUsage, i64, Option<String>) {
+    process_error_output(error)
+        .map(|output| {
+            let parsed = inspect_pi_stream(&output.stdout);
+            (parsed.usage, output.duration_ms, parsed.raw_text)
+        })
+        .unwrap_or_else(|| (empty_usage(), 0, None))
 }
 
 fn inspect_pi_stream(stream: &str) -> PiStreamOutcome {
@@ -408,14 +417,8 @@ impl Pipeline {
             match run_monitored(cmd, Duration::from_secs(self.config.ai.timeout_seconds)).await {
                 Ok(output) => output,
                 Err(process_error) => {
-                    let (usage, duration_ms, raw_text) = process_error
-                        .downcast_ref::<ProcessFailure>()
-                        .map(|failure| {
-                            let output = failure.output();
-                            let parsed = inspect_pi_stream(&output.stdout);
-                            (parsed.usage, output.duration_ms, parsed.raw_text)
-                        })
-                        .unwrap_or_else(|| (empty_usage(), 0, None));
+                    let (usage, duration_ms, raw_text) =
+                        recover_usage_from_process_error(&process_error);
                     let error = classify_process_error(process_error);
                     let message = error.to_string();
                     audit.finish(
@@ -581,5 +584,27 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(estimate_segment_tokens(&cues) < 200_000);
         assert!(estimate_translation_tokens(&cues) < 200_000);
+    }
+
+    #[tokio::test]
+    async fn timeout_process_error_recovers_usage_from_captured_output() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}],\"usage\":{\"input\":5,\"output\":3,\"totalTokens\":8,\"cost\":{\"total\":0.02}}}]}'; sleep 30",
+        ]);
+        let error = run_monitored(command, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::process::ProcessTimeoutFailure>()
+                .is_some()
+        );
+        let (usage, duration_ms, raw_text) = recover_usage_from_process_error(&error);
+        assert_eq!(usage.total, 8);
+        assert_eq!(usage.cost, Some(0.02));
+        assert!(duration_ms > 0);
+        assert_eq!(raw_text.as_deref(), Some("hello"));
     }
 }
