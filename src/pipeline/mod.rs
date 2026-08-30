@@ -35,6 +35,59 @@ pub use upload::NEXT_BILIBILI_SUBMIT_AT;
 /// YouTube 的整数秒元数据与容器时长会有轻微舍入差异；超过这个范围通常意味着
 /// HLS 分片被跳过或合并出的文件不完整。
 const MAX_VIDEO_DURATION_DRIFT_SECONDS: f64 = 3.0;
+const COVER_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const COVER_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const COVER_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const COVER_RESPONSE_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+fn cover_http_client_with_timeouts(
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent("y2b-rs/0.1")
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .read_timeout(read_timeout)
+        .build()
+}
+
+fn cover_http_client() -> reqwest::Client {
+    cover_http_client_with_timeouts(
+        COVER_HTTP_CONNECT_TIMEOUT,
+        COVER_HTTP_REQUEST_TIMEOUT,
+        COVER_HTTP_READ_TIMEOUT,
+    )
+    .expect("固定封面 HTTP 客户端配置必须有效")
+}
+
+/// 流式读取封面响应；每次追加前先核对剩余额度，内存占用不会随超限正文增长。
+async fn read_cover_response_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit_u64)
+    {
+        bail!("封面响应体超过上限 {limit} 字节")
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(limit);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            bail!("封面响应体超过上限 {limit} 字节")
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct AiCircuitBreaker {
@@ -58,7 +111,7 @@ pub struct Pipeline {
     pub config: Config,
     pub db: Database,
     ai_circuit_breaker: AiCircuitBreaker,
-    /// 复用的 HTTP 客户端（目前只用于拉 YouTube 封面）。每次调用新建
+    /// 复用的有界 HTTP 客户端（目前只用于拉 YouTube 封面）。每次调用新建
     /// `reqwest::Client` 会重建 TLS 配置和连接池，没有必要。
     http: reqwest::Client,
 }
@@ -566,7 +619,7 @@ impl Pipeline {
             config,
             db,
             ai_circuit_breaker,
-            http: reqwest::Client::new(),
+            http: cover_http_client(),
         }
     }
 
@@ -909,7 +962,7 @@ impl Pipeline {
                 .send()
                 .await?
                 .error_for_status()?;
-            let bytes = response.bytes().await?;
+            let bytes = read_cover_response_body(response, COVER_RESPONSE_BODY_LIMIT).await?;
             if bytes.is_empty() {
                 bail!("YouTube 封面为空")
             }
@@ -1327,6 +1380,75 @@ mod tests {
         };
         let error = validate_media(oversized, None, 921_600).unwrap_err();
         assert!(error.to_string().contains("max_pixels=921600"));
+    }
+
+    #[tokio::test]
+    async fn cover_client_times_out_when_server_stalls() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = cover_http_client_with_timeouts(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let error = client
+            .get(format!("http://{address}/stalled-cover"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout(), "无响应封面服务应触发超时: {error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "封面 HTTP 超时没有及时中止"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn oversized_cover_body_is_rejected_while_streaming() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let payload = "x".repeat(65);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{payload}\r\n0\r\n\r\n",
+                payload.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = cover_http_client_with_timeouts(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let response = client
+            .get(format!("http://{address}/large-cover"))
+            .send()
+            .await
+            .unwrap();
+        let error = read_cover_response_body(response, 64).await.unwrap_err();
+        assert!(
+            error.to_string().contains("封面响应体超过上限 64 字节"),
+            "超大封面响应未被流式限长: {error:#}"
+        );
+        server.await.unwrap();
     }
 
     #[test]
