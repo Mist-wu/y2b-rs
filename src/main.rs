@@ -278,6 +278,40 @@ fn run_maintenance_command(command: &MaintenanceCmd) -> Result<()> {
     Ok(())
 }
 
+async fn run_subtitle_all(pipeline: &Pipeline) -> Result<()> {
+    let jobs = pipeline.db.jobs_awaiting_subtitle()?;
+    if jobs.is_empty() {
+        println!("没有待补字幕的已投稿视频");
+        return Ok(());
+    }
+    let mut failed = 0;
+    let mut skipped = 0;
+    let mut submitted = 0;
+    for job in jobs {
+        let bvid = job.bvid.as_deref().unwrap_or_default();
+        match pipeline.backfill_cc_subtitle(bvid).await {
+            Ok(message) => {
+                println!("{message}");
+                if message.contains("跳过") {
+                    skipped += 1;
+                } else {
+                    submitted += 1;
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                eprintln!("{bvid} 补字幕失败: {error:#}");
+            }
+        }
+    }
+    let summary = format!("完成: 提交 {submitted}，跳过 {skipped}，失败 {failed}");
+    println!("{summary}");
+    if failed > 0 {
+        anyhow::bail!("{summary}");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -494,31 +528,7 @@ async fn main() -> Result<()> {
             }
             SubtitleCmd::All => {
                 let pipeline = Pipeline::new(config, db);
-                let jobs = pipeline.db.jobs_awaiting_subtitle()?;
-                if jobs.is_empty() {
-                    println!("没有待补字幕的已投稿视频");
-                }
-                let mut failed = 0;
-                let mut skipped = 0;
-                let mut submitted = 0;
-                for job in jobs {
-                    let bvid = job.bvid.as_deref().unwrap_or_default();
-                    match pipeline.backfill_cc_subtitle(bvid).await {
-                        Ok(message) => {
-                            println!("{message}");
-                            if message.contains("跳过") {
-                                skipped += 1;
-                            } else {
-                                submitted += 1;
-                            }
-                        }
-                        Err(error) => {
-                            failed += 1;
-                            println!("{bvid} 补字幕失败: {error:#}");
-                        }
-                    }
-                }
-                println!("完成: 提交 {submitted}，跳过 {skipped}，失败 {failed}");
+                run_subtitle_all(&pipeline).await?;
             }
         },
         Cmd::Model(c) => match c {
@@ -1139,6 +1149,39 @@ mod tests {
         let error = finish_check(&config, &checks, true).await.unwrap_err();
         assert!(error.to_string().contains("必选检查失败: pi"));
         assert_eq!(fs::read_to_string(baseline).unwrap(), "原基线");
+    }
+
+    #[tokio::test]
+    async fn subtitle_all_returns_error_when_any_item_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+        let id = db
+            .create_job(y2b_rs::NewJob {
+                channel_id: None,
+                video_id: "subtitle-fail",
+                url: "https://youtu.be/subtitle-fail",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        db.update_job_status(&id, JobStatus::Completed, None)
+            .unwrap();
+        db.set_job_bvid(&id, "BV1subtitlefail").unwrap();
+        // 活跃维护锁会让 claim_subtitle_job_now 立即返回 None，使 backfill 在
+        // 触网前失败，从而离线验证批量命令的非零退出行为。
+        assert!(
+            db.acquire_maintenance_hold("tester", "测试维护", 300)
+                .unwrap()
+        );
+        let mut config = Config::default();
+        config.runtime.data_dir = temp.path().to_path_buf();
+        let pipeline = Pipeline::new(config, db);
+
+        let error = run_subtitle_all(&pipeline).await.unwrap_err();
+        assert!(error.to_string().contains("失败 1"));
     }
 
     #[test]
