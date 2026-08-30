@@ -2,6 +2,7 @@
 use super::cc::CC_INITIAL_DELAY_SECONDS;
 use super::publication::build_upload_args;
 use super::{Pipeline, StageGuard};
+use crate::db::UploadCompletionTiming;
 use crate::model::{Job, JobStatus, PreparedUpload, PublicationMetadata, VideoMetadata};
 use crate::process::{ProcessFailure, run_monitored};
 use anyhow::{Context, Result, bail};
@@ -180,14 +181,18 @@ impl Pipeline {
                 publication.title
             ),
         };
+        let next_submit_at =
+            self.bilibili_submission_deadline(self.config.bilibili.submit_interval_seconds)?;
         let subtitle_queued = self.db.confirm_uncertain_upload(
             job_id,
             &bvid,
             completion_status,
             mode,
-            CC_INITIAL_DELAY_SECONDS,
+            UploadCompletionTiming {
+                subtitle_delay_seconds: CC_INITIAL_DELAY_SECONDS,
+                next_submit_at,
+            },
         )?;
-        let _ = self.defer_bilibili_submissions(self.config.bilibili.submit_interval_seconds);
         self.db.event(
             Some(job_id),
             "info",
@@ -282,39 +287,60 @@ impl Pipeline {
                         return Err(UploadUncertainError { detail }.into());
                     }
                 };
+                let next_submit_at = match self
+                    .bilibili_submission_deadline(self.config.bilibili.submit_interval_seconds)
+                {
+                    Ok(next_submit_at) => next_submit_at,
+                    Err(error) => {
+                        let detail = format!(
+                            "Bilibili 已返回成功 {bvid}，但计算本地冷却时间失败（attempt={attempt_id}）: {error:#}"
+                        );
+                        let detail = match self.db.mark_upload_attempt_uncertain(
+                            &job.id,
+                            &attempt_id,
+                            &detail,
+                        ) {
+                            Ok(()) => detail,
+                            Err(mark_error) => {
+                                format!("{detail}；写入不确定状态失败: {mark_error:#}")
+                            }
+                        };
+                        return Err(UploadUncertainError { detail }.into());
+                    }
+                };
                 match self.db.finish_upload_attempt(
                     &job.id,
                     &attempt_id,
                     &bvid,
                     completion_status,
                     mode,
-                    CC_INITIAL_DELAY_SECONDS,
+                    UploadCompletionTiming {
+                        subtitle_delay_seconds: CC_INITIAL_DELAY_SECONDS,
+                        next_submit_at,
+                    },
                 ) {
                     Ok(subtitle_queued) => subtitle_queued,
                     Err(error) => {
                         let detail = format!(
                             "Bilibili 已返回成功 {bvid}，但本地确认失败（attempt={attempt_id}）: {error:#}"
                         );
-                        let _ =
-                            self.db
-                                .mark_upload_attempt_uncertain(&job.id, &attempt_id, &detail);
+                        let detail = match self.db.mark_upload_attempt_uncertain(
+                            &job.id,
+                            &attempt_id,
+                            &detail,
+                        ) {
+                            Ok(()) => detail,
+                            Err(mark_error) => {
+                                format!("{detail}；写入不确定状态失败: {mark_error:#}")
+                            }
+                        };
                         return Err(UploadUncertainError { detail }.into());
                     }
                 }
             }
         };
-        // 投稿 attempt 与任务终态已经由 finish_upload_attempt 同事务持久化。
-        if let Err(error) =
-            self.defer_bilibili_submissions(self.config.bilibili.submit_interval_seconds)
-        {
-            tracing::warn!(job_id = %job.id, error = %error, "投稿成功后写入冷却时间失败");
-            let _ = self.db.event(
-                Some(&job.id),
-                "warn",
-                &format!("投稿成功后写入冷却时间失败: {error}"),
-            );
-        }
-        // CC 字幕状态和首次到期时间已与投稿完成同事务写入，不占用上传 worker。
+        // 投稿 attempt、任务终态和全局冷却已经由 finish_upload_attempt 同事务持久化。
+        // CC 字幕状态和首次到期时间也在同一事务写入，不占用上传 worker。
         if subtitle_queued {
             self.db
                 .event(Some(&job.id), "info", "已投稿，等待自动补交中文 CC 字幕")?;
@@ -488,14 +514,21 @@ impl Pipeline {
         }
     }
 
-    pub(super) fn defer_bilibili_submissions(&self, seconds: u64) -> Result<()> {
+    fn bilibili_submission_deadline(&self, seconds: u64) -> Result<Option<DateTime<Utc>>> {
         if seconds == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
-        let not_before = Utc::now()
+        Utc::now()
             .checked_add_signed(chrono::Duration::seconds(seconds))
-            .context("Bilibili 投稿冷却时间溢出")?;
+            .map(Some)
+            .context("Bilibili 投稿冷却时间溢出")
+    }
+
+    pub(super) fn defer_bilibili_submissions(&self, seconds: u64) -> Result<()> {
+        let Some(not_before) = self.bilibili_submission_deadline(seconds)? else {
+            return Ok(());
+        };
         self.db
             .set_setting(NEXT_BILIBILI_SUBMIT_AT, &not_before.to_rfc3339())
     }
