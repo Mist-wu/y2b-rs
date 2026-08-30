@@ -382,18 +382,97 @@ fn is_youtube_video_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+fn validate_youtube_video_id(value: &str) -> Result<()> {
+    anyhow::ensure!(
+        is_youtube_video_id(value),
+        "YouTube video ID 必须是 11 位 ASCII 字母、数字、连字符或下划线: {value:?}"
+    );
+    Ok(())
+}
+
+fn canonical_youtube_video_url(video_id: &str) -> Result<String> {
+    validate_youtube_video_id(video_id)?;
+    Ok(format!("https://www.youtube.com/watch?v={video_id}"))
+}
+
+fn parse_operator_url(value: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value.trim()).context("请输入完整的 YouTube URL")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "YouTube URL 只允许 http 或 https"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "YouTube URL 不允许包含用户信息"
+    );
+    anyhow::ensure!(url.port().is_none(), "YouTube URL 不允许自定义端口");
+    Ok(url)
+}
+
+fn is_youtube_host(host: &str) -> bool {
+    matches!(
+        host,
+        "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com"
+    )
+}
+
+fn canonicalize_youtube_video_url(value: &str) -> Result<(String, String)> {
+    let url = parse_operator_url(value)?;
+    let host = url.host_str().context("YouTube URL 缺少域名")?;
+    let segments = url
+        .path_segments()
+        .context("YouTube URL 路径无效")?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let video_id = if host == "youtu.be" {
+        anyhow::ensure!(segments.len() == 1, "youtu.be URL 必须只包含 video ID");
+        segments[0].to_string()
+    } else {
+        anyhow::ensure!(
+            is_youtube_host(host),
+            "视频 URL 只允许 youtube.com 或 youtu.be 域名"
+        );
+        match segments.as_slice() {
+            ["watch"] => {
+                let mut values = url
+                    .query_pairs()
+                    .filter(|(key, _)| key == "v")
+                    .map(|(_, value)| value.into_owned());
+                let video_id = values.next().context("YouTube watch URL 缺少 video ID")?;
+                anyhow::ensure!(
+                    values.next().is_none(),
+                    "YouTube watch URL 包含多个 video ID"
+                );
+                video_id
+            }
+            [route, video_id] if matches!(*route, "shorts" | "live" | "embed") => {
+                (*video_id).to_string()
+            }
+            _ => bail!("请输入单个 YouTube 视频 URL"),
+        }
+    };
+    validate_youtube_video_id(&video_id)?;
+    let canonical_url = canonical_youtube_video_url(&video_id)?;
+    Ok((video_id, canonical_url))
+}
+
 /// yt-dlp 对裸频道 URL 返回的首层 entries 是 videos/shorts/streams 标签页，不是
 /// 视频。新频道入库和旧频道校对都在运行时规范化；用户明确给出的标签页则保留。
-fn normalize_channel_url(url: &str) -> String {
-    let trimmed = url.trim_end_matches('/');
-    if ["/videos", "/shorts", "/streams"]
+fn normalize_channel_url(value: &str) -> Result<String> {
+    let url = parse_operator_url(value)?;
+    let host = url.host_str().context("YouTube 频道 URL 缺少域名")?;
+    anyhow::ensure!(is_youtube_host(host), "频道 URL 只允许 youtube.com 域名");
+    let path = url.path().trim_end_matches('/');
+    anyhow::ensure!(!path.is_empty(), "YouTube 频道 URL 缺少频道路径");
+    let path = if ["/videos", "/shorts", "/streams"]
         .iter()
-        .any(|suffix| trimmed.ends_with(suffix))
+        .any(|suffix| path.ends_with(suffix))
     {
-        trimmed.to_string()
+        path.to_string()
     } else {
-        format!("{trimmed}/videos")
-    }
+        format!("{path}/videos")
+    };
+    Ok(format!("https://www.youtube.com{path}"))
 }
 
 fn random_jitter_factor() -> f64 {
@@ -667,6 +746,7 @@ impl Monitor {
     }
 
     pub async fn resolve_channel(&self, url: &str) -> Result<ResolvedChannel> {
+        let normalized_url = normalize_channel_url(url)?;
         let mut cmd = ytdlp_command(&self.config.youtube);
         cmd.args([
             "--flat-playlist",
@@ -674,7 +754,7 @@ impl Monitor {
             "1",
             "--dump-single-json",
             "--skip-download",
-            url,
+            &normalized_url,
         ]);
         let out = run_monitored(cmd, Duration::from_secs(90)).await?;
         let v: Value = serde_json::from_str(out.stdout.trim()).context("yt-dlp 频道 JSON 无效")?;
@@ -694,7 +774,7 @@ impl Monitor {
             feed_url: format!("https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"),
             channel_id,
             name,
-            url: normalize_channel_url(url),
+            url: normalized_url,
         })
     }
 
@@ -847,7 +927,7 @@ impl Monitor {
             {
                 continue;
             }
-            let url = format!("https://www.youtube.com/watch?v={}", video.video_id);
+            let url = canonical_youtube_video_url(&video.video_id)?;
             if self.db.insert_video_candidate(NewVideoCandidate {
                 video_id: &video.video_id,
                 channel_id: Some(channel.id),
@@ -913,9 +993,7 @@ impl Monitor {
         transfer_mode: TransferMode,
     ) -> Result<EnqueueOutcome> {
         let (meta, _, _) = self.fetch_metadata(url).await?;
-        if meta.id.trim().is_empty() {
-            bail!("无法解析 YouTube video ID")
-        }
+        validate_youtube_video_id(&meta.id)?;
         if let Some(job) = self.db.get_job_by_video_id(&meta.id)? {
             return Ok(EnqueueOutcome {
                 job,
@@ -927,7 +1005,7 @@ impl Monitor {
             .create_job(NewJob {
                 channel_id: None,
                 video_id: &meta.id,
-                url,
+                url: &meta.url,
                 title: Some(&meta.title),
                 published: None,
                 updated: None,
@@ -1128,7 +1206,7 @@ impl Monitor {
 
     async fn reconcile_channel(&self, id: i64, url: &str) -> Result<usize> {
         let baseline = self.db.channel_baseline(id)?;
-        let normalized_url = normalize_channel_url(url);
+        let normalized_url = normalize_channel_url(url)?;
         let mut cmd = ytdlp_command(&self.config.youtube);
         cmd.args([
             "--flat-playlist",
@@ -1154,12 +1232,7 @@ impl Monitor {
                 tracing::debug!(video_id, "校对条目不是 YouTube 视频，跳过");
                 continue;
             }
-            let link = e
-                .get("url")
-                .or_else(|| e.get("webpage_url"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={video_id}"));
+            let link = canonical_youtube_video_url(video_id)?;
             let title = e.get("title").and_then(Value::as_str);
             let timestamp = e
                 .get("timestamp")
@@ -1327,16 +1400,11 @@ impl Monitor {
                 continue;
             }
             let video_id = e.id.strip_prefix("yt:video:").unwrap_or(&e.id).to_string();
-            if video_id.len() < 6 {
+            if !is_youtube_video_id(&video_id) {
+                tracing::warn!(video_id, "RSS 返回非法 video_id，跳过");
                 continue;
             }
-            let link = e
-                .links
-                .iter()
-                .find(|l| l.rel.as_deref() == Some("alternate"))
-                .or_else(|| e.links.first())
-                .map(|l| l.href.clone())
-                .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={video_id}"));
+            let link = canonical_youtube_video_url(&video_id)?;
             let title = e.title.as_ref().map(|x| x.content.as_str());
             if enqueue
                 && (self.db.get_job_by_video_id(&video_id)?.is_some()
@@ -1643,13 +1711,14 @@ impl Monitor {
     }
 
     pub async fn fetch_metadata(&self, url: &str) -> Result<(VideoMetadata, u64, i64)> {
+        let (requested_video_id, canonical_url) = canonicalize_youtube_video_url(url)?;
         let mut cmd = ytdlp_command(&self.config.youtube);
         cmd.args([
             "--print",
             VIDEO_METADATA_TEMPLATE,
             "--skip-download",
             "--no-playlist",
-            url,
+            &canonical_url,
         ]);
         let out = run_monitored(cmd, Duration::from_secs(120)).await?;
         let v: Value = match serde_json::from_str(out.stdout.trim()) {
@@ -1669,14 +1738,24 @@ impl Monitor {
             v.get("duration").and_then(Value::as_f64),
             self.config.youtube.max_duration_seconds,
         )?;
+        // 该值会直接成为下载目录组件；即使输入 URL 已校验，也不能信任 yt-dlp 输出。
+        let video_id = v
+            .get("id")
+            .and_then(Value::as_str)
+            .context("yt-dlp 未返回 YouTube video ID")?;
+        validate_youtube_video_id(video_id)?;
+        anyhow::ensure!(
+            video_id == requested_video_id,
+            "yt-dlp 返回的 video ID 与输入 URL 不一致: {video_id} != {requested_video_id}"
+        );
         let live = v
             .get("live_status")
             .and_then(Value::as_str)
             .map(str::to_string);
         Ok((
             VideoMetadata {
-                id: v["id"].as_str().unwrap_or_default().into(),
-                url: url.into(),
+                id: video_id.into(),
+                url: canonical_url.clone(),
                 title: v["title"].as_str().unwrap_or("Untitled").into(),
                 description: v
                     .get("description")
@@ -1702,10 +1781,7 @@ impl Monitor {
                 height: v.get("height").and_then(Value::as_i64),
                 fps: v.get("fps").and_then(Value::as_f64),
                 thumbnail_url: extract_thumbnail_url(&v),
-                webpage_url: v
-                    .get("webpage_url")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                webpage_url: Some(canonical_url),
                 live_status: live,
                 default_audio_language: None,
             },
@@ -1806,6 +1882,7 @@ case "$url" in
   *longvideo01*) printf '%s\n' '{"_type":"video","id":"longvideo01","title":"long","duration":8000,"timestamp":2000000000,"live_status":"not_live"}' ;;
   *oldreplay01*) printf '%s\n' '{"_type":"video","id":"oldreplay01","title":"old replay","duration":10,"timestamp":1600000000,"live_status":"was_live"}' ;;
   *baseline001*) printf '%s\n' '{"_type":"video","id":"baseline001","title":"old normal","duration":10,"timestamp":1600000000,"live_status":"not_live"}' ;;
+  *deferred001*) printf '%s\n' '{"_type":"video","id":"deferred001","title":"deferred","duration":10,"timestamp":2000000000,"live_status":"not_live"}' ;;
   *) printf '%s\n' '{"_type":"video","id":"normalvid01","title":"normal","duration":10,"timestamp":2000000000,"live_status":"not_live"}' ;;
 esac
 "#,
@@ -1825,10 +1902,27 @@ esac
             &path,
             r#"#!/bin/sh
 case " $* " in
-  *" --flat-playlist "*) printf '%s\n' '{"entries":[{"id":"normalvid01","title":"normal","url":"https://www.youtube.com/watch?v=normalvid01"}]}' ;;
+  *" --flat-playlist "*) printf '%s\n' '{"entries":[{"id":"normalvid01","title":"normal","url":"https://example.invalid/forged"}]}' ;;
   *) exit 97 ;;
 esac
 "#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn fixed_metadata_ytdlp(dir: &std::path::Path, name: &str, video_id: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"_type\":\"video\",\"id\":\"{video_id}\",\"title\":\"test\",\"duration\":10,\"live_status\":\"not_live\"}}'\n"
+            ),
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
@@ -2026,23 +2120,144 @@ esac
     }
 
     #[test]
-    fn reconciliation_filters_channel_tabs_and_normalizes_bare_urls() {
+    fn youtube_urls_and_video_ids_are_strictly_canonicalized() {
+        const VIDEO_ID: &str = "dQw4w9WgXcQ";
+        const CANONICAL: &str = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+
         assert!(is_youtube_video_id("P3ncIFdXrO0"));
         assert!(is_youtube_video_id("-lfxKdAm3vA"));
         assert!(!is_youtube_video_id("UCoFbVpsJ-XP8zl77ntGWBqw"));
         assert!(!is_youtube_video_id("playlist"));
 
+        for input in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123#chapter",
+            "http://youtu.be/dQw4w9WgXcQ?t=43",
+            "https://m.youtube.com/shorts/dQw4w9WgXcQ?feature=share",
+            "https://music.youtube.com/live/dQw4w9WgXcQ",
+            "https://youtube.com/embed/dQw4w9WgXcQ",
+        ] {
+            let (video_id, url) = canonicalize_youtube_video_url(input).unwrap();
+            assert_eq!(video_id, VIDEO_ID);
+            assert_eq!(url, CANONICAL);
+        }
+
+        for input in [
+            "dQw4w9WgXcQ",
+            "ftp://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://example.com/watch?v=dQw4w9WgXcQ",
+            "https://youtube.com.evil.example/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be.evil.example/dQw4w9WgXcQ",
+            "https://www.youtube.com:444/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=too-short",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&v=P3ncIFdXrO0",
+            "https://www.youtube.com/playlist?list=PL123",
+            "https://youtu.be/dQw4w9WgXcQ/extra",
+        ] {
+            assert!(
+                canonicalize_youtube_video_url(input).is_err(),
+                "非法 URL 应被拒绝: {input}"
+            );
+        }
+
         assert_eq!(
-            normalize_channel_url("https://www.youtube.com/@WiiBrawlStars"),
-            "https://www.youtube.com/@WiiBrawlStars/videos"
-        );
-        assert_eq!(
-            normalize_channel_url("https://www.youtube.com/@WiiBrawlStars/"),
+            normalize_channel_url("http://m.youtube.com/@WiiBrawlStars/?view=0").unwrap(),
             "https://www.youtube.com/@WiiBrawlStars/videos"
         );
         for tab in ["videos", "shorts", "streams"] {
             let url = format!("https://www.youtube.com/@channel/{tab}");
-            assert_eq!(normalize_channel_url(&url), url);
+            assert_eq!(normalize_channel_url(&url).unwrap(), url);
+        }
+        for input in [
+            "https://example.com/@channel",
+            "https://youtube.com.evil.example/@channel",
+            "https://youtu.be/dQw4w9WgXcQ",
+        ] {
+            assert!(normalize_channel_url(input).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_queue_persists_only_the_canonical_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.youtube.yt_dlp = fixed_metadata_ytdlp(dir.path(), "canonical-yt-dlp", "dQw4w9WgXcQ");
+        config.runtime.download_dir = dir.path().join("downloads");
+        let db = Database::open(&dir.path().join("canonical.db")).unwrap();
+        let monitor = Monitor::new(config.clone(), db).unwrap();
+
+        let outcome = monitor
+            .enqueue_video("http://youtu.be/dQw4w9WgXcQ?t=43", TransferMode::Direct)
+            .await
+            .unwrap();
+        assert_eq!(outcome.job.video_id, "dQw4w9WgXcQ");
+        assert_eq!(
+            outcome.job.url,
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        );
+        assert!(!config.runtime.download_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn invalid_operator_url_is_rejected_without_creating_a_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("unexpected-directory");
+        let script = dir.path().join("must-not-run-yt-dlp");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nmkdir -p \"{}\"\nprintf '%s\\n' '{{\"_type\":\"video\",\"id\":\"dQw4w9WgXcQ\",\"title\":\"test\"}}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let mut config = Config::default();
+        config.youtube.yt_dlp = script.to_string_lossy().into_owned();
+        config.runtime.download_dir = dir.path().join("downloads");
+        let db = Database::open(&dir.path().join("invalid-input.db")).unwrap();
+        let monitor = Monitor::new(config.clone(), db.clone()).unwrap();
+        let error = monitor
+            .enqueue_video(
+                "https://example.invalid/watch?v=dQw4w9WgXcQ",
+                TransferMode::Direct,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("域名"));
+        assert!(db.get_job_by_video_id("dQw4w9WgXcQ").unwrap().is_none());
+        assert!(!marker.exists(), "非法输入不应启动 yt-dlp");
+        assert!(!config.runtime.download_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn metadata_id_is_revalidated_before_it_can_become_a_directory_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let download_dir = dir.path().join("downloads");
+        for (name, returned_id, expected_error) in [
+            ("unsafe-id-yt-dlp", "../escape", "必须是 11 位"),
+            ("mismatch-id-yt-dlp", "normalvid01", "不一致"),
+        ] {
+            let mut config = Config::default();
+            config.youtube.yt_dlp = fixed_metadata_ytdlp(dir.path(), name, returned_id);
+            config.runtime.download_dir = download_dir.clone();
+            let db = Database::open(&dir.path().join(format!("{name}.db"))).unwrap();
+            let monitor = Monitor::new(config, db).unwrap();
+            let error = monitor
+                .fetch_metadata("https://youtu.be/dQw4w9WgXcQ")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(expected_error),
+                "返回 ID {returned_id:?} 的错误不明确: {error}"
+            );
+            assert!(!download_dir.exists(), "非法 ID 不得产生下载目录");
         }
     }
 
@@ -2406,7 +2621,7 @@ esac
   <entry>
     <id>yt:video:normalvid01</id><yt:videoId>normalvid01</yt:videoId>
     <title>normal</title>
-    <link rel="alternate" href="https://www.youtube.com/watch?v=normalvid01" />
+    <link rel="alternate" href="https://example.invalid/forged" />
     <published>2035-01-01T00:00:00Z</published><updated>2035-01-01T00:00:00Z</updated>
   </entry>
 </feed>"#;
@@ -2427,6 +2642,7 @@ esac
         server.await.unwrap();
         let candidate = db.get_video_candidate("normalvid01").unwrap().unwrap();
         assert_eq!(candidate.source, CandidateSource::Rss);
+        assert_eq!(candidate.url, "https://www.youtube.com/watch?v=normalvid01");
         assert_eq!(candidate.gate_state, crate::model::GateState::Pending);
         assert!(db.get_job_by_video_id("normalvid01").unwrap().is_none());
 
@@ -2445,6 +2661,7 @@ esac
         );
         let candidate = db.get_video_candidate("normalvid01").unwrap().unwrap();
         assert_eq!(candidate.source, CandidateSource::Ytdlp);
+        assert_eq!(candidate.url, "https://www.youtube.com/watch?v=normalvid01");
         assert!(db.get_job_by_video_id("normalvid01").unwrap().is_none());
     }
 
@@ -2528,6 +2745,7 @@ esac
         assert_eq!(channel.uploads_playlist_id.as_deref(), Some("UU-data-api"));
         let candidate = db.get_video_candidate("normalvid01").unwrap().unwrap();
         assert_eq!(candidate.source, CandidateSource::DataApi);
+        assert_eq!(candidate.url, "https://www.youtube.com/watch?v=normalvid01");
         assert_eq!(candidate.title.as_deref(), Some("from api"));
         assert!(db.get_job_by_video_id("normalvid01").unwrap().is_none());
         assert_eq!(
