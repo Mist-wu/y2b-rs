@@ -483,7 +483,9 @@ class LiveOnce:
         return True
 
     def start_upload_hold_worker(self) -> None:
-        if self.state.get("bvid") or self.hold_thread is not None:
+        if self.hold_thread is not None:
+            return
+        if self.state.get("upload_recorded") and not self.state.get("upload_hold"):
             return
 
         def worker() -> None:
@@ -530,52 +532,78 @@ class LiveOnce:
                     continue
             return
 
+    def _write_cooldown_and_release_hold(
+        self,
+        connection: sqlite3.Connection,
+        owner: str,
+        now_time: dt.datetime,
+        now: str,
+        *,
+        require_owner: bool,
+    ) -> tuple[bool, str | None]:
+        """在现有事务内写全局投稿冷却，并在自己持有租约时释放它。
+
+        `require_owner=True` 用于旧的独立释放路径：拿不到自己的租约时既不写冷却
+        也不删除任何行，交由调用方报错。`require_owner=False` 用于原子交接：
+        投稿终态和冷却必须写回，只有租约按 owner 精确删除，绝不误删他方锁。
+        """
+        next_submit_time = now_time + dt.timedelta(
+            seconds=self.args.submit_interval_seconds
+        )
+        hold = connection.execute(
+            "SELECT owner,reason,expires_at FROM maintenance_hold WHERE singleton=1"
+        ).fetchone()
+        owns_hold = hold is not None and hold["owner"] == owner
+        if require_owner and not owns_hold:
+            return False, None
+        current_row = connection.execute(
+            "SELECT value FROM settings WHERE key=?", (NEXT_SUBMIT_KEY,)
+        ).fetchone()
+        current = str(current_row[0]) if current_row else None
+        # 租约期间若平台限流写入了更晚的冷却时间，释放时必须保留它。
+        if current:
+            try:
+                current_time = parse_time(current)
+                if current_time > next_submit_time:
+                    next_submit_time = current_time
+            except ValueError:
+                if require_owner:
+                    raise
+                log(f"忽略无法解析的原投稿冷却时间: {current}")
+        next_submit = iso(next_submit_time)
+        connection.execute(
+            """
+            INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
+            """,
+            (NEXT_SUBMIT_KEY, next_submit, now),
+        )
+        if owns_hold:
+            connection.execute(
+                "DELETE FROM maintenance_hold WHERE singleton=1 AND owner=?",
+                (owner,),
+            )
+            self.record_hold_event(
+                connection,
+                "released",
+                owner,
+                str(hold["reason"]),
+                now,
+                str(hold["expires_at"]),
+            )
+            return True, next_submit
+        return False, next_submit
+
     def release_upload_hold_after_success(self) -> None:
         owner = self.upload_hold_owner()
         now_time = utc_now()
-        next_submit_time = now_time + dt.timedelta(seconds=self.args.submit_interval_seconds)
         now = iso(now_time)
-        released = False
-        next_submit: str | None = None
         with sqlite_connect(Path(self.args.database)) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            hold = connection.execute(
-                "SELECT owner,reason,expires_at FROM maintenance_hold WHERE singleton=1"
-            ).fetchone()
-            if hold is not None and hold["owner"] == owner:
-                current_row = connection.execute(
-                    "SELECT value FROM settings WHERE key=?", (NEXT_SUBMIT_KEY,)
-                ).fetchone()
-                current = str(current_row[0]) if current_row else None
-                # 租约期间若平台限流写入了更晚的冷却时间，释放时必须保留它。
-                if current:
-                    current_time = parse_time(current)
-                    if current_time > next_submit_time:
-                        next_submit_time = current_time
-                next_submit = iso(next_submit_time)
-                connection.execute(
-                    """
-                    INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
-                    ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
-                    """,
-                    (NEXT_SUBMIT_KEY, next_submit, now),
-                )
-                connection.execute(
-                    "DELETE FROM maintenance_hold WHERE singleton=1 AND owner=?",
-                    (owner,),
-                )
-                self.record_hold_event(
-                    connection,
-                    "released",
-                    owner,
-                    str(hold["reason"]),
-                    now,
-                    str(hold["expires_at"]),
-                )
-                connection.commit()
-                released = True
-            else:
-                connection.rollback()
+            released, next_submit = self._write_cooldown_and_release_hold(
+                connection, owner, now_time, now, require_owner=True
+            )
+            connection.commit()
         if not released:
             raise RuntimeError("cannot release a maintenance hold owned by another process")
         self.save(upload_hold=False, released_next_submit_at=next_submit)
@@ -1458,6 +1486,73 @@ class LiveOnce:
             "default_audio_language": self.metadata.get("default_audio_language"),
         }
 
+    def _record_upload_sql(
+        self,
+        connection: sqlite3.Connection,
+        video: Path,
+        bvid: str,
+        now: str,
+        metadata: dict[str, Any],
+        probe: dict[str, Any],
+    ) -> None:
+        """在现有事务内写回投稿终态（不含 BEGIN/COMMIT 与状态落盘）。"""
+        job = connection.execute(
+            "SELECT id,error FROM jobs WHERE video_id=?", (self.args.video_id,)
+        ).fetchone()
+        if job is None or job["id"] != self.state["job_id"]:
+            raise RuntimeError("reserved live-once job disappeared before upload recording")
+        self.update_job_bvid_or_mark_uncertain(
+            connection,
+            """
+            UPDATE jobs SET
+              title=?,status='uploaded_original_pending_subtitle',bvid=?,error=NULL,
+              raw_video_path=?,duration_seconds=?,width=?,height=?,fps=?,
+              source_metadata_json=?,subtitle_attempt=0,subtitle_retry_at=?,updated_at=?
+            WHERE id=?
+            """,
+            (
+                self.args.title,
+                bvid,
+                str(video),
+                float(probe.get("duration") or 0),
+                probe.get("width"),
+                probe.get("height"),
+                self.metadata.get("fps"),
+                json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                SIDECAR_SUBTITLE_RETRY_AT,
+                now,
+                self.state["job_id"],
+            ),
+            bvid,
+            str(self.state["upload_attempt_id"])
+            if self.state.get("upload_attempt_id")
+            else None,
+        )
+        connection.execute(
+            """
+            UPDATE video_candidates SET
+              title=COALESCE(?,title),published_at=COALESCE(?,published_at),
+              gate_state='promoted',next_gate_at=NULL,last_error=NULL
+            WHERE video_id=?
+            """,
+            (
+                self.metadata.get("title"),
+                iso(dt.datetime.fromtimestamp(metadata["timestamp"], UTC))
+                if metadata.get("timestamp")
+                else None,
+                self.args.video_id,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO events(job_id,level,message,created_at) VALUES(?,?,?,?)",
+            (
+                self.state["job_id"],
+                "info",
+                f"一次性直播旁路投稿成功: {bvid}；由旁路持续等待官方字幕",
+                now,
+            ),
+        )
+
     def record_upload(self, video: Path, bvid: str) -> None:
         if self.state.get("upload_recorded"):
             return
@@ -1466,65 +1561,48 @@ class LiveOnce:
         probe = self.state.get("video_probe") or {}
         with sqlite_connect(Path(self.args.database)) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            job = connection.execute(
-                "SELECT id,error FROM jobs WHERE video_id=?", (self.args.video_id,)
-            ).fetchone()
-            if job is None or job["id"] != self.state["job_id"]:
-                raise RuntimeError("reserved live-once job disappeared before upload recording")
-            self.update_job_bvid_or_mark_uncertain(
-                connection,
-                """
-                UPDATE jobs SET
-                  title=?,status='uploaded_original_pending_subtitle',bvid=?,error=NULL,
-                  raw_video_path=?,duration_seconds=?,width=?,height=?,fps=?,
-                  source_metadata_json=?,subtitle_attempt=0,subtitle_retry_at=?,updated_at=?
-                WHERE id=?
-                """,
-                (
-                    self.args.title,
-                    bvid,
-                    str(video),
-                    float(probe.get("duration") or 0),
-                    probe.get("width"),
-                    probe.get("height"),
-                    self.metadata.get("fps"),
-                    json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
-                    SIDECAR_SUBTITLE_RETRY_AT,
-                    now,
-                    self.state["job_id"],
-                ),
-                bvid,
-                str(self.state["upload_attempt_id"])
-                if self.state.get("upload_attempt_id")
-                else None,
-            )
-            connection.execute(
-                """
-                UPDATE video_candidates SET
-                  title=COALESCE(?,title),published_at=COALESCE(?,published_at),
-                  gate_state='promoted',next_gate_at=NULL,last_error=NULL
-                WHERE video_id=?
-                """,
-                (
-                    self.metadata.get("title"),
-                    iso(dt.datetime.fromtimestamp(metadata["timestamp"], UTC))
-                    if metadata.get("timestamp")
-                    else None,
-                    self.args.video_id,
-                ),
-            )
-            connection.execute(
-                "INSERT INTO events(job_id,level,message,created_at) VALUES(?,?,?,?)",
-                (
-                    self.state["job_id"],
-                    "info",
-                    f"一次性直播旁路投稿成功: {bvid}；由旁路持续等待官方字幕",
-                    now,
-                ),
-            )
+            self._record_upload_sql(connection, video, bvid, now, metadata, probe)
             connection.commit()
         self.save(upload_recorded=True, phase="waiting_subtitle")
         log("投稿结果已原子写回 y2b 数据库")
+
+    def commit_upload_handoff(self, video: Path, bvid: str) -> None:
+        """把投稿终态、全局投稿冷却与租约释放合并为一个原子事务。
+
+        只有这个事务成功之后 execute 才会停止续租 worker；否则重启时 state 里
+        已有 BVID，worker 会拒绝恢复续租，普通投稿就能在租约过期后绕过刚发生的
+        旁路投稿冷却，字幕交接也可能永久停住。
+        """
+        if self.state.get("upload_recorded") and not self.state.get("upload_hold"):
+            return
+        owner = self.upload_hold_owner()
+        now_time = utc_now()
+        now = iso(now_time)
+        metadata = self.source_metadata(video)
+        probe = self.state.get("video_probe") or {}
+        with sqlite_connect(Path(self.args.database)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._record_upload_sql(connection, video, bvid, now, metadata, probe)
+            released, next_submit = self._write_cooldown_and_release_hold(
+                connection, owner, now_time, now, require_owner=False
+            )
+            connection.commit()
+        # 事务成功，租约已在数据库释放；立即停掉续租，避免 worker 在停表前
+        # 重新抢到刚释放的租约。
+        self.hold_stop.set()
+        self.save(
+            upload_recorded=True,
+            phase="waiting_subtitle",
+            upload_hold=False,
+            released_next_submit_at=next_submit,
+        )
+        if released:
+            log(
+                "投稿终态、全局投稿冷却与维护租约已原子提交；"
+                f"下一次最早投稿时间: {next_submit}"
+            )
+        else:
+            log("投稿终态与全局投稿冷却已提交；维护租约由其他进程持有，未改动")
 
     def wait_for_subtitle(self, bvid: str) -> None:
         attempt = int(self.state.get("subtitle_attempt", 0))
@@ -1639,9 +1717,8 @@ class LiveOnce:
             self.fetch_metadata()
             video = self.capture_until_end()
             bvid = self.upload_video(video)
+            self.commit_upload_handoff(video, bvid)
             self.stop_upload_hold_worker()
-            self.record_upload(video, bvid)
-            self.release_upload_hold_after_success()
             self.wait_for_subtitle(bvid)
 
 
