@@ -109,7 +109,7 @@ y2b backup | auth-check | check --write-baseline
 <summary><b>队列与容错</b></summary>
 
 - SQLite 持久化频道、任务、阶段、峰值 RSS、Pi token/cost 和认证状态。普通故障连续失败 5 次进 `dead_letter` 并删除大型视频；失败间按 `min(5min × 2^n, 1h)` 退避，首次重试仍是 10 分钟。直播／预约／回放生成中不消耗失败次数。
-- `watch` 使用单个准备 worker + 单个上传 worker + 单个字幕 worker。任务准备完成后持久化为 `ready_to_upload`，投稿冷却期间仍可继续下载和翻译后续任务，实际上传严格串行。最终领取任务的写事务会同时复核投稿冷却和 `live_once` 独占 hold，避免旁路暂停与普通投稿抢跑；hold 只允许 owner 自己释放，并保留期间写入的更晚平台冷却。CC 字幕补交独立成队列，不占用上传 worker。
+- `watch` 使用单个准备 worker + 单个上传 worker + 单个字幕 worker。任务准备完成后持久化为 `ready_to_upload`，投稿冷却期间仍可继续下载和翻译后续任务，实际上传严格串行。最终领取任务的写事务会同时复核投稿冷却和维护锁。CC 字幕补交独立成队列，不占用上传 worker。
 - 每次真正投稿先持久化 attempt；中断且无法确认结果时进入 `upload_uncertain`，禁止自动重投。`jobs reconcile-upload` 查询创作中心后，只有标题匹配、稿件发布时间晚于本次 attempt 开始时间且 BVID 未被其他任务占用时才会确认；缺少任一证据都会保持不确定态并要求人工提供 BVID。数据库同时用部分唯一索引保证一个非空 BVID 只能归属一个任务。
 
 - RSS 轮询／yt-dlp 校对与备份／认证各跑独立任务，长时间 yt-dlp 调用不阻塞队列调度。裸频道 URL 规范化到内容标签页，校对结果中的频道／播放列表条目不会被误当视频。
@@ -220,7 +220,7 @@ ssh azureuser@20.89.60.23 "sudo bash /tmp/y2b-release-$release_id/deploy/deploy-
 
 ### maintenance hold 与原子 release 边界
 
-**maintenance hold** 是 SQLite 中带 owner、原因和租期的真实写锁，不再只是运维约定。它会阻止 watch、手动 `y2b run` 和字幕流程领取新工作；部署获取锁后仍要等待已经领取的任务结束。`deploy-app.sh` 以 `deploy:<revision>:<UTC 时间>:<PID>` 作为唯一 owner，每轮等待都会续租，并用 `status --json --owner <本次 owner>` 排除自己的锁。`active_claims`、`upload_attempts`、`subtitle_attempts`、`live_once_hold` 等 blocker 的 kind、数量和 details 都会原样打印。
+**maintenance hold** 是 SQLite 中带 owner、原因和租期的真实写锁，不再只是运维约定。它会阻止 watch、手动 `y2b run` 和字幕流程领取新工作；部署获取锁后仍要等待已经领取的任务结束。`deploy-app.sh` 以 `deploy:<revision>:<UTC 时间>:<PID>` 作为唯一 owner，每轮等待都会续租，并用 `status --json --owner <本次 owner>` 排除自己的锁。`active_claims`、`upload_attempts`、`subtitle_attempts` 等 blocker 的 kind、数量和 details 都会原样打印。
 
 手工维护也必须使用唯一 owner，并始终显式指定数据库：
 
@@ -240,7 +240,7 @@ y2b maintenance release --database /var/lib/y2b/state.db --owner "$owner"
 
 1. 在获取 hold 之前完成 `config-check`、Pi extension 解析、凭据、Python、SQLite 等静态预检。
 2. 获取 hold，间隔等待两次连续 idle；hold 挡住新领取，两次检查只需排空存量工作。
-3. 把二进制、全部 Pi 资源、`Cargo.lock`、`scripts/live_once.py` 和 deploy 脚本（含两个 systemd 单元）写入隐藏 staging，完整后发布为不可变的 `/opt/y2b/releases/<revision>/`，不改动运行中的 `current`。
+3. 把二进制、全部 Pi 资源、`Cargo.lock` 和 deploy 脚本（含 watch systemd 单元）写入隐藏 staging，完整后发布为不可变的 `/opt/y2b/releases/<revision>/`，不改动运行中的 `current`。
 4. 生成迁移前快照并做严格完整性校验（`integrity_check` 只返回一行 `ok`）。完整 hold 路径在停服前在线备份；自举路径在第二次 idle 通过后立即停服并确认 inactive 再备份，保证快照是停服后的静止状态。
 5. 以临时符号链接和单次 `mv -T` 原子切换 `/opt/y2b/current`，再依次执行显式迁移、`y2b check --write-baseline`、启动和稳定窗口健康检查。systemd 直接执行 `/opt/y2b/current/y2b`，Pi 兼容路径也经 `current/pi` 解析。
 6. 稳定窗口健康检查成功后才释放 hold。脚本保留当前版、上一版和若干旧 release；超出上限时只按修改时间清理名称符合十六进制 revision 规则的真实目录，不跟随符号链接。

@@ -2096,39 +2096,6 @@ PY
     }
 
     #[test]
-    fn deploy_ships_live_once_bypass_and_installs_its_unit() {
-        let fixture = deploy_fixture("success");
-        let output = fixture.run(3);
-        assert!(output.status.success(), "{}", output_detail(&output));
-        let live_once = fixture
-            .app_root
-            .join("releases")
-            .join(NEW_DEPLOY_REVISION)
-            .join("scripts/live_once.py");
-        assert!(live_once.is_file());
-        assert!(
-            fixture
-                .app_root
-                .join("current/scripts/live_once.py")
-                .is_file()
-        );
-        let unit =
-            fs::read_to_string(fixture.unit_dir.join("y2b-live-once-qhvPlcwJUvk.service")).unwrap();
-        let exec_start = unit
-            .lines()
-            .find(|line| line.starts_with("ExecStart="))
-            .unwrap();
-        let script = exec_start
-            .trim_start_matches("ExecStart=")
-            .split_whitespace()
-            .next()
-            .unwrap();
-        assert_eq!(script, "/opt/y2b/current/scripts/live_once.py");
-        let relative = script.strip_prefix("/opt/y2b/").unwrap();
-        assert!(fixture.app_root.join(relative).is_file());
-    }
-
-    #[test]
     fn deploy_continues_when_only_the_deployed_binary_drifts() {
         let fixture = deploy_fixture("success");
         fs::write(
