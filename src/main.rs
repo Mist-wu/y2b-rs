@@ -1229,11 +1229,15 @@ mod tests {
         let mv_probe = deploy
             .find("\"$mv_cmd\" -Tf -- \"$mv_probe_dir/source\" \"$mv_probe_dir/target\"")
             .unwrap();
+        let hold_table_check = deploy.find("maintenance_hold_tables=").unwrap();
         let acquire = deploy.find("maintenance acquire").unwrap();
-        let idle_wait = deploy.find("wait_for_two_idle_checks_bootstrap").unwrap();
+        let idle_wait = deploy.find("\nwait_for_two_idle_checks\n").unwrap();
         assert!(sqlite_check < acquire);
         assert!(mv_probe < acquire);
+        assert!(hold_table_check < acquire);
         assert!(acquire < idle_wait);
+        assert!(!deploy.contains("wait_for_two_idle_checks_bootstrap"));
+        assert!(!deploy.contains("legacy_capture_required"));
         assert!(deploy.contains(
             "maintenance status \\\n      --database \"$database\" --owner \"$owner\" --json"
         ));
