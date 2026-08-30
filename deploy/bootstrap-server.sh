@@ -5,8 +5,8 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-# sqlite3 主要供服务已运行后的再次部署做空闲断言，并且是所有 restore 的硬依赖；
-# 首次部署时服务尚未 active，assert_idle 会跳过数据库查询。
+# sqlite3 用于迁移前备份及完整性校验，并且是所有 restore 的硬依赖；jq 解析
+# maintenance status 的 blockers，不能用只看少数状态列的 SQL 代替。
 apt-get install -y ca-certificates curl jq xz-utils tar fontconfig gnupg python3 sqlite3
 
 if ! swapon --show=NAME --noheadings | grep -qx /swapfile; then
@@ -65,7 +65,7 @@ tar -xJf "$tmp_dir/biliup.tar.xz" -C "$tmp_dir"
 bili_bin=$(find "$tmp_dir" -type f -name biliup | head -1)
 install -m 0755 "$bili_bin" /usr/local/bin/biliup
 
-install -d /opt/y2b/pi /var/lib/y2b/{downloads,backups} /etc/y2b
+install -d /opt/y2b/releases /var/lib/y2b/{downloads,backups} /etc/y2b
 install -d -o root -g root -m 0700 /var/lib/y2b/pi-agent
 if [[ ! -f /etc/y2b/y2b.env ]]; then
   install -o root -g root -m 0600 /dev/null /etc/y2b/y2b.env
