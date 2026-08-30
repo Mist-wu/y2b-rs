@@ -1,0 +1,2 @@
+# deploy/tests 中固定假 Key 的唯一历史 finding；依次锁定提交、文件、规则和行号。
+a9fb21bab9f0cd23f5711773a3c903276dda2195:deploy/tests/test_y2b_set_deepseek_key.py:generic-api-key:80
