@@ -1302,10 +1302,13 @@ impl Database {
         Ok(())
     }
     pub fn set_channel_enabled(&self, id: i64, enabled: bool) -> Result<()> {
-        self.conn().execute(
+        let changed = self.conn().execute(
             "UPDATE channels SET enabled=? WHERE id=?",
             params![enabled as i64, id],
         )?;
+        if changed == 0 {
+            anyhow::bail!("频道不存在: {id}")
+        }
         Ok(())
     }
     pub fn set_channel_transfer_mode(&self, id: i64, transfer_mode: TransferMode) -> Result<()> {
@@ -4161,6 +4164,29 @@ mod tests {
             db.get_job(&second).unwrap().unwrap().transfer_mode,
             TransferMode::Translated
         );
+    }
+
+    #[test]
+    fn set_channel_enabled_reports_missing_channel_and_updates_existing() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("x.db")).unwrap();
+
+        let error = db.set_channel_enabled(999, false).unwrap_err().to_string();
+        assert!(error.contains("频道不存在"));
+
+        let id = db
+            .add_channel(
+                "UC-enable",
+                "enable",
+                "https://youtube.com/@enable/videos",
+                "https://youtube.com/feeds/videos.xml?channel_id=UC-enable",
+                TransferMode::Direct,
+            )
+            .unwrap();
+        db.set_channel_enabled(id, false).unwrap();
+        assert!(!db.channel(id).unwrap().enabled);
+        db.set_channel_enabled(id, true).unwrap();
+        assert!(db.channel(id).unwrap().enabled);
     }
 
     #[test]
