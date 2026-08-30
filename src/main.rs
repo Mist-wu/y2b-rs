@@ -10,15 +10,18 @@ use tokio::process::Command;
 /// 取 50 是为了对齐 `videos.list` 的批量上限：闸门每轮最多发一次 videos.list，
 /// 一次 1 个配额单位。取小于 50（此前是 25）会让同样的候选量多花一倍配额。
 const GATE_BATCH: usize = 50;
+#[cfg(feature = "tui")]
+use y2b_rs::tui;
 use y2b_rs::{
     Database, check,
     config::{AI_MODEL, AI_PROVIDER, AI_THINKING, AI_TRANSLATION_MODEL, Config},
+    cookies,
     db::CURRENT_SCHEMA_VERSION,
     model::{ChannelPriority, JobStatus, TransferMode},
     monitor::Monitor,
     pipeline::{self, AiCircuitBreaker, Pipeline},
     process::run_monitored,
-    tui, websub,
+    websub,
 };
 
 #[derive(Parser)]
@@ -58,6 +61,7 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = TransferMode::Translated)]
         mode: TransferMode,
     },
+    #[cfg(feature = "tui")]
     Tui,
     Backup,
     AuthCheck,
@@ -378,6 +382,7 @@ async fn main() -> Result<()> {
             }
             Pipeline::new(config, db).run_job(outcome.job).await?;
         }
+        #[cfg(feature = "tui")]
         Cmd::Tui => tui::run(&cli.config, config, db)?,
         Cmd::Backup => {
             println!("backup: {}", backup(&config, &db)?.display());
@@ -556,7 +561,7 @@ async fn main() -> Result<()> {
         },
         Cmd::Login(c) => match c {
             LoginCmd::Youtube { cookies_file } => {
-                tui::import_cookie(&cookies_file, &config.youtube.cookies)?;
+                cookies::import_cookie(&cookies_file, &config.youtube.cookies)?;
                 println!("已导入 {}", config.youtube.cookies.display());
             }
             LoginCmd::Bilibili => {

@@ -15,7 +15,7 @@ class CiContractTests(unittest.TestCase):
         required_commands = (
             "cargo fmt --check",
             "cargo clippy --all-targets --all-features -- -D warnings",
-            "cargo test",
+            "cargo test --all-features",
             "npm run check",
             "python3 -m unittest discover -s scripts",
             "python3 -m unittest discover -s deploy/tests",

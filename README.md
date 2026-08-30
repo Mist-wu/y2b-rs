@@ -4,7 +4,7 @@
 
 **监控 YouTube 频道 → 下载 → Pi 分句翻译 → 投稿 Bilibili → 自动补中文 CC 字幕**
 
-单二进制 Rust CLI/TUI，SQLite 持久化队列，全流程无人值守。
+单二进制 Rust CLI、可选 TUI，SQLite 持久化队列，全流程无人值守。
 
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-000?logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -36,7 +36,7 @@ y2b login youtube /path/to/cookies.txt
 y2b login bilibili
 y2b channels add 'https://www.youtube.com/@channel/videos' --mode translated
 y2b check --write-baseline
-y2b watch                # 常驻；或 y2b tui 交互查看
+y2b watch                # 常驻
 ```
 
 ## CLI
@@ -62,6 +62,8 @@ y2b backup | auth-check | check --write-baseline
 `subtitle` 优先复用 `downloads/<video_id>/*.en-zh-CN.translated.json` 缓存，缺失时重新下载英文字幕、分句并调 Pi 翻译；提交走 B 站审核，非即时生效。
 
 ### TUI
+
+TUI 不进入默认生产构建。需要交互界面时使用 `cargo build --release --features tui`，生成的二进制才包含 `y2b tui`。
 
 | 键 | 作用 | 键 | 作用 |
 | --- | --- | --- | --- |

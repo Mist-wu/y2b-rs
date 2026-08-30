@@ -5,6 +5,10 @@ edition = "2024"
 description = "YouTube monitor, subtitle translator and Bilibili uploader"
 license = "MIT"
 
+[features]
+default = []
+tui = ["dep:crossterm", "dep:ratatui"]
+
 [[bin]]
 name = "y2b"
 path = "src/main.rs"
@@ -15,14 +19,14 @@ axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.29"
+crossterm = { version = "0.29", optional = true }
 feed-rs = "2"
 fs2 = "0.4"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
-ratatui = "0.30"
+ratatui = { version = "0.30", optional = true }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "json"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
