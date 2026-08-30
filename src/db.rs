@@ -71,6 +71,8 @@ pub(crate) const SUBTITLE_CLAIM_KIND: &str = "subtitle";
 pub(crate) const UPLOAD_CLAIM_KIND: &str = "upload";
 pub const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
 pub const BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
+/// 当前二进制能够完整理解的数据库迁移版本。
+pub const CURRENT_SCHEMA_VERSION: i64 = 19;
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -439,9 +441,11 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_upload_attempts_job
               ON upload_attempts(job_id, started_at DESC);
-            INSERT OR IGNORE INTO schema_migrations(version,applied_at)
-              VALUES(19,CURRENT_TIMESTAMP);
             "#,
+        )?;
+        self.conn().execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,CURRENT_TIMESTAMP)",
+            [CURRENT_SCHEMA_VERSION],
         )?;
         Ok(())
     }
@@ -609,7 +613,7 @@ impl Database {
         let mut q = c.prepare(
             "SELECT published_at FROM jobs WHERE channel_id=? AND published_at IS NOT NULL ORDER BY published_at",
         )?;
-        Ok(q.query_map([id], |row| Ok(parse(row.get(0)?)))?
+        Ok(q.query_map([id], |row| parse(row.get(0)?))?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -638,7 +642,7 @@ impl Database {
             "SELECT baseline_at FROM channels WHERE id=?",
             [id],
             |r| r.get(0),
-        )?))
+        )?)?)
     }
     pub fn channel_consecutive_failures(&self, id: i64) -> Result<u32> {
         Ok(self.conn().query_row(
@@ -892,6 +896,17 @@ impl Database {
         now: DateTime<Utc>,
         next_reset_at: DateTime<Utc>,
     ) -> Result<DiscoveryQuota> {
+        self.update_discovery_quota(units, budget, now, next_reset_at, false)
+    }
+
+    fn update_discovery_quota(
+        &self,
+        units: u32,
+        budget: u32,
+        now: DateTime<Utc>,
+        next_reset_at: DateTime<Utc>,
+        force_exhausted: bool,
+    ) -> Result<DiscoveryQuota> {
         let mut c = self.conn();
         let tx = c.transaction()?;
         let raw_used = tx
@@ -908,26 +923,44 @@ impl Database {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        let stored_reset = raw_reset
-            .as_deref()
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&Utc));
-        let reset_due = stored_reset.is_none_or(|reset_at| reset_at <= now);
-        let mut used = if reset_due {
-            0
-        } else {
-            raw_used
-                .as_deref()
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(0)
+        let stored_reset = match raw_reset.as_deref() {
+            Some(value) => match DateTime::parse_from_rfc3339(value) {
+                Ok(reset_at) => Some(reset_at.with_timezone(&Utc)),
+                Err(error) => {
+                    tracing::warn!(
+                        key = "quota_reset_at",
+                        value,
+                        error = %error,
+                        "发现配额状态损坏，拒绝重置配额窗口"
+                    );
+                    anyhow::bail!("发现配额状态 quota_reset_at 无效: {value}: {error}")
+                }
+            },
+            None => None,
         };
-        let reset_at = if reset_due {
-            next_reset_at
-        } else {
-            stored_reset.expect("reset_due=false 时必有 reset_at")
+        let stored_used = match raw_used.as_deref() {
+            Some(value) => match value.parse::<u32>() {
+                Ok(used) => used,
+                Err(error) => {
+                    tracing::warn!(
+                        key = "quota_used_today",
+                        value,
+                        error = %error,
+                        "发现配额状态损坏，拒绝继续使用配额"
+                    );
+                    anyhow::bail!("发现配额状态 quota_used_today 无效: {value}: {error}")
+                }
+            },
+            None => 0,
+        };
+        let (mut used, reset_at) = match stored_reset {
+            Some(reset_at) if reset_at > now => (stored_used, reset_at),
+            _ => (0, next_reset_at),
         };
         let allowed = used.saturating_add(units) <= budget;
-        if allowed {
+        if force_exhausted {
+            used = budget;
+        } else if allowed {
             used = used.saturating_add(units);
         }
         tx.execute(
@@ -952,12 +985,7 @@ impl Database {
         now: DateTime<Utc>,
         next_reset_at: DateTime<Utc>,
     ) -> Result<DiscoveryQuota> {
-        let status = self.consume_discovery_quota(0, budget, now, next_reset_at)?;
-        self.set_discovery_state("quota_used_today", &budget.to_string())?;
-        Ok(DiscoveryQuota {
-            used: budget,
-            ..status
-        })
+        self.update_discovery_quota(0, budget, now, next_reset_at, true)
     }
 
     pub fn insert_video_candidate(&self, candidate: NewVideoCandidate<'_>) -> Result<bool> {
@@ -2125,8 +2153,8 @@ impl Database {
                 job_id: r.get(1)?,
                 stage: r.get(2)?,
                 status: r.get(3)?,
-                started_at: parse(r.get(4)?),
-                finished_at: parse_opt(r.get(5)?),
+                started_at: parse(r.get(4)?)?,
+                finished_at: parse_opt(r.get(5)?)?,
                 duration_ms: r.get(6)?,
                 peak_rss_kib: r.get(7)?,
                 provider: r.get(8)?,
@@ -2322,23 +2350,29 @@ fn format_timestamp(value: DateTime<Utc>) -> String {
 }
 
 fn channel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Channel> {
+    let transfer_mode = TransferMode::from_str(&r.get::<_, String>(5)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, error.into())
+    })?;
+    let priority = ChannelPriority::from_str(&r.get::<_, String>(6)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, error.into())
+    })?;
     Ok(Channel {
         id: r.get(0)?,
         youtube_channel_id: r.get(1)?,
         name: r.get(2)?,
         url: r.get(3)?,
         enabled: r.get::<_, i64>(4)? != 0,
-        transfer_mode: TransferMode::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
-        priority: ChannelPriority::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
-        last_checked_at: parse_opt(r.get(7)?),
+        transfer_mode,
+        priority,
+        last_checked_at: parse_opt(r.get(7)?)?,
         last_error: r.get(8)?,
-        next_poll_at: parse_opt(r.get(9)?),
+        next_poll_at: parse_opt(r.get(9)?)?,
         consecutive_failures: r.get(10)?,
         uploads_playlist_id: r.get(11)?,
-        next_data_api_poll_at: parse_opt(r.get(12)?),
+        next_data_api_poll_at: parse_opt(r.get(12)?)?,
         data_api_etag: r.get(13)?,
-        websub_lease_expires_at: parse_opt(r.get(14)?),
-        websub_last_received_at: parse_opt(r.get(15)?),
+        websub_lease_expires_at: parse_opt(r.get(14)?)?,
+        websub_last_received_at: parse_opt(r.get(15)?)?,
     })
 }
 
@@ -2354,12 +2388,12 @@ fn candidate_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<VideoCandidate>
         channel_id: r.get(1)?,
         url: r.get(2)?,
         title: r.get(3)?,
-        published_at: parse_opt(r.get(4)?),
+        published_at: parse_opt(r.get(4)?)?,
         source,
-        discovered_at: parse(r.get(6)?),
+        discovered_at: parse(r.get(6)?)?,
         gate_state,
         gate_attempts: r.get(8)?,
-        next_gate_at: parse_opt(r.get(9)?),
+        next_gate_at: parse_opt(r.get(9)?)?,
         last_error: r.get(10)?,
         source_language: r.get(11)?,
         source_language_mismatch: r.get::<_, i64>(12)? != 0,
@@ -2372,33 +2406,48 @@ fn websub_channel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<WebSubChan
         youtube_channel_id: r.get(1)?,
         name: r.get(2)?,
         enabled: r.get::<_, i64>(3)? != 0,
-        lease_expires_at: parse_opt(r.get(4)?),
+        lease_expires_at: parse_opt(r.get(4)?)?,
         secret: r.get(5)?,
         callback_path: r.get(6)?,
-        last_received_at: parse_opt(r.get(7)?),
+        last_received_at: parse_opt(r.get(7)?)?,
     })
 }
 
-fn parse(s: String) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(&s)
-        .map(|x| x.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+fn parse(s: String) -> rusqlite::Result<DateTime<Utc>> {
+    if let Ok(value) = DateTime::parse_from_rfc3339(&s) {
+        return Ok(value.with_timezone(&Utc));
+    }
+    // 早期迁移和 SQLite 的 CURRENT_TIMESTAMP 会生成这一 UTC 格式；它不是损坏值。
+    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S") {
+        return Ok(value.and_utc());
+    }
+    Err(rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        anyhow::anyhow!("无效时间戳: {s}").into(),
+    ))
 }
-fn parse_opt(s: Option<String>) -> Option<DateTime<Utc>> {
-    s.map(parse)
+fn parse_opt(s: Option<String>) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    s.map(parse).transpose()
 }
 fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
+    let status = JobStatus::from_str(&r.get::<_, String>(5)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, error.into())
+    })?;
+    let transfer_mode = TransferMode::from_str(&r.get::<_, String>(6)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, error.into())
+    })?;
     Ok(Job {
         id: r.get(0)?,
         channel_id: r.get(1)?,
         video_id: r.get(2)?,
         url: r.get(3)?,
         title: r.get(4)?,
-        status: JobStatus::from_str(&r.get::<_, String>(5)?).unwrap_or(JobStatus::Failed),
-        transfer_mode: TransferMode::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
-        published_at: parse_opt(r.get(7)?),
-        youtube_updated_at: parse_opt(r.get(8)?),
-        discovered_at: parse(r.get(9)?),
+        status,
+        transfer_mode,
+        published_at: parse_opt(r.get(7)?)?,
+        youtube_updated_at: parse_opt(r.get(8)?)?,
+        discovered_at: parse(r.get(9)?)?,
         is_short: r.get::<_, i64>(10)? != 0,
         duration_seconds: r.get(11)?,
         width: r.get(12)?,
@@ -2454,7 +2503,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         let migrated: (String, Option<String>, String) = db
             .conn()
             .query_row(
@@ -2538,7 +2587,7 @@ mod tests {
         drop(old);
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             db.list_channels().unwrap()[0].transfer_mode,
             TransferMode::Translated
@@ -2558,7 +2607,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("x.db")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
-        assert_eq!(db.schema_version().unwrap(), 19);
+        assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         assert!(
             db.create_job(NewJob {
                 channel_id: None,
@@ -2589,6 +2638,164 @@ mod tests {
             .unwrap();
         assert_eq!(db.recover_incomplete_jobs().unwrap(), 1);
         assert_eq!(db.list_jobs(1).unwrap()[0].status, JobStatus::Queued);
+    }
+
+    #[test]
+    fn corrupted_job_and_channel_fields_return_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+        let channel_id = db
+            .add_channel(
+                "UC-corrupted",
+                "corrupted",
+                "https://youtube.com/@corrupted",
+                "https://youtube.com/feeds/videos.xml?channel_id=UC-corrupted",
+                TransferMode::Direct,
+            )
+            .unwrap();
+        let job_id = db
+            .create_job(NewJob {
+                channel_id: Some(channel_id),
+                video_id: "corrupted-job",
+                url: "https://youtu.be/corrupted-job",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+
+        db.conn()
+            .execute(
+                "UPDATE channels SET transfer_mode='unknown-mode' WHERE id=?",
+                [channel_id],
+            )
+            .unwrap();
+        assert!(db.channel(channel_id).is_err());
+        db.conn()
+            .execute(
+                "UPDATE channels SET transfer_mode='direct',priority='urgent' WHERE id=?",
+                [channel_id],
+            )
+            .unwrap();
+        assert!(db.channel(channel_id).is_err());
+        db.conn()
+            .execute(
+                "UPDATE channels SET priority='normal' WHERE id=?",
+                [channel_id],
+            )
+            .unwrap();
+
+        db.conn()
+            .execute("UPDATE jobs SET status='mystery' WHERE id=?", [&job_id])
+            .unwrap();
+        assert!(db.get_job(&job_id).is_err());
+        db.conn()
+            .execute(
+                "UPDATE jobs SET status='queued',transfer_mode='unknown-mode' WHERE id=?",
+                [&job_id],
+            )
+            .unwrap();
+        assert!(db.get_job(&job_id).is_err());
+        db.conn()
+            .execute(
+                "UPDATE jobs SET transfer_mode='direct',discovered_at='not-a-timestamp' WHERE id=?",
+                [&job_id],
+            )
+            .unwrap();
+        assert!(db.get_job(&job_id).is_err());
+    }
+
+    #[test]
+    fn corrupted_discovery_quota_state_returns_errors_without_resetting_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+        let now = Utc::now();
+        let next_reset = now + chrono::Duration::days(1);
+
+        db.set_discovery_state("quota_used_today", "7").unwrap();
+        db.set_discovery_state("quota_reset_at", "not-a-timestamp")
+            .unwrap();
+        let error = db
+            .consume_discovery_quota(1, 100, now, next_reset)
+            .unwrap_err();
+        assert!(error.to_string().contains("quota_reset_at 无效"));
+        assert_eq!(
+            db.get_discovery_state("quota_used_today").unwrap(),
+            Some("7".into())
+        );
+
+        db.set_discovery_state("quota_reset_at", &format_timestamp(next_reset))
+            .unwrap();
+        db.set_discovery_state("quota_used_today", "seven").unwrap();
+        let error = db
+            .consume_discovery_quota(1, 100, now, next_reset)
+            .unwrap_err();
+        assert!(error.to_string().contains("quota_used_today 无效"));
+        assert_eq!(
+            db.get_discovery_state("quota_used_today").unwrap(),
+            Some("seven".into())
+        );
+    }
+
+    #[test]
+    fn exhausting_discovery_quota_rolls_back_as_one_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+        let now = Utc::now();
+        let reset_at = now + chrono::Duration::hours(1);
+        db.set_discovery_state("quota_used_today", "3").unwrap();
+        db.set_discovery_state("quota_reset_at", &format_timestamp(reset_at))
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER reject_reset_after_exhaust
+                BEFORE UPDATE ON discovery_state
+                WHEN OLD.key='quota_reset_at'
+                  AND (SELECT value FROM discovery_state
+                       WHERE key='quota_used_today')='10'
+                BEGIN
+                  SELECT RAISE(ABORT, '模拟提交前失败');
+                END;
+                "#,
+            )
+            .unwrap();
+
+        assert!(
+            db.exhaust_discovery_quota(10, now, now + chrono::Duration::days(1))
+                .is_err()
+        );
+        assert_eq!(
+            db.get_discovery_state("quota_used_today").unwrap(),
+            Some("3".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_probe_failure_stops_job_preparation() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+        let job_id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "disk-probe-failure",
+                url: "https://youtu.be/disk-probe-failure",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        let job = db.claim_prepare_job(&job_id).unwrap().unwrap();
+        let mut config = crate::config::Config::default();
+        config.runtime.data_dir = temp.path().join("不存在的目录");
+        let pipeline = crate::pipeline::Pipeline::new(config, db);
+
+        let error = pipeline.prepare_job(job).await.unwrap_err();
+        assert!(error.to_string().contains("读取剩余磁盘空间失败"));
     }
 
     #[test]
@@ -3833,8 +4040,8 @@ mod tests {
             db.conn()
                 .execute("UPDATE jobs SET status=? WHERE id=?", params![legacy, id])
                 .unwrap();
-            // 未知状态串读回来会退化成 Failed，而不是 panic。
-            assert_eq!(db.get_job(&id).unwrap().unwrap().status, JobStatus::Failed);
+            // 恢复 SQL 不需要先把旧状态映射成枚举；直接读取则必须拒绝未知值。
+            assert!(db.get_job(&id).is_err());
             ids.push(id);
         }
         assert_eq!(db.recover_incomplete_jobs().unwrap(), 4);
@@ -3995,7 +4202,7 @@ mod tests {
         drop(db);
 
         let reopened = Database::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 19);
+        assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         assert!(reopened.is_over_duration_video("too-long", 7200).unwrap());
         reopened
             .record_over_duration_video("too-long", None, 8000, "9000s > 8000s")
