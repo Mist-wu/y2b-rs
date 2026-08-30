@@ -1,4 +1,8 @@
-use crate::{config::Config, db::Database, process::run_monitored};
+use crate::{
+    config::Config,
+    db::{CURRENT_SCHEMA_VERSION, Database},
+    process::run_monitored,
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -12,6 +16,7 @@ use tokio::process::Command;
 pub struct CheckItem {
     pub name: String,
     pub ok: bool,
+    pub required: bool,
     pub detail: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +64,15 @@ fn tool_checks(config: &Config) -> [(&'static str, PathBuf, Vec<&'static str>); 
     ]
 }
 
+fn schema_check(schema: i64) -> CheckItem {
+    CheckItem {
+        name: "database schema".into(),
+        ok: schema == CURRENT_SCHEMA_VERSION,
+        required: true,
+        detail: format!("v{schema}，期望 v{CURRENT_SCHEMA_VERSION}"),
+    }
+}
+
 pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
     let mut out = Vec::new();
     for (name, path, args) in tool_checks(config) {
@@ -66,6 +80,7 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
             out.push(CheckItem {
                 name: name.into(),
                 ok: false,
+                required: true,
                 detail: format!("未找到 {}", path.display()),
             });
             continue;
@@ -76,11 +91,13 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
             Ok(r) => out.push(CheckItem {
                 name: name.into(),
                 ok: true,
+                required: true,
                 detail: first_line(&(r.stdout + r.stderr.as_str())),
             }),
             Err(e) => out.push(CheckItem {
                 name: name.into(),
                 ok: false,
+                required: true,
                 detail: e.to_string(),
             }),
         }
@@ -91,29 +108,45 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
     out.push(CheckItem {
         name: "swap".into(),
         ok: swap,
+        required: false,
         detail: if swap {
             "已启用".into()
         } else {
             "未启用".into()
         },
     });
-    let free = fs2::available_space(&config.runtime.data_dir).unwrap_or(0) / (1024 * 1024 * 1024);
-    out.push(CheckItem {
-        name: "disk".into(),
-        ok: free >= config.storage.stop_free_gib,
-        detail: format!("剩余 {free} GiB"),
+    out.push(match fs2::available_space(&config.runtime.data_dir) {
+        Ok(bytes) => {
+            let free = bytes / (1024 * 1024 * 1024);
+            CheckItem {
+                name: "disk".into(),
+                ok: free >= config.storage.stop_free_gib,
+                required: true,
+                detail: format!("剩余 {free} GiB"),
+            }
+        }
+        Err(error) => CheckItem {
+            name: "disk".into(),
+            ok: false,
+            required: true,
+            detail: format!("读取磁盘空间失败: {error}"),
+        },
     });
     let integrity = db.integrity_check().unwrap_or_else(|e| e.to_string());
     out.push(CheckItem {
         name: "database".into(),
         ok: integrity == "ok",
+        required: true,
         detail: integrity,
     });
-    let schema = db.schema_version().unwrap_or(0);
-    out.push(CheckItem {
-        name: "database schema".into(),
-        ok: schema >= 2,
-        detail: format!("v{schema}"),
+    out.push(match db.schema_version() {
+        Ok(schema) => schema_check(schema),
+        Err(error) => CheckItem {
+            name: "database schema".into(),
+            ok: false,
+            required: true,
+            detail: format!("读取版本失败: {error}"),
+        },
     });
     let glossary_path = config.ai.policy.with_file_name("brawl-stars-glossary.json");
     let audit_policy_path = config.ai.policy.with_file_name("audit-policy.json");
@@ -128,6 +161,7 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
         out.push(CheckItem {
             name: name.into(),
             ok: p.exists(),
+            required: true,
             detail: p.display().to_string(),
         });
     }
@@ -153,6 +187,7 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
                 out.push(CheckItem {
                     name: "dependency baseline".into(),
                     ok: drift.is_empty(),
+                    required: true,
                     detail: if drift.is_empty() {
                         format!("无漂移，基线 {}", baseline.generated_at)
                     } else {
@@ -163,42 +198,75 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
             None => out.push(CheckItem {
                 name: "dependency baseline".into(),
                 ok: false,
+                required: true,
                 detail: "基线 JSON 无效".into(),
             }),
         }
+    } else {
+        out.push(CheckItem {
+            name: "dependency baseline".into(),
+            ok: false,
+            required: true,
+            detail: format!("未找到 {}", baseline_path.display()),
+        });
     }
     for (key, label) in [
         ("auth.youtube", "YouTube auth"),
         ("auth.bilibili", "Bilibili auth"),
     ] {
-        if let Ok(Some(value)) = db.get_setting(key) {
-            out.push(CheckItem {
+        out.push(match db.get_setting(key) {
+            Ok(Some(value)) => CheckItem {
                 name: label.into(),
                 ok: value.starts_with("ok "),
+                required: true,
                 detail: value,
-            });
-        }
+            },
+            Ok(None) => CheckItem {
+                name: label.into(),
+                ok: false,
+                required: true,
+                detail: "未检查".into(),
+            },
+            Err(error) => CheckItem {
+                name: label.into(),
+                ok: false,
+                required: true,
+                detail: format!("读取状态失败: {error}"),
+            },
+        });
     }
     out
 }
 
-pub async fn write_baseline(config: &Config, dest: &Path) -> Result<Baseline> {
+pub async fn write_baseline(
+    config: &Config,
+    dest: &Path,
+    checks: &[CheckItem],
+) -> Result<Baseline> {
     let mut items = Vec::new();
     // 基线只记录会被二进制更新影响的工具，ffprobe 由 run() 检查但不入基线。
-    for (name, path, args) in tool_checks(config)
+    // 版本必须复用本轮检查结果，不能再次执行命令后把另一份结果写入基线。
+    for (name, path, _) in tool_checks(config)
         .into_iter()
         .filter(|(name, _, _)| *name != "ffprobe")
     {
         if !path.exists() {
-            continue;
+            anyhow::bail!("生成依赖基线失败，缺少必选工具 {name}: {}", path.display());
         }
-        let mut c = Command::new(&path);
-        c.args(args);
-        let r = run_monitored(c, Duration::from_secs(20)).await?;
+        let probe = checks
+            .iter()
+            .find(|item| item.name == name)
+            .with_context(|| format!("生成依赖基线失败，缺少必选工具 {name} 的检查结果"))?;
+        if !probe.ok {
+            anyhow::bail!(
+                "生成依赖基线失败，必选工具 {name} 检查未通过: {}",
+                probe.detail
+            );
+        }
         items.push(BaselineItem {
             name: name.into(),
             path: path.display().to_string(),
-            version: first_line(&(r.stdout + r.stderr.as_str())),
+            version: probe.detail.clone(),
             sha256: Some(hash_file(&path)?),
         });
     }
@@ -228,11 +296,6 @@ pub async fn write_baseline(config: &Config, dest: &Path) -> Result<Baseline> {
         }
     }
     let mut details = std::collections::BTreeMap::new();
-    let mut build = Command::new(&config.render.ffmpeg);
-    build.arg("-buildconf");
-    if let Ok(r) = run_monitored(build, Duration::from_secs(20)).await {
-        details.insert("ffmpeg_buildconf".into(), r.stdout + r.stderr.as_str());
-    }
     details.insert(
         "kernel".into(),
         fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -268,4 +331,57 @@ fn first_line(s: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_check_rejects_versions_on_both_sides() {
+        assert!(schema_check(CURRENT_SCHEMA_VERSION).ok);
+        assert!(!schema_check(CURRENT_SCHEMA_VERSION - 1).ok);
+        assert!(!schema_check(CURRENT_SCHEMA_VERSION + 1).ok);
+    }
+
+    #[tokio::test]
+    async fn missing_baseline_and_auth_states_are_required_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.runtime.data_dir = temp.path().to_path_buf();
+        let missing = temp.path().join("missing-tool").display().to_string();
+        config.ai.pi = missing.clone();
+        config.youtube.yt_dlp = missing.clone();
+        config.render.ffmpeg = missing.clone();
+        config.render.ffprobe = missing.clone();
+        config.bilibili.biliup = missing;
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+
+        let checks = run(&config, &db).await;
+        for name in ["dependency baseline", "YouTube auth", "Bilibili auth"] {
+            let item = checks.iter().find(|item| item.name == name).unwrap();
+            assert!(item.required);
+            assert!(!item.ok);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_required_tool_does_not_create_partial_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.ai.pi = temp.path().join("missing-pi").display().to_string();
+        let destination = temp.path().join("dependency-baseline.json");
+        let checks = vec![CheckItem {
+            name: "pi".into(),
+            ok: false,
+            required: true,
+            detail: "未找到 pi".into(),
+        }];
+
+        let error = write_baseline(&config, &destination, &checks)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("缺少必选工具 pi"));
+        assert!(!destination.exists());
+    }
 }

@@ -5,7 +5,9 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-apt-get install -y ca-certificates curl jq xz-utils tar fontconfig gnupg python3
+# sqlite3 主要供服务已运行后的再次部署做空闲断言，并且是所有 restore 的硬依赖；
+# 首次部署时服务尚未 active，assert_idle 会跳过数据库查询。
+apt-get install -y ca-certificates curl jq xz-utils tar fontconfig gnupg python3 sqlite3
 
 if ! swapon --show=NAME --noheadings | grep -qx /swapfile; then
   if [[ ! -f /swapfile ]]; then fallocate -l 2G /swapfile; fi

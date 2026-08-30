@@ -724,7 +724,12 @@ impl Pipeline {
     }
 
     fn ensure_disk(&self) -> Result<()> {
-        let bytes = fs2::available_space(&self.config.runtime.data_dir).unwrap_or(u64::MAX);
+        let bytes = fs2::available_space(&self.config.runtime.data_dir).with_context(|| {
+            format!(
+                "读取剩余磁盘空间失败: {}",
+                self.config.runtime.data_dir.display()
+            )
+        })?;
         let gib = bytes / (1024 * 1024 * 1024);
         if gib < self.config.storage.stop_free_gib {
             bail!(
