@@ -11,9 +11,8 @@ from unittest import mock
 
 from live_once import (
     EXPECTED_SCHEMA_VERSION,
-    HOLD_OWNER_KEY,
-    HOLD_PREVIOUS_KEY,
-    HOLD_UNTIL,
+    MAINTENANCE_HOLD_LEASE_SECONDS,
+    MAINTENANCE_HOLD_RENEW_INTERVAL_SECONDS,
     NEXT_SUBMIT_KEY,
     LiveOnce,
     SchemaVersionError,
@@ -84,6 +83,24 @@ def make_database(path: Path, schema_version: int = EXPECTED_SCHEMA_VERSION) -> 
           id INTEGER PRIMARY KEY, job_id TEXT, level TEXT, message TEXT, created_at TEXT
         );
         CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
+        CREATE TABLE maintenance_hold(
+          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+          owner TEXT NOT NULL CHECK(owner<>''),
+          reason TEXT NOT NULL,
+          acquired_at TEXT NOT NULL,
+          heartbeat_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL
+        );
+        CREATE TABLE maintenance_hold_events(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          action TEXT NOT NULL CHECK(action IN('acquired','taken_over','renewed','released')),
+          owner TEXT NOT NULL,
+          previous_owner TEXT,
+          reason TEXT NOT NULL,
+          previous_reason TEXT,
+          occurred_at TEXT NOT NULL,
+          expires_at TEXT
+        );
         CREATE TABLE upload_attempts(
           id TEXT PRIMARY KEY,
           job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -163,6 +180,27 @@ class LiveOnceTests(unittest.TestCase):
             self.assertTrue(called.wait(1))
             item.stop_upload_hold_worker()
 
+    def test_upload_hold_worker_keeps_renewing_until_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = arguments(Path(directory))
+            args.hold_at = "2020-01-01T00:00:00Z"
+            item = LiveOnce(args)
+            calls = 0
+
+            def hold() -> bool:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    item.hold_stop.set()
+                return True
+
+            item.ensure_upload_hold = hold  # type: ignore[method-assign]
+            with mock.patch.object(item.hold_stop, "wait", return_value=False):
+                item.start_upload_hold_worker()
+                assert item.hold_thread is not None
+                item.hold_thread.join(timeout=1)
+            self.assertEqual(calls, 2)
+
     def test_upload_hold_waits_for_uploading_job_before_claiming(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -183,19 +221,137 @@ class LiveOnceTests(unittest.TestCase):
             self.assertFalse(item.ensure_upload_hold())
             connection = sqlite3.connect(args.database)
             self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM settings").fetchone()[0], 0
+                connection.execute("SELECT COUNT(*) FROM maintenance_hold").fetchone()[0],
+                0,
             )
             connection.execute("UPDATE jobs SET status='completed' WHERE id='ordinary'")
             connection.commit()
             connection.close()
 
+            before = utc_now()
             self.assertTrue(item.ensure_upload_hold())
             connection = sqlite3.connect(args.database)
+            hold = connection.execute(
+                "SELECT owner,expires_at FROM maintenance_hold WHERE singleton=1"
+            ).fetchone()
+            events = list(
+                connection.execute(
+                    "SELECT action,owner FROM maintenance_hold_events ORDER BY id"
+                )
+            )
             settings = dict(connection.execute("SELECT key,value FROM settings"))
             connection.close()
-            self.assertEqual(settings[NEXT_SUBMIT_KEY], HOLD_UNTIL)
-            self.assertEqual(settings[HOLD_OWNER_KEY], item.state["upload_hold_owner"])
-            self.assertEqual(json.loads(settings[HOLD_PREVIOUS_KEY]), None)
+            self.assertEqual(hold[0], item.state["upload_hold_owner"])
+            self.assertGreater(parse_time(hold[1]), before)
+            self.assertLessEqual(
+                parse_time(hold[1]),
+                before
+                + dt.timedelta(seconds=MAINTENANCE_HOLD_LEASE_SECONDS + 2),
+            )
+            self.assertEqual(events, [("acquired", hold[0])])
+            self.assertNotIn(NEXT_SUBMIT_KEY, settings)
+
+    def test_upload_hold_is_renewed_before_its_short_lease_expires(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = arguments(root)
+            args.hold_at = "2020-01-01T00:00:00Z"
+            make_database(Path(args.database))
+            item = LiveOnce(args)
+            self.assertTrue(item.ensure_upload_hold())
+            almost_expired = iso(
+                utc_now()
+                + dt.timedelta(seconds=MAINTENANCE_HOLD_RENEW_INTERVAL_SECONDS - 1)
+            )
+            connection = sqlite3.connect(args.database)
+            connection.execute(
+                "UPDATE maintenance_hold SET expires_at=? WHERE singleton=1",
+                (almost_expired,),
+            )
+            connection.commit()
+            connection.close()
+
+            self.assertTrue(item.ensure_upload_hold())
+            connection = sqlite3.connect(args.database)
+            expires_at = connection.execute(
+                "SELECT expires_at FROM maintenance_hold WHERE singleton=1"
+            ).fetchone()[0]
+            actions = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT action FROM maintenance_hold_events ORDER BY id"
+                )
+            ]
+            connection.close()
+            self.assertGreater(
+                parse_time(expires_at),
+                utc_now()
+                + dt.timedelta(seconds=MAINTENANCE_HOLD_LEASE_SECONDS - 5),
+            )
+            self.assertEqual(actions, ["acquired", "renewed"])
+
+    def test_expired_live_once_lease_no_longer_blocks_automatically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = arguments(root)
+            args.hold_at = "2020-01-01T00:00:00Z"
+            make_database(Path(args.database))
+            item = LiveOnce(args)
+            self.assertTrue(item.ensure_upload_hold())
+            connection = sqlite3.connect(args.database)
+            connection.execute(
+                "UPDATE maintenance_hold SET expires_at=? WHERE singleton=1",
+                (iso(utc_now() - dt.timedelta(seconds=1)),),
+            )
+            connection.commit()
+            active = connection.execute(
+                "SELECT COUNT(*) FROM maintenance_hold WHERE expires_at>?",
+                (iso(utc_now()),),
+            ).fetchone()[0]
+            retained = connection.execute(
+                "SELECT owner FROM maintenance_hold WHERE singleton=1"
+            ).fetchone()[0]
+            connection.close()
+            self.assertEqual(active, 0)
+            self.assertEqual(retained, item.state["upload_hold_owner"])
+
+    def test_crashed_process_lease_can_be_taken_over_by_a_later_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_args = arguments(root)
+            first_args.hold_at = "2020-01-01T00:00:00Z"
+            make_database(Path(first_args.database))
+            first = LiveOnce(first_args)
+            self.assertTrue(first.ensure_upload_hold())
+            first_owner = first.state["upload_hold_owner"]
+            connection = sqlite3.connect(first_args.database)
+            connection.execute(
+                "UPDATE maintenance_hold SET expires_at=? WHERE singleton=1",
+                (iso(utc_now() - dt.timedelta(seconds=1)),),
+            )
+            connection.commit()
+            connection.close()
+
+            second_args = arguments(root)
+            second_args.hold_at = "2020-01-01T00:00:00Z"
+            second_args.work_dir = str(root / "second-work")
+            second = LiveOnce(second_args)
+            self.assertTrue(second.ensure_upload_hold())
+            second_owner = second.state["upload_hold_owner"]
+            connection = sqlite3.connect(second_args.database)
+            hold_owner = connection.execute(
+                "SELECT owner FROM maintenance_hold WHERE singleton=1"
+            ).fetchone()[0]
+            takeover = connection.execute(
+                """
+                SELECT action,owner,previous_owner
+                FROM maintenance_hold_events ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+            connection.close()
+            self.assertNotEqual(first_owner, second_owner)
+            self.assertEqual(hold_owner, second_owner)
+            self.assertEqual(takeover, ("taken_over", second_owner, first_owner))
 
     def test_upload_hold_release_preserves_newer_platform_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -208,7 +364,8 @@ class LiveOnceTests(unittest.TestCase):
             later = iso(utc_now() + dt.timedelta(hours=12))
             connection = sqlite3.connect(args.database)
             connection.execute(
-                "UPDATE settings SET value=? WHERE key=?", (later, NEXT_SUBMIT_KEY)
+                "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)",
+                (NEXT_SUBMIT_KEY, later, "now"),
             )
             connection.commit()
             connection.close()
@@ -216,12 +373,18 @@ class LiveOnceTests(unittest.TestCase):
             item.release_upload_hold_after_success()
             connection = sqlite3.connect(args.database)
             settings = dict(connection.execute("SELECT key,value FROM settings"))
+            hold_count = connection.execute(
+                "SELECT COUNT(*) FROM maintenance_hold"
+            ).fetchone()[0]
+            action = connection.execute(
+                "SELECT action FROM maintenance_hold_events ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
             connection.close()
             self.assertEqual(settings[NEXT_SUBMIT_KEY], later)
-            self.assertNotIn(HOLD_OWNER_KEY, settings)
-            self.assertNotIn(HOLD_PREVIOUS_KEY, settings)
+            self.assertEqual(hold_count, 0)
+            self.assertEqual(action, "released")
 
-    def test_upload_hold_rollback_restores_only_its_own_window(self) -> None:
+    def test_upload_hold_rollback_releases_only_its_own_lease(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args = arguments(root)
@@ -243,10 +406,12 @@ class LiveOnceTests(unittest.TestCase):
             resumed.rollback()
             connection = sqlite3.connect(args.database)
             settings = dict(connection.execute("SELECT key,value FROM settings"))
+            hold_count = connection.execute(
+                "SELECT COUNT(*) FROM maintenance_hold"
+            ).fetchone()[0]
             connection.close()
             self.assertEqual(settings[NEXT_SUBMIT_KEY], original)
-            self.assertNotIn(HOLD_OWNER_KEY, settings)
-            self.assertNotIn(HOLD_PREVIOUS_KEY, settings)
+            self.assertEqual(hold_count, 0)
 
     def test_upload_hold_rollback_does_not_clobber_foreign_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -256,14 +421,20 @@ class LiveOnceTests(unittest.TestCase):
             item = LiveOnce(args)
             item.save(upload_hold=True, upload_hold_owner="ours")
             deadline = iso(utc_now() + dt.timedelta(hours=6))
+            now = iso(utc_now())
+            expires_at = iso(utc_now() + dt.timedelta(minutes=5))
             connection = sqlite3.connect(args.database)
-            connection.executemany(
+            connection.execute(
                 "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)",
-                [
-                    (NEXT_SUBMIT_KEY, deadline, "now"),
-                    (HOLD_OWNER_KEY, "foreign", "now"),
-                    (HOLD_PREVIOUS_KEY, json.dumps(None), "now"),
-                ],
+                (NEXT_SUBMIT_KEY, deadline, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO maintenance_hold(
+                  singleton,owner,reason,acquired_at,heartbeat_at,expires_at
+                ) VALUES(1,'foreign','部署维护',?,?,?)
+                """,
+                (now, now, expires_at),
             )
             connection.commit()
             connection.close()
@@ -273,9 +444,12 @@ class LiveOnceTests(unittest.TestCase):
             item.rollback()
             connection = sqlite3.connect(args.database)
             settings = dict(connection.execute("SELECT key,value FROM settings"))
+            hold_owner = connection.execute(
+                "SELECT owner FROM maintenance_hold WHERE singleton=1"
+            ).fetchone()[0]
             connection.close()
             self.assertEqual(settings[NEXT_SUBMIT_KEY], deadline)
-            self.assertEqual(settings[HOLD_OWNER_KEY], "foreign")
+            self.assertEqual(hold_owner, "foreign")
 
     def test_segments_are_deduplicated_and_keep_pre_roll(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

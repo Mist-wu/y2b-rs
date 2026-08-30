@@ -62,6 +62,47 @@ pub struct DiscoveryQuota {
     pub allowed: bool,
 }
 
+/// 全局维护锁。单例行只阻止领取新任务，不撤销已经发出的任务租约。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MaintenanceHold {
+    pub owner: String,
+    pub reason: String,
+    pub acquired_at: DateTime<Utc>,
+    pub heartbeat_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// 维护锁的获取、接管、续租和释放审计记录。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MaintenanceHoldEvent {
+    pub id: i64,
+    pub action: String,
+    pub owner: String,
+    pub previous_owner: Option<String>,
+    pub reason: String,
+    pub previous_reason: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// 维护前空闲判定中的一类阻塞项。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MaintenanceBlocker {
+    pub kind: String,
+    pub count: usize,
+    pub details: Vec<String>,
+}
+
+/// 可直接序列化给部署脚本使用的完整空闲状态。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MaintenanceStatus {
+    pub checked_at: DateTime<Utc>,
+    pub idle: bool,
+    pub hold: Option<MaintenanceHold>,
+    pub expired_hold: Option<MaintenanceHold>,
+    pub blockers: Vec<MaintenanceBlocker>,
+}
+
 /// WebSub 内部订阅信息。刻意不派生 Debug/Serialize，避免 secret 被意外写入日志。
 pub struct WebSubChannel {
     pub id: i64,
@@ -89,9 +130,11 @@ pub(crate) const PREPARE_CLAIM_KIND: &str = "prepare";
 pub(crate) const SUBTITLE_CLAIM_KIND: &str = "subtitle";
 pub(crate) const UPLOAD_CLAIM_KIND: &str = "upload";
 pub const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
-pub const BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
+const LEGACY_BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
+const LEGACY_BILIBILI_UPLOAD_HOLD_PREVIOUS: &str = "bilibili.upload_hold_previous";
+const LEGACY_BILIBILI_UPLOAD_HOLD_UNTIL: &str = "2099-12-31T23:59:59+00:00";
 /// 当前二进制能够完整理解的数据库迁移版本。
-pub const CURRENT_SCHEMA_VERSION: i64 = 21;
+pub const CURRENT_SCHEMA_VERSION: i64 = 22;
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -108,6 +151,27 @@ impl Database {
             claim_owner: Arc::from(Uuid::new_v4().to_string()),
         };
         db.migrate()?;
+        Ok(db)
+    }
+
+    /// 打开已经迁移完成的数据库，但不执行任何迁移写入。
+    ///
+    /// 维护命令会与线上服务并行查询或只更新维护锁，不能顺带重跑整套迁移。
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        anyhow::ensure!(path.is_file(), "数据库不存在: {}", path.display());
+        let conn = Connection::open(path)
+            .with_context(|| format!("打开数据库失败: {}", path.display()))?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let db = Self {
+            connection: Arc::new(Mutex::new(conn)),
+            claim_owner: Arc::from(Uuid::new_v4().to_string()),
+        };
+        let version = db.schema_version()?;
+        anyhow::ensure!(
+            version == CURRENT_SCHEMA_VERSION,
+            "数据库 schema 版本不兼容：当前 v{version}，需要 v{CURRENT_SCHEMA_VERSION}"
+        );
         Ok(db)
     }
 
@@ -518,6 +582,111 @@ impl Database {
             "#,
         )?;
         tx.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(21,CURRENT_TIMESTAMP)",
+            [],
+        )?;
+        tx.commit()?;
+        // v22: 部署和一次性旁路共用带租约的全局维护锁。锁的单例行保留最近一次
+        // 到期持有者，后续接管时可以完整记录谁接管了谁，避免崩溃后永久阻塞。
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS maintenance_hold(
+              singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+              owner TEXT NOT NULL CHECK(owner<>''),
+              reason TEXT NOT NULL,
+              acquired_at TEXT NOT NULL,
+              heartbeat_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS maintenance_hold_events(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              action TEXT NOT NULL CHECK(action IN('acquired','taken_over','renewed','released')),
+              owner TEXT NOT NULL,
+              previous_owner TEXT,
+              reason TEXT NOT NULL,
+              previous_reason TEXT,
+              occurred_at TEXT NOT NULL,
+              expires_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_maintenance_hold_events_time
+              ON maintenance_hold_events(occurred_at DESC,id DESC);
+            "#,
+        )?;
+        // v21 live_once 可能遗留 2099 年的永久投稿窗口。迁移时恢复它之前保存的
+        // 冷却时间，并把持有者转换成五分钟租约；即使旧进程已经崩溃也会自然失效。
+        let legacy_owner: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key=?",
+                [LEGACY_BILIBILI_UPLOAD_HOLD_OWNER],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(legacy_owner) = legacy_owner {
+            let previous_json: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM settings WHERE key=?",
+                    [LEGACY_BILIBILI_UPLOAD_HOLD_PREVIOUS],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let previous_deadline = previous_json
+                .as_deref()
+                .map(serde_json::from_str::<Option<String>>)
+                .transpose()
+                .context("迁移 v22 失败：旧 live_once 投稿窗口的 previous 值无效")?
+                .flatten();
+            let current_deadline: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM settings WHERE key=?",
+                    [NEXT_BILIBILI_SUBMIT_AT],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current_deadline.as_deref() == Some(LEGACY_BILIBILI_UPLOAD_HOLD_UNTIL) {
+                if let Some(previous_deadline) = previous_deadline {
+                    tx.execute(
+                        "UPDATE settings SET value=?,updated_at=? WHERE key=?",
+                        params![
+                            previous_deadline,
+                            format_timestamp(Utc::now()),
+                            NEXT_BILIBILI_SUBMIT_AT
+                        ],
+                    )?;
+                } else {
+                    tx.execute(
+                        "DELETE FROM settings WHERE key=?",
+                        [NEXT_BILIBILI_SUBMIT_AT],
+                    )?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM settings WHERE key IN (?,?)",
+                params![
+                    LEGACY_BILIBILI_UPLOAD_HOLD_OWNER,
+                    LEGACY_BILIBILI_UPLOAD_HOLD_PREVIOUS
+                ],
+            )?;
+            let now = Utc::now();
+            let now_text = format_timestamp(now);
+            let expires_at = format_timestamp(now + chrono::Duration::minutes(5));
+            let reason = "从 v21 live_once 永久投稿 hold 迁移";
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO maintenance_hold(\
+                   singleton,owner,reason,acquired_at,heartbeat_at,expires_at\
+                 ) VALUES(1,?,?,?,?,?)",
+                params![&legacy_owner, reason, &now_text, &now_text, &expires_at],
+            )?;
+            if inserted == 1 {
+                tx.execute(
+                    "INSERT INTO maintenance_hold_events(\
+                       action,owner,reason,occurred_at,expires_at\
+                     ) VALUES('acquired',?,?,?,?)",
+                    params![&legacy_owner, reason, &now_text, &expires_at],
+                )?;
+            }
+        }
+        tx.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,CURRENT_TIMESTAMP)",
             [CURRENT_SCHEMA_VERSION],
         )?;
@@ -569,6 +738,276 @@ impl Database {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    fn maintenance_deadline(now: DateTime<Utc>, lease_seconds: i64) -> Result<DateTime<Utc>> {
+        anyhow::ensure!(lease_seconds > 0, "维护锁租约必须大于 0 秒");
+        now.checked_add_signed(chrono::Duration::seconds(lease_seconds))
+            .context("维护锁租约到期时间超出可表示范围")
+    }
+
+    /// 原子获取全局维护锁。仍有效的锁不会被覆盖；到期锁可被接管并写入审计表。
+    pub fn acquire_maintenance_hold(
+        &self,
+        owner: &str,
+        reason: &str,
+        lease_seconds: i64,
+    ) -> Result<bool> {
+        anyhow::ensure!(!owner.trim().is_empty(), "维护锁 owner 不能为空");
+        anyhow::ensure!(!reason.trim().is_empty(), "维护锁 reason 不能为空");
+        let now = Utc::now();
+        let expires_at = Self::maintenance_deadline(now, lease_seconds)?;
+        let now_text = format_timestamp(now);
+        let expires_text = format_timestamp(expires_at);
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let previous = tx
+            .query_row(
+                "SELECT owner,reason,acquired_at,heartbeat_at,expires_at \
+                 FROM maintenance_hold WHERE singleton=1",
+                [],
+                maintenance_hold_from_row,
+            )
+            .optional()?;
+        if previous.as_ref().is_some_and(|hold| hold.expires_at > now) {
+            return Ok(false);
+        }
+        let action = if previous.is_some() {
+            "taken_over"
+        } else {
+            "acquired"
+        };
+        tx.execute(
+            "INSERT INTO maintenance_hold(singleton,owner,reason,acquired_at,heartbeat_at,expires_at) \
+             VALUES(1,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET \
+             owner=excluded.owner,reason=excluded.reason,acquired_at=excluded.acquired_at,\
+             heartbeat_at=excluded.heartbeat_at,expires_at=excluded.expires_at",
+            params![owner, reason, &now_text, &now_text, &expires_text],
+        )?;
+        tx.execute(
+            "INSERT INTO maintenance_hold_events(\
+               action,owner,previous_owner,reason,previous_reason,occurred_at,expires_at\
+             ) VALUES(?,?,?,?,?,?,?)",
+            params![
+                action,
+                owner,
+                previous.as_ref().map(|hold| hold.owner.as_str()),
+                reason,
+                previous.as_ref().map(|hold| hold.reason.as_str()),
+                &now_text,
+                &expires_text
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 只有当前且尚未到期的持有者才能续租，避免旧进程在接管后复活自己的锁。
+    pub fn renew_maintenance_hold(&self, owner: &str, lease_seconds: i64) -> Result<bool> {
+        anyhow::ensure!(!owner.trim().is_empty(), "维护锁 owner 不能为空");
+        let now = Utc::now();
+        let expires_at = Self::maintenance_deadline(now, lease_seconds)?;
+        let now_text = format_timestamp(now);
+        let expires_text = format_timestamp(expires_at);
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let reason = tx
+            .query_row(
+                "UPDATE maintenance_hold SET heartbeat_at=?1,expires_at=?2 \
+                 WHERE singleton=1 AND owner=?3 AND expires_at>?1 RETURNING reason",
+                params![&now_text, &expires_text, owner],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(reason) = reason else {
+            return Ok(false);
+        };
+        tx.execute(
+            "INSERT INTO maintenance_hold_events(\
+               action,owner,reason,occurred_at,expires_at\
+             ) VALUES('renewed',?,?,?,?)",
+            params![owner, reason, &now_text, &expires_text],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 释放只按 owner 做比较删除，绝不会误删已经由另一进程接管的锁。
+    pub fn release_maintenance_hold(&self, owner: &str) -> Result<bool> {
+        anyhow::ensure!(!owner.trim().is_empty(), "维护锁 owner 不能为空");
+        let now_text = format_timestamp(Utc::now());
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let hold = tx
+            .query_row(
+                "SELECT owner,reason,acquired_at,heartbeat_at,expires_at \
+                 FROM maintenance_hold WHERE singleton=1",
+                [],
+                maintenance_hold_from_row,
+            )
+            .optional()?;
+        let Some(hold) = hold.filter(|hold| hold.owner == owner) else {
+            return Ok(false);
+        };
+        tx.execute(
+            "DELETE FROM maintenance_hold WHERE singleton=1 AND owner=?",
+            [owner],
+        )?;
+        tx.execute(
+            "INSERT INTO maintenance_hold_events(\
+               action,owner,reason,occurred_at,expires_at\
+             ) VALUES('released',?,?,?,?)",
+            params![
+                owner,
+                &hold.reason,
+                &now_text,
+                format_timestamp(hold.expires_at)
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 查询当前有效维护锁；到期行仅保留给接管审计，不再视为持有中。
+    pub fn maintenance_hold(&self) -> Result<Option<MaintenanceHold>> {
+        let hold = self
+            .conn()
+            .query_row(
+                "SELECT owner,reason,acquired_at,heartbeat_at,expires_at \
+                 FROM maintenance_hold WHERE singleton=1",
+                [],
+                maintenance_hold_from_row,
+            )
+            .optional()?;
+        Ok(hold.filter(|hold| hold.expires_at > Utc::now()))
+    }
+
+    pub fn maintenance_hold_events(&self, limit: usize) -> Result<Vec<MaintenanceHoldEvent>> {
+        let connection = self.conn();
+        let mut query = connection.prepare(
+            "SELECT id,action,owner,previous_owner,reason,previous_reason,occurred_at,expires_at \
+             FROM maintenance_hold_events ORDER BY id DESC LIMIT ?",
+        )?;
+        Ok(query
+            .query_map(
+                [i64::try_from(limit).unwrap_or(i64::MAX)],
+                maintenance_hold_event_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 返回维护所需的完整空闲快照。`owner` 可排除调用方自己持有的维护锁；
+    /// 其他持有者（尤其 live_once）仍会作为明确阻塞项返回。
+    pub fn maintenance_status(&self, owner: Option<&str>) -> Result<MaintenanceStatus> {
+        let checked_at = Utc::now();
+        let now_text = format_timestamp(checked_at);
+        let connection = self.conn();
+        let mut blockers = Vec::new();
+
+        push_maintenance_blocker(
+            &mut blockers,
+            "active_jobs",
+            query_text_rows(
+                &connection,
+                "SELECT id||':'||status FROM jobs \
+                 WHERE status IN('inspecting','processing','downloading','segmenting','translating','rendering') \
+                 ORDER BY id",
+                [],
+            )?,
+        );
+        push_maintenance_blocker(
+            &mut blockers,
+            "running_stages",
+            query_text_rows(
+                &connection,
+                "SELECT CAST(id AS TEXT)||':'||job_id||':'||stage FROM stage_runs \
+                 WHERE status='running' ORDER BY id",
+                [],
+            )?,
+        );
+        push_maintenance_blocker(
+            &mut blockers,
+            "active_claims",
+            query_text_rows(
+                &connection,
+                "SELECT id||':'||COALESCE(NULLIF(claim_kind,''),'-')||':'||\
+                   COALESCE(NULLIF(claim_owner,''),'-') FROM jobs \
+                 WHERE (NULLIF(claim_kind,'') IS NOT NULL OR NULLIF(claim_owner,'') IS NOT NULL) \
+                   AND (claim_expires_at IS NULL OR claim_expires_at>?) ORDER BY id",
+                [&now_text],
+            )?,
+        );
+        push_maintenance_blocker(
+            &mut blockers,
+            "uploading_jobs",
+            query_text_rows(
+                &connection,
+                "SELECT id||':'||video_id FROM jobs WHERE status='uploading' ORDER BY id",
+                [],
+            )?,
+        );
+        push_maintenance_blocker(
+            &mut blockers,
+            "upload_attempts",
+            query_text_rows(
+                &connection,
+                "SELECT id||':'||job_id||':'||status FROM upload_attempts \
+                 WHERE status IN('running','uncertain') ORDER BY id",
+                [],
+            )?,
+        );
+        push_maintenance_blocker(
+            &mut blockers,
+            "subtitle_attempts",
+            query_text_rows(
+                &connection,
+                "SELECT id||':'||job_id||':'||status FROM subtitle_attempts \
+                 WHERE status IN('started','uncertain') ORDER BY id",
+                [],
+            )?,
+        );
+
+        let hold_record = connection
+            .query_row(
+                "SELECT owner,reason,acquired_at,heartbeat_at,expires_at \
+                 FROM maintenance_hold WHERE singleton=1",
+                [],
+                maintenance_hold_from_row,
+            )
+            .optional()?;
+        let hold = hold_record
+            .as_ref()
+            .filter(|hold| hold.expires_at > checked_at)
+            .cloned();
+        let expired_hold = hold_record.filter(|hold| hold.expires_at <= checked_at);
+        if let Some(active_hold) = hold
+            .as_ref()
+            .filter(|hold| Some(hold.owner.as_str()) != owner)
+        {
+            let kind = if active_hold.owner.starts_with("LIVE_ONCE:") {
+                "live_once_hold"
+            } else {
+                "maintenance_hold"
+            };
+            push_maintenance_blocker(
+                &mut blockers,
+                kind,
+                vec![format!(
+                    "owner={} expires_at={} reason={}",
+                    active_hold.owner,
+                    format_timestamp(active_hold.expires_at),
+                    active_hold.reason
+                )],
+            );
+        }
+
+        Ok(MaintenanceStatus {
+            checked_at,
+            idle: blockers.is_empty(),
+            hold,
+            expired_hold,
+            blockers,
+        })
     }
 
     pub fn add_channel(
@@ -1315,6 +1754,7 @@ impl Database {
              WHERE id=(SELECT id FROM jobs \
                WHERE (status='queued' OR (status='retry_wait' AND ((retry_at IS NULL AND updated_at<=?4) OR retry_at<=?5))) \
                  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?5) \
+                 AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?5) \
                ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1) \
              RETURNING {JOB_COLUMNS}"
         );
@@ -1341,6 +1781,7 @@ impl Database {
              WHERE id=?4 \
                AND (status='queued' OR (status='retry_wait' AND ((retry_at IS NULL AND updated_at<=?5) OR retry_at<=?6))) \
                AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?6) \
+               AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?6) \
              RETURNING {JOB_COLUMNS}"
         );
         self.job_opt(
@@ -1479,9 +1920,9 @@ impl Database {
         let due = Self::retry_due_clause("updated_at");
         self.job_opt(
             &format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='queued' OR (status='retry_wait' AND ({due})) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1"
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE (status='queued' OR (status='retry_wait' AND ({due}))) AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1"
             ),
-            params![legacy_before, now],
+            params![legacy_before, &now, &now],
         )
     }
 
@@ -1490,9 +1931,9 @@ impl Database {
         let due = Self::retry_due_clause("updated_at");
         self.job_opt(
             &format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='ready_to_upload' OR (status='upload_retry_wait' AND ({due})) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1"
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE (status='ready_to_upload' OR (status='upload_retry_wait' AND ({due}))) AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1"
             ),
-            params![legacy_before, now],
+            params![legacy_before, &now, &now],
         )
     }
 
@@ -1606,22 +2047,20 @@ impl Database {
     /// 原子检查全局投稿窗口、创建 attempt 并领取任务。
     ///
     /// `live_once` 与普通调度器都通过 SQLite 的写事务串行化：要么旁路先写入
-    /// hold，普通任务无法领取；要么普通任务先进入 uploading，旁路会等待它结束。
-    /// 返回 attempt ID；窗口未到、存在旁路 hold 或任务状态不匹配时返回 None。
+    /// 维护租约，普通任务无法领取；要么普通任务先进入 uploading，旁路会等待它结束。
+    /// 返回 attempt ID；窗口未到、维护租约生效或任务状态不匹配时返回 None。
     pub fn begin_prepared_upload(&self, id: &str) -> Result<Option<String>> {
         let attempt_id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let hold_owner: Option<String> = tx
-            .query_row(
-                "SELECT value FROM settings WHERE key=?",
-                [BILIBILI_UPLOAD_HOLD_OWNER],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if hold_owner.is_some() {
+        let maintenance_hold_active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?)",
+            [&now_text],
+            |row| row.get(0),
+        )?;
+        if maintenance_hold_active {
             return Ok(None);
         }
         let deadline: Option<String> = tx
@@ -1986,10 +2425,12 @@ impl Database {
                  AND bvid IS NOT NULL AND bvid<>'' AND subtitle_attempt<? \
                  AND (subtitle_retry_at IS NULL OR subtitle_retry_at<=?) \
                  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?) \
+                 AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?) \
                  ORDER BY discovered_at LIMIT 1"
             ),
             params![
                 max_attempts,
+                Utc::now().to_rfc3339(),
                 Utc::now().to_rfc3339(),
                 Utc::now().to_rfc3339()
             ],
@@ -2006,6 +2447,7 @@ impl Database {
                AND bvid IS NOT NULL AND bvid<>'' AND subtitle_attempt<?4 \
                AND (subtitle_retry_at IS NULL OR subtitle_retry_at<=?3) \
                AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?3) \
+               AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?3) \
                ORDER BY discovered_at LIMIT 1) \
              RETURNING {JOB_COLUMNS}"
         );
@@ -2029,6 +2471,7 @@ impl Database {
              WHERE id=?4 AND bvid IS NOT NULL AND bvid<>'' \
                AND status IN ('completed','uploaded_original_pending_subtitle') \
                AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?3) \
+               AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?3) \
              RETURNING {JOB_COLUMNS}"
         );
         self.job_opt(
@@ -2567,7 +3010,7 @@ impl Database {
     /// 调度器的只读快速判断；真正的窗口与 hold 校验仍在 `begin_prepared_upload`
     /// 的写事务内重复执行，避免检查后领取前的竞态。
     pub fn bilibili_submission_due(&self, now: DateTime<Utc>) -> Result<bool> {
-        if self.get_setting(BILIBILI_UPLOAD_HOLD_OWNER)?.is_some() {
+        if self.maintenance_hold()?.is_some() {
             return Ok(false);
         }
         self.setting_deadline_due(NEXT_BILIBILI_SUBMIT_AT, now)
@@ -2646,6 +3089,56 @@ impl Database {
 
 fn format_timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn maintenance_hold_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MaintenanceHold> {
+    Ok(MaintenanceHold {
+        owner: r.get(0)?,
+        reason: r.get(1)?,
+        acquired_at: parse(r.get(2)?)?,
+        heartbeat_at: parse(r.get(3)?)?,
+        expires_at: parse(r.get(4)?)?,
+    })
+}
+
+fn maintenance_hold_event_from_row(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MaintenanceHoldEvent> {
+    Ok(MaintenanceHoldEvent {
+        id: r.get(0)?,
+        action: r.get(1)?,
+        owner: r.get(2)?,
+        previous_owner: r.get(3)?,
+        reason: r.get(4)?,
+        previous_reason: r.get(5)?,
+        occurred_at: parse(r.get(6)?)?,
+        expires_at: parse_opt(r.get(7)?)?,
+    })
+}
+
+fn query_text_rows(
+    connection: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<String>> {
+    let mut query = connection.prepare(sql)?;
+    Ok(query
+        .query_map(params, |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn push_maintenance_blocker(
+    blockers: &mut Vec<MaintenanceBlocker>,
+    kind: &str,
+    details: Vec<String>,
+) {
+    if !details.is_empty() {
+        blockers.push(MaintenanceBlocker {
+            kind: kind.into(),
+            count: details.len(),
+            details,
+        });
+    }
 }
 
 fn channel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Channel> {
@@ -2839,6 +3332,275 @@ mod tests {
         }
     }
 
+    fn maintenance_test_job(db: &Database, video_id: &str) -> String {
+        db.create_job(NewJob {
+            channel_id: None,
+            video_id,
+            url: &format!("https://youtu.be/{video_id}"),
+            title: None,
+            published: None,
+            updated: None,
+            transfer_mode: TransferMode::Direct,
+        })
+        .unwrap()
+        .unwrap()
+    }
+
+    fn assert_maintenance_blocker(status: &MaintenanceStatus, kind: &str, detail: &str) {
+        assert!(!status.idle);
+        let blocker = status
+            .blockers
+            .iter()
+            .find(|blocker| blocker.kind == kind)
+            .unwrap_or_else(|| panic!("缺少 {kind} 阻塞项: {:?}", status.blockers));
+        assert_eq!(blocker.count, blocker.details.len());
+        assert!(
+            blocker.details.iter().any(|value| value.contains(detail)),
+            "{kind} 未指出 {detail}: {:?}",
+            blocker.details
+        );
+    }
+
+    #[test]
+    fn maintenance_hold_acquisition_is_atomic_between_processes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("maintenance-race.db");
+        let first = Database::open(&path).unwrap();
+        let second = Database::open(&path).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_barrier = barrier.clone();
+        let second_barrier = barrier.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first
+                .acquire_maintenance_hold("deploy:first", "并发部署一", 300)
+                .unwrap()
+        });
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            second
+                .acquire_maintenance_hold("deploy:second", "并发部署二", 300)
+                .unwrap()
+        });
+        barrier.wait();
+        let acquired = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+        assert_eq!(acquired.into_iter().filter(|value| *value).count(), 1);
+
+        let reopened = Database::open_existing(&path).unwrap();
+        assert!(matches!(
+            reopened.maintenance_hold().unwrap().unwrap().owner.as_str(),
+            "deploy:first" | "deploy:second"
+        ));
+        assert_eq!(reopened.maintenance_hold_events(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expired_maintenance_hold_can_be_taken_over_with_audit() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("maintenance-takeover.db")).unwrap();
+        assert!(
+            db.acquire_maintenance_hold("deploy:old", "旧版本部署", 300)
+                .unwrap()
+        );
+        db.conn()
+            .execute(
+                "UPDATE maintenance_hold SET expires_at=? WHERE singleton=1",
+                [format_timestamp(Utc::now() - chrono::Duration::seconds(1))],
+            )
+            .unwrap();
+        assert!(db.maintenance_hold().unwrap().is_none());
+
+        assert!(
+            db.acquire_maintenance_hold("deploy:new", "接管过期部署", 300)
+                .unwrap()
+        );
+        let hold = db.maintenance_hold().unwrap().unwrap();
+        assert_eq!(hold.owner, "deploy:new");
+        let event = &db.maintenance_hold_events(1).unwrap()[0];
+        assert_eq!(event.action, "taken_over");
+        assert_eq!(event.owner, "deploy:new");
+        assert_eq!(event.previous_owner.as_deref(), Some("deploy:old"));
+        assert_eq!(event.previous_reason.as_deref(), Some("旧版本部署"));
+        assert_eq!(event.reason, "接管过期部署");
+    }
+
+    #[test]
+    fn maintenance_hold_can_be_renewed_but_not_released_by_another_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("maintenance-owner.db")).unwrap();
+        assert!(
+            db.acquire_maintenance_hold("deploy:owner", "发布维护", 1)
+                .unwrap()
+        );
+        let original_expiry = db.maintenance_hold().unwrap().unwrap().expires_at;
+        assert!(db.renew_maintenance_hold("deploy:owner", 300).unwrap());
+        assert!(
+            db.maintenance_hold().unwrap().unwrap().expires_at > original_expiry,
+            "续租没有延长到期时间"
+        );
+        assert!(!db.release_maintenance_hold("deploy:other").unwrap());
+        assert_eq!(
+            db.maintenance_hold().unwrap().unwrap().owner,
+            "deploy:owner"
+        );
+        assert!(db.release_maintenance_hold("deploy:owner").unwrap());
+        assert!(db.maintenance_hold().unwrap().is_none());
+    }
+
+    #[test]
+    fn idle_status_reports_active_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-active-job.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-active-job");
+        db.update_job_status(&id, JobStatus::Processing, None)
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "active_jobs", &format!("{id}:processing"));
+    }
+
+    #[test]
+    fn idle_status_reports_running_stage() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-running-stage.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-running-stage");
+        let stage_id = db.start_stage(&id, "render", None, None, None).unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(
+            &status,
+            "running_stages",
+            &format!("{stage_id}:{id}:render"),
+        );
+    }
+
+    #[test]
+    fn idle_status_reports_only_unexpired_nonempty_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-claim.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-claim");
+        db.conn()
+            .execute(
+                "UPDATE jobs SET claim_kind='prepare',claim_owner='worker',claim_expires_at=? \
+                 WHERE id=?",
+                params![
+                    format_timestamp(Utc::now() + chrono::Duration::minutes(1)),
+                    &id
+                ],
+            )
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "active_claims", &format!("{id}:prepare:worker"));
+
+        db.conn()
+            .execute(
+                "UPDATE jobs SET claim_expires_at=? WHERE id=?",
+                params![
+                    format_timestamp(Utc::now() - chrono::Duration::seconds(1)),
+                    &id
+                ],
+            )
+            .unwrap();
+        assert!(db.maintenance_status(None).unwrap().idle);
+    }
+
+    #[test]
+    fn idle_status_reports_uploading_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-uploading.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-uploading");
+        db.update_job_status(&id, JobStatus::Uploading, None)
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "uploading_jobs", &id);
+    }
+
+    #[test]
+    fn idle_status_reports_running_upload_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-upload-running.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-upload-running");
+        db.conn()
+            .execute(
+                "INSERT INTO upload_attempts(id,job_id,status,started_at) \
+                 VALUES('upload-running',?,'running',?)",
+                params![&id, format_timestamp(Utc::now())],
+            )
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "upload_attempts", "upload-running");
+    }
+
+    #[test]
+    fn idle_status_reports_uncertain_upload_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-upload-uncertain.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-upload-uncertain");
+        db.conn()
+            .execute(
+                "INSERT INTO upload_attempts(id,job_id,status,started_at) \
+                 VALUES('upload-uncertain',?,'uncertain',?)",
+                params![&id, format_timestamp(Utc::now())],
+            )
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "upload_attempts", "upload-uncertain");
+    }
+
+    #[test]
+    fn idle_status_reports_started_subtitle_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-subtitle-started.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-subtitle-started");
+        db.conn()
+            .execute(
+                "INSERT INTO subtitle_attempts(id,job_id,bvid,status,started_at) \
+                 VALUES('subtitle-started',?,'BV1idletest1','started',?)",
+                params![&id, format_timestamp(Utc::now())],
+            )
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "subtitle_attempts", "subtitle-started");
+    }
+
+    #[test]
+    fn idle_status_reports_uncertain_subtitle_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-subtitle-uncertain.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-subtitle-uncertain");
+        db.conn()
+            .execute(
+                "INSERT INTO subtitle_attempts(id,job_id,bvid,status,started_at) \
+                 VALUES('subtitle-uncertain',?,'BV1idletest2','uncertain',?)",
+                params![&id, format_timestamp(Utc::now())],
+            )
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "subtitle_attempts", "subtitle-uncertain");
+    }
+
+    #[test]
+    fn idle_status_reports_live_once_lease_but_exempts_its_caller() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-live-once.db")).unwrap();
+        let owner = "LIVE_ONCE:video:process";
+        assert!(
+            db.acquire_maintenance_hold(owner, "一次性直播投稿", 300)
+                .unwrap()
+        );
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "live_once_hold", owner);
+        assert!(db.maintenance_status(Some(owner)).unwrap().idle);
+
+        db.conn()
+            .execute(
+                "UPDATE maintenance_hold SET expires_at=? WHERE singleton=1",
+                [format_timestamp(Utc::now() - chrono::Duration::seconds(1))],
+            )
+            .unwrap();
+        let expired = db.maintenance_status(None).unwrap();
+        assert!(expired.idle);
+        assert_eq!(expired.expired_hold.unwrap().owner, owner);
+    }
+
     #[test]
     fn migrates_v3_rows_to_translated_mode() {
         let t = tempfile::tempdir().unwrap();
@@ -2953,6 +3715,58 @@ mod tests {
             )
             .unwrap();
         assert!(subtitle_attempts_exists);
+    }
+
+    #[test]
+    fn v22_migrates_legacy_permanent_live_hold_to_a_short_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("v21-live-hold.db");
+        let old = Database::open(&path).unwrap();
+        let previous_deadline = format_timestamp(Utc::now() + chrono::Duration::minutes(20));
+        old.set_setting(LEGACY_BILIBILI_UPLOAD_HOLD_OWNER, "LIVE_ONCE:legacy:owner")
+            .unwrap();
+        old.set_setting(
+            LEGACY_BILIBILI_UPLOAD_HOLD_PREVIOUS,
+            &serde_json::to_string(&Some(&previous_deadline)).unwrap(),
+        )
+        .unwrap();
+        old.set_setting(NEXT_BILIBILI_SUBMIT_AT, LEGACY_BILIBILI_UPLOAD_HOLD_UNTIL)
+            .unwrap();
+        old.conn()
+            .execute_batch(
+                "DROP INDEX idx_maintenance_hold_events_time; \
+                 DROP TABLE maintenance_hold_events; \
+                 DROP TABLE maintenance_hold; \
+                 DELETE FROM schema_migrations WHERE version=22;",
+            )
+            .unwrap();
+        drop(old);
+
+        let migrated = Database::open(&path).unwrap();
+        assert_eq!(
+            migrated.get_setting(NEXT_BILIBILI_SUBMIT_AT).unwrap(),
+            Some(previous_deadline)
+        );
+        assert!(
+            migrated
+                .get_setting(LEGACY_BILIBILI_UPLOAD_HOLD_OWNER)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            migrated
+                .get_setting(LEGACY_BILIBILI_UPLOAD_HOLD_PREVIOUS)
+                .unwrap()
+                .is_none()
+        );
+        let hold = migrated.maintenance_hold().unwrap().unwrap();
+        assert_eq!(hold.owner, "LIVE_ONCE:legacy:owner");
+        assert!(hold.expires_at > Utc::now());
+        assert!(hold.expires_at <= Utc::now() + chrono::Duration::minutes(5));
+        let event = &migrated.maintenance_hold_events(1).unwrap()[0];
+        assert_eq!(event.action, "acquired");
+        assert_eq!(event.owner, hold.owner);
+        assert!(event.reason.contains("v21"));
     }
 
     #[test]
@@ -3735,6 +4549,129 @@ mod tests {
         );
     }
 
+    #[test]
+    fn maintenance_hold_refuses_prepare_upload_and_subtitle_claims_until_expiry() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("maintenance-claims.db")).unwrap();
+        let prepare_id = maintenance_test_job(&db, "hold-prepare");
+        let upload_id = maintenance_test_job(&db, "hold-upload");
+        db.queue_prepared_upload(
+            &upload_id,
+            &PreparedUpload::Submission {
+                video_path: "/tmp/hold-upload.mp4".into(),
+                cover_path: "/tmp/hold-upload.jpg".into(),
+                mode: TransferMode::Direct,
+                completion_status: JobStatus::Completed,
+            },
+        )
+        .unwrap();
+        let subtitle_id = maintenance_test_job(&db, "hold-subtitle");
+        db.set_job_bvid(&subtitle_id, "BV1holdtest1").unwrap();
+        db.queue_pending_subtitle(&subtitle_id, -1).unwrap();
+
+        assert!(
+            db.acquire_maintenance_hold("deploy:claims", "验证队列暂停", 300)
+                .unwrap()
+        );
+        assert!(db.next_queued_job().unwrap().is_none());
+        assert!(db.claim_next_prepare_job().unwrap().is_none());
+        assert!(db.claim_prepare_job(&prepare_id).unwrap().is_none());
+        assert!(db.next_ready_to_upload_job().unwrap().is_none());
+        assert!(!db.bilibili_submission_due(Utc::now()).unwrap());
+        assert!(db.begin_prepared_upload(&upload_id).unwrap().is_none());
+        assert!(db.next_pending_subtitle_job(16).unwrap().is_none());
+        assert!(db.claim_next_pending_subtitle_job(16).unwrap().is_none());
+        assert!(db.claim_subtitle_job_now(&subtitle_id).unwrap().is_none());
+
+        db.conn()
+            .execute(
+                "UPDATE maintenance_hold SET expires_at=? WHERE singleton=1",
+                [format_timestamp(Utc::now() - chrono::Duration::seconds(1))],
+            )
+            .unwrap();
+        assert_eq!(db.claim_next_prepare_job().unwrap().unwrap().id, prepare_id);
+        assert!(db.begin_prepared_upload(&upload_id).unwrap().is_some());
+        assert_eq!(
+            db.claim_next_pending_subtitle_job(16).unwrap().unwrap().id,
+            subtitle_id
+        );
+    }
+
+    #[test]
+    fn maintenance_hold_does_not_interrupt_already_claimed_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("maintenance-inflight.db")).unwrap();
+        let prepare_id = maintenance_test_job(&db, "inflight-prepare");
+        db.claim_prepare_job(&prepare_id).unwrap().unwrap();
+
+        let upload_id = maintenance_test_job(&db, "inflight-upload");
+        db.queue_prepared_upload(
+            &upload_id,
+            &PreparedUpload::Submission {
+                video_path: "/tmp/inflight-upload.mp4".into(),
+                cover_path: "/tmp/inflight-upload.jpg".into(),
+                mode: TransferMode::Direct,
+                completion_status: JobStatus::Completed,
+            },
+        )
+        .unwrap();
+        let upload_attempt = db.begin_prepared_upload(&upload_id).unwrap().unwrap();
+
+        let subtitle_id = maintenance_test_job(&db, "inflight-subtitle");
+        db.set_job_bvid(&subtitle_id, "BV1holdtest2").unwrap();
+        db.queue_pending_subtitle(&subtitle_id, -1).unwrap();
+        db.claim_next_pending_subtitle_job(16).unwrap().unwrap();
+
+        assert!(
+            db.acquire_maintenance_hold("deploy:inflight", "等待存量任务", 300)
+                .unwrap()
+        );
+        assert!(db.renew_job_claim(&prepare_id, PREPARE_CLAIM_KIND).unwrap());
+        assert!(db.renew_job_claim(&upload_id, UPLOAD_CLAIM_KIND).unwrap());
+        assert!(
+            db.renew_job_claim(&subtitle_id, SUBTITLE_CLAIM_KIND)
+                .unwrap()
+        );
+        db.update_claimed_job_status(
+            &prepare_id,
+            PREPARE_CLAIM_KIND,
+            JobStatus::Processing,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !db.finish_upload_attempt(
+                &upload_id,
+                &upload_attempt,
+                "BV1holdtest3",
+                JobStatus::Completed,
+                TransferMode::Direct,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: 90,
+                    next_submit_at: None,
+                },
+            )
+            .unwrap()
+        );
+        db.defer_claimed_pending_subtitle(&subtitle_id, "存量任务正常收尾", 60)
+            .unwrap();
+
+        assert_eq!(
+            db.get_job(&prepare_id).unwrap().unwrap().status,
+            JobStatus::Processing
+        );
+        assert_eq!(
+            db.get_job(&upload_id).unwrap().unwrap().status,
+            JobStatus::Completed
+        );
+        assert_eq!(
+            db.get_job(&subtitle_id).unwrap().unwrap().status,
+            JobStatus::UploadedOriginalPendingSubtitle
+        );
+        assert!(db.claim_next_pending_subtitle_job(16).unwrap().is_none());
+    }
+
     fn claimed_subtitle_job(db: &Database, video_id: &str, bvid: &str) -> (String, Job) {
         let id = db
             .create_job(NewJob {
@@ -4306,7 +5243,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_claim_atomically_observes_deadline_and_live_hold() {
+    fn upload_claim_atomically_observes_deadline_and_maintenance_hold() {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("upload-window.db")).unwrap();
         let id = db
@@ -4348,20 +5285,17 @@ mod tests {
             &(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
         )
         .unwrap();
-        db.set_setting(BILIBILI_UPLOAD_HOLD_OWNER, "live-once:test")
-            .unwrap();
+        assert!(
+            db.acquire_maintenance_hold("LIVE_ONCE:test", "一次性直播旁路", 300)
+                .unwrap()
+        );
         assert!(db.begin_prepared_upload(&id).unwrap().is_none());
         assert_eq!(
             db.get_job(&id).unwrap().unwrap().status,
             JobStatus::ReadyToUpload
         );
 
-        db.conn()
-            .execute(
-                "DELETE FROM settings WHERE key=?",
-                [BILIBILI_UPLOAD_HOLD_OWNER],
-            )
-            .unwrap();
+        assert!(db.release_maintenance_hold("LIVE_ONCE:test").unwrap());
         assert!(db.begin_prepared_upload(&id).unwrap().is_some());
         assert_eq!(
             db.get_job(&id).unwrap().unwrap().status,
