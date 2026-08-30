@@ -1179,11 +1179,23 @@ mod tests {
                 .split_whitespace()
                 .any(|dependency| dependency == "sqlite3")
         );
+        assert!(bootstrap.contains("install -d /opt/y2b/releases"));
 
         let deploy = fs::read_to_string(root.join("deploy/deploy-app.sh")).unwrap();
-        let sqlite_check = deploy.find("command -v sqlite3").unwrap();
-        let first_idle_check = deploy.find("\nassert_idle\n").unwrap();
-        assert!(sqlite_check < first_idle_check);
+        let sqlite_check = deploy.find("command -v \"$sqlite3_cmd\"").unwrap();
+        let acquire = deploy.find("maintenance acquire").unwrap();
+        let idle_wait = deploy.find("\nwait_for_two_idle_checks\n").unwrap();
+        assert!(sqlite_check < acquire);
+        assert!(acquire < idle_wait);
+        assert!(deploy.contains(
+            "maintenance status \\\n      --database \"$database\" --owner \"$owner\" --json"
+        ));
+        assert!(deploy.contains("\"$mv_cmd\" -Tf -- \"$current_temp\" \"$current_link\""));
+        assert!(!deploy.contains("rm -f -- \"$current_link\""));
+
+        let service = fs::read_to_string(root.join("deploy/y2b-watch.service")).unwrap();
+        assert!(service.contains("ExecStart=/opt/y2b/current/y2b"));
+        assert!(service.contains("/opt/y2b/current/pi/y2b-extension.ts"));
     }
 
     #[test]
@@ -1235,6 +1247,555 @@ mod tests {
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    const OLD_DEPLOY_REVISION: &str = "aaaaaaaaaaaa";
+    const NEW_DEPLOY_REVISION: &str = "bbbbbbbbbbbb";
+
+    struct DeployFixture {
+        _temp: tempfile::TempDir,
+        candidate: PathBuf,
+        app_root: PathBuf,
+        state_dir: PathBuf,
+        database: PathBuf,
+        config: PathBuf,
+        env_file: PathBuf,
+        unit_dir: PathBuf,
+        local_bin: PathBuf,
+        local_sbin: PathBuf,
+        current: PathBuf,
+        hold: PathBuf,
+        claim_attempt: PathBuf,
+        claim_blocked: PathBuf,
+        claim_acquired: PathBuf,
+        service_state: PathBuf,
+        systemctl_log: PathBuf,
+        events: PathBuf,
+        scenario: &'static str,
+        credential_owner: String,
+        path: String,
+    }
+
+    fn deploy_fixture(scenario: &'static str) -> DeployFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let bin_dir = root.join("stub-bin");
+        let app_root = root.join("opt/y2b");
+        let state_dir = root.join("var/lib/y2b");
+        let unit_dir = root.join("etc/systemd/system");
+        let local_bin = root.join("usr/local/bin");
+        let local_sbin = root.join("usr/local/sbin");
+        let old_release = app_root.join("releases").join(OLD_DEPLOY_REVISION);
+        for directory in [
+            bin_dir.clone(),
+            old_release.join("pi"),
+            old_release.join("deploy"),
+            state_dir.join("backups"),
+            unit_dir.clone(),
+            local_bin.clone(),
+            local_sbin.clone(),
+            root.join("etc/y2b"),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+
+        let y2b_stub = r#"#!/usr/bin/env bash
+set -euo pipefail
+line=" $* "
+scenario=${DEPLOY_TEST_SCENARIO:-success}
+target=$(readlink "$DEPLOY_TEST_CURRENT" 2>/dev/null || printf 'none')
+printf 'target=%s args=%s\n' "$target" "$*" >>"$DEPLOY_TEST_Y2B_LOG"
+
+value_for() {
+  local wanted=$1
+  shift
+  while (( $# > 0 )); do
+    if [[ $1 == "$wanted" ]]; then
+      printf '%s\n' "$2"
+      return
+    fi
+    shift
+  done
+  return 1
+}
+
+record_event() {
+  printf '%s\n' "$1" >>"$DEPLOY_TEST_EVENTS"
+}
+
+if [[ "$line" == *" maintenance acquire "* ]]; then
+  owner=$(value_for --owner "$@")
+  [[ ! -e "$DEPLOY_TEST_HOLD" ]] || exit 1
+  printf '%s\n' "$owner" >"$DEPLOY_TEST_HOLD"
+  record_event "acquire:$owner"
+  printf 'acquired\n'
+elif [[ "$line" == *" maintenance renew "* ]]; then
+  owner=$(value_for --owner "$@")
+  [[ -f "$DEPLOY_TEST_HOLD" && $(<"$DEPLOY_TEST_HOLD") == "$owner" ]] || exit 1
+  if [[ "$scenario" == race && -f "$DEPLOY_TEST_FIRST_IDLE" && ! -f "$DEPLOY_TEST_CLAIM_ATTEMPT" ]]; then
+    printf 'attempted\n' >"$DEPLOY_TEST_CLAIM_ATTEMPT"
+    if [[ -f "$DEPLOY_TEST_HOLD" ]]; then
+      printf 'blocked\n' >"$DEPLOY_TEST_CLAIM_BLOCKED"
+      record_event 'claim:blocked-by-maintenance'
+    else
+      printf 'acquired\n' >"$DEPLOY_TEST_CLAIM_ACQUIRED"
+      record_event 'claim:acquired'
+    fi
+  fi
+  printf 'renewed\n'
+elif [[ "$line" == *" maintenance status "* ]]; then
+  owner=$(value_for --owner "$@")
+  [[ -f "$DEPLOY_TEST_HOLD" && $(<"$DEPLOY_TEST_HOLD") == "$owner" ]] || exit 1
+  count=0
+  [[ ! -f "$DEPLOY_TEST_STATUS_COUNT" ]] || count=$(<"$DEPLOY_TEST_STATUS_COUNT")
+  ((count += 1))
+  printf '%s\n' "$count" >"$DEPLOY_TEST_STATUS_COUNT"
+  case "$scenario" in
+    blocker)
+      printf '%s\n' '{"checked_at":"test","idle":false,"hold":null,"expired_hold":null,"blockers":[{"kind":"active_claims","count":1,"details":["job-42:upload:worker-7"]}]}'
+      ;;
+    live_once)
+      printf '%s\n' '{"checked_at":"test","idle":false,"hold":null,"expired_hold":null,"blockers":[{"kind":"live_once_hold","count":1,"details":["owner=LIVE_ONCE:premiere expires_at=2099-01-01 reason=直播首发"]}]}'
+      ;;
+    *)
+      printf '%s\n' '{"checked_at":"test","idle":true,"hold":null,"expired_hold":null,"blockers":[]}'
+      if (( count == 1 )); then
+        printf 'returned\n' >"$DEPLOY_TEST_FIRST_IDLE"
+      fi
+      ;;
+  esac
+elif [[ "$line" == *" maintenance release "* ]]; then
+  owner=$(value_for --owner "$@")
+  [[ -f "$DEPLOY_TEST_HOLD" && $(<"$DEPLOY_TEST_HOLD") == "$owner" ]] || exit 1
+  rm -f "$DEPLOY_TEST_HOLD"
+  record_event "release:$target"
+  printf 'released\n'
+elif [[ "$line" == *" config-check "* ]]; then
+  record_event 'preflight:config-check'
+elif [[ "$line" == *" migrate --database "* ]]; then
+  printf 'new-database\n' >"$DEPLOY_TEST_DATABASE"
+  record_event "migrate:$target"
+  printf '22\n'
+elif [[ "$line" == *" check "* ]]; then
+  content=$(<"$DEPLOY_TEST_DATABASE")
+  record_event "check:$target:$content"
+else
+  echo "未预期的 y2b 参数: $*" >&2
+  exit 2
+fi
+"#;
+        let candidate = bin_dir.join("y2b");
+        write_executable(&candidate, y2b_stub);
+        write_executable(&old_release.join("y2b"), y2b_stub);
+
+        for resource in [
+            "y2b-extension.ts",
+            "policy.json",
+            "audit-policy.json",
+            "brawl-stars-glossary.json",
+        ] {
+            fs::write(old_release.join("pi").join(resource), resource).unwrap();
+        }
+        fs::write(old_release.join("Cargo.lock"), "old lock\n").unwrap();
+        write_executable(
+            &old_release.join("deploy/y2b-set-deepseek-key.py"),
+            "#!/usr/bin/env python3\n",
+        );
+
+        let current = app_root.join("current");
+        symlink(format!("releases/{OLD_DEPLOY_REVISION}"), &current).unwrap();
+        symlink("current/pi", app_root.join("pi")).unwrap();
+        symlink("current/Cargo.lock", app_root.join("Cargo.lock")).unwrap();
+        symlink("current/deploy", app_root.join("deploy")).unwrap();
+        symlink(current.join("y2b"), local_bin.join("y2b")).unwrap();
+
+        let database = state_dir.join("state.db");
+        fs::write(&database, "old-database\n").unwrap();
+        let config = root.join("etc/y2b/config.toml");
+        fs::write(
+            &config,
+            format!(
+                "[runtime]\ndatabase = \"{}\"\n[ai]\nextension = \"{}/pi/y2b-extension.ts\"\npolicy = \"{}/pi/policy.json\"\n",
+                database.display(),
+                app_root.display(),
+                app_root.display()
+            ),
+        )
+        .unwrap();
+        let env_file = root.join("etc/y2b/y2b.env");
+        fs::write(&env_file, "YOUTUBE_API_KEY=test-only\n").unwrap();
+        let mut env_permissions = fs::metadata(&env_file).unwrap().permissions();
+        env_permissions.set_mode(0o600);
+        fs::set_permissions(&env_file, env_permissions).unwrap();
+
+        let service_state = root.join("service-state");
+        fs::write(&service_state, "active\n").unwrap();
+        let systemctl_log = root.join("systemctl.log");
+        let events = root.join("events.log");
+        write_executable(
+            &bin_dir.join("systemctl"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+target=$(readlink "$DEPLOY_TEST_CURRENT" 2>/dev/null || printf 'none')
+content=$(<"$DEPLOY_TEST_DATABASE")
+printf '%s target=%s database=%s\n' "$*" "$target" "$content" >>"$DEPLOY_TEST_SYSTEMCTL_LOG"
+line=" $* "
+if [[ ${1:-} == stop ]]; then
+  printf 'inactive\n' >"$DEPLOY_TEST_SERVICE_STATE"
+elif [[ ${1:-} == start ]]; then
+  if [[ "$DEPLOY_TEST_SCENARIO" == health_failure && "$target" == "releases/bbbbbbbbbbbb" ]]; then
+    printf 'failed\n' >"$DEPLOY_TEST_SERVICE_STATE"
+  else
+    printf 'active\n' >"$DEPLOY_TEST_SERVICE_STATE"
+  fi
+  printf 'start:%s:%s\n' "$target" "$content" >>"$DEPLOY_TEST_EVENTS"
+elif [[ ${1:-} == is-active ]]; then
+  [[ $(<"$DEPLOY_TEST_SERVICE_STATE") == active ]] && exit 0
+  exit 3
+elif [[ "$line" == *" status "* ]]; then
+  [[ $(<"$DEPLOY_TEST_SERVICE_STATE") == active ]] && exit 0
+  exit 3
+elif [[ ${1:-} == daemon-reload || ${1:-} == enable ]]; then
+  :
+else
+  echo "未预期的 systemctl 参数: $*" >&2
+  exit 2
+fi
+"#,
+        );
+
+        write_executable(
+            &bin_dir.join("sqlite3"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+database=$1
+query=$2
+if [[ "$query" == .backup\ * ]]; then
+  target=${query#.backup \'}
+  target=${target%\'}
+  case "$DEPLOY_TEST_SCENARIO" in
+    backup_missing) : ;;
+    backup_corrupt) printf 'damaged-backup\n' >"$target" ;;
+    *) cp "$database" "$target" ;;
+  esac
+elif [[ "$query" == *integrity_check* ]]; then
+  if grep -q '^damaged' "$database"; then
+    printf 'row 1 broken\nrow 2 missing\n'
+  else
+    printf 'ok\n'
+  fi
+else
+  echo "未预期的 sqlite3 查询: $query" >&2
+  exit 2
+fi
+"#,
+        );
+
+        let python = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        assert!(python.status.success());
+        let python = String::from_utf8(python.stdout).unwrap().trim().to_owned();
+        write_executable(
+            &bin_dir.join("python3"),
+            &format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${{1:-}} == *y2b-set-deepseek-key.py ]]; then
+  exit 0
+fi
+exec "{python}" "$@"
+"#
+            ),
+        );
+        write_executable(&bin_dir.join("node"), "#!/usr/bin/env bash\nexit 0\n");
+        write_executable(
+            &bin_dir.join("mv"),
+            &format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+operands=()
+for argument in "$@"; do
+  case "$argument" in
+    --|-f|-T|-Tf|-fT) ;;
+    -*) ;;
+    *) operands+=("$argument") ;;
+  esac
+done
+(( ${{#operands[@]}} == 2 )) || {{ echo "mv 测试桩参数错误: $*" >&2; exit 2; }}
+if [[ ${{operands[1]}} == "$DEPLOY_TEST_CURRENT" ]]; then
+  sleep 0.02
+fi
+exec "{python}" - "${{operands[0]}}" "${{operands[1]}}" <<'PY'
+import os
+import sys
+os.replace(sys.argv[1], sys.argv[2])
+PY
+"#
+            ),
+        );
+
+        let user = std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .unwrap();
+        let group = std::process::Command::new("id")
+            .arg("-gn")
+            .output()
+            .unwrap();
+        assert!(user.status.success() && group.status.success());
+        let credential_owner = format!(
+            "{}:{}",
+            String::from_utf8(user.stdout).unwrap().trim(),
+            String::from_utf8(group.stdout).unwrap().trim()
+        );
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        DeployFixture {
+            _temp: temp,
+            candidate,
+            app_root,
+            state_dir,
+            database,
+            config,
+            env_file,
+            unit_dir,
+            local_bin,
+            local_sbin,
+            current,
+            hold: root.join("maintenance-hold"),
+            claim_attempt: root.join("claim-attempt"),
+            claim_blocked: root.join("claim-blocked"),
+            claim_acquired: root.join("claim-acquired"),
+            service_state,
+            systemctl_log,
+            events,
+            scenario,
+            credential_owner,
+            path,
+        }
+    }
+
+    impl DeployFixture {
+        fn command(&self, idle_max_checks: usize) -> std::process::Command {
+            let mut command = std::process::Command::new("bash");
+            command
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/deploy/deploy-app.sh"))
+                .arg(&self.candidate)
+                .env("PATH", &self.path)
+                .env("Y2B_APP_ROOT", &self.app_root)
+                .env("Y2B_STATE_DIR", &self.state_dir)
+                .env("Y2B_DATABASE", &self.database)
+                .env("Y2B_CONFIG", &self.config)
+                .env("Y2B_ENV_FILE", &self.env_file)
+                .env("Y2B_SYSTEMD_UNIT_DIR", &self.unit_dir)
+                .env("Y2B_BIN_LINK", self.local_bin.join("y2b"))
+                .env(
+                    "Y2B_KEY_TOOL_LINK",
+                    self.local_sbin.join("y2b-set-deepseek-key"),
+                )
+                .env("Y2B_SERVICE", "y2b-test.service")
+                .env("Y2B_CREDENTIAL_OWNER", &self.credential_owner)
+                .env("Y2B_REVISION", NEW_DEPLOY_REVISION)
+                .env("Y2B_DEPLOY_TIMESTAMP", "20260901T010203Z")
+                .env("Y2B_IDLE_INTERVAL_SECONDS", "0")
+                .env("Y2B_IDLE_MAX_CHECKS", idle_max_checks.to_string())
+                .env("Y2B_HEALTH_INTERVAL_SECONDS", "0")
+                .env("Y2B_HEALTH_MAX_CHECKS", "2")
+                .env("Y2B_HOLD_LEASE_SECONDS", "60")
+                .env("Y2B_RELEASE_KEEP", "5")
+                .env("DEPLOY_TEST_SCENARIO", self.scenario)
+                .env("DEPLOY_TEST_CURRENT", &self.current)
+                .env("DEPLOY_TEST_DATABASE", &self.database)
+                .env("DEPLOY_TEST_HOLD", &self.hold)
+                .env("DEPLOY_TEST_FIRST_IDLE", self.state_dir.join("first-idle"))
+                .env(
+                    "DEPLOY_TEST_STATUS_COUNT",
+                    self.state_dir.join("status-count"),
+                )
+                .env("DEPLOY_TEST_CLAIM_ATTEMPT", &self.claim_attempt)
+                .env("DEPLOY_TEST_CLAIM_BLOCKED", &self.claim_blocked)
+                .env("DEPLOY_TEST_CLAIM_ACQUIRED", &self.claim_acquired)
+                .env("DEPLOY_TEST_SERVICE_STATE", &self.service_state)
+                .env("DEPLOY_TEST_SYSTEMCTL_LOG", &self.systemctl_log)
+                .env("DEPLOY_TEST_EVENTS", &self.events)
+                .env("DEPLOY_TEST_Y2B_LOG", self.state_dir.join("y2b.log"));
+            command
+        }
+
+        fn run(&self, idle_max_checks: usize) -> Output {
+            self.command(idle_max_checks).output().unwrap()
+        }
+    }
+
+    fn output_detail(output: &Output) -> String {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    #[test]
+    fn deploy_hold_blocks_claim_between_two_idle_checks() {
+        let fixture = deploy_fixture("race");
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        assert!(fixture.claim_attempt.exists());
+        assert!(fixture.claim_blocked.exists());
+        assert!(!fixture.claim_acquired.exists());
+        assert_eq!(
+            fs::read_link(&fixture.current).unwrap(),
+            PathBuf::from(format!("releases/{NEW_DEPLOY_REVISION}"))
+        );
+    }
+
+    #[test]
+    fn deploy_reports_blocker_and_refuses_before_install() {
+        let fixture = deploy_fixture("blocker");
+        let output = fixture.run(1);
+        assert!(!output.status.success());
+        let detail = output_detail(&output);
+        assert!(detail.contains("kind=active_claims count=1"), "{detail}");
+        assert!(detail.contains("job-42:upload:worker-7"), "{detail}");
+        assert!(!fixture.systemctl_log.exists());
+        assert!(
+            !fixture
+                .app_root
+                .join("releases")
+                .join(NEW_DEPLOY_REVISION)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn deploy_reports_live_once_lease_and_refuses_to_continue() {
+        let fixture = deploy_fixture("live_once");
+        let output = fixture.run(1);
+        assert!(!output.status.success());
+        let detail = output_detail(&output);
+        assert!(detail.contains("kind=live_once_hold count=1"), "{detail}");
+        assert!(detail.contains("owner=LIVE_ONCE:premiere"), "{detail}");
+        assert!(!fixture.systemctl_log.exists());
+    }
+
+    #[test]
+    fn deploy_rejects_missing_or_corrupt_backup_before_stopping_service() {
+        for scenario in ["backup_missing", "backup_corrupt"] {
+            let fixture = deploy_fixture(scenario);
+            let output = fixture.run(3);
+            assert!(!output.status.success(), "{scenario}");
+            let detail = output_detail(&output);
+            assert!(
+                detail.contains("迁移前备份缺失或为空")
+                    || detail.contains("SQLite 完整性检查未返回唯一一行 ok"),
+                "{scenario}: {detail}"
+            );
+            assert!(!fixture.systemctl_log.exists(), "{scenario}");
+            assert_eq!(
+                fs::read_to_string(&fixture.database).unwrap(),
+                "old-database\n"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_health_failure_rolls_back_release_and_database_as_a_pair() {
+        let fixture = deploy_fixture("health_failure");
+        let output = fixture.run(3);
+        assert!(!output.status.success());
+        assert_eq!(
+            fs::read_link(&fixture.current).unwrap(),
+            PathBuf::from(format!("releases/{OLD_DEPLOY_REVISION}"))
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.database).unwrap(),
+            "old-database\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "active\n"
+        );
+        assert!(!fixture.hold.exists());
+
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        let new_start = events
+            .find(&format!(
+                "start:releases/{NEW_DEPLOY_REVISION}:new-database"
+            ))
+            .unwrap();
+        let old_start = events
+            .find(&format!(
+                "start:releases/{OLD_DEPLOY_REVISION}:old-database"
+            ))
+            .unwrap();
+        let release = events
+            .find(&format!("release:releases/{OLD_DEPLOY_REVISION}"))
+            .unwrap();
+        assert!(new_start < old_start && old_start < release, "{events}");
+    }
+
+    #[test]
+    fn deploy_switch_never_exposes_a_missing_or_dangling_current() {
+        let fixture = deploy_fixture("success");
+        let mut command = fixture.command(3);
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let mut broken_observation = None;
+        loop {
+            let metadata = fs::symlink_metadata(&fixture.current).unwrap();
+            if (!metadata.file_type().is_symlink() || !fixture.current.exists())
+                && broken_observation.is_none()
+            {
+                broken_observation = Some(format!(
+                    "target={:?} releases={:?}",
+                    fs::read_link(&fixture.current),
+                    fs::read_dir(fixture.app_root.join("releases"))
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name())
+                        .collect::<Vec<_>>()
+                ));
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{}", output_detail(&output));
+        assert!(
+            broken_observation.is_none(),
+            "current 在切换期间曾缺失或指向不存在的目录: {broken_observation:?}"
+        );
+    }
+
+    #[test]
+    fn successful_deploy_releases_hold_after_new_service_is_healthy() {
+        let fixture = deploy_fixture("success");
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        assert!(!fixture.hold.exists());
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        let start = events
+            .find(&format!(
+                "start:releases/{NEW_DEPLOY_REVISION}:new-database"
+            ))
+            .unwrap();
+        let release = events
+            .find(&format!("release:releases/{NEW_DEPLOY_REVISION}"))
+            .unwrap();
+        assert!(start < release, "{events}");
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "active\n"
+        );
     }
 
     struct RestoreFixture {
