@@ -1516,6 +1516,7 @@ printf '%s target=%s database=%s\n' "$*" "$target" "$content" >>"$DEPLOY_TEST_SY
 line=" $* "
 if [[ ${1:-} == stop ]]; then
   printf 'inactive\n' >"$DEPLOY_TEST_SERVICE_STATE"
+  printf 'stop:%s:%s\n' "$target" "$content" >>"$DEPLOY_TEST_EVENTS"
 elif [[ ${1:-} == start ]]; then
   if [[ "$DEPLOY_TEST_SCENARIO" == health_failure && "$target" == "releases/bbbbbbbbbbbb" ]]; then
     printf 'failed\n' >"$DEPLOY_TEST_SERVICE_STATE"
@@ -1545,6 +1546,7 @@ query=$2
 if [[ "$query" == .backup\ * ]]; then
   target=${query#.backup \'}
   target=${target%\'}
+  printf 'backup:%s\n' "$target" >>"$DEPLOY_TEST_EVENTS"
   case "$DEPLOY_TEST_SCENARIO" in
     backup_missing) : ;;
     backup_corrupt) printf 'damaged-backup\n' >"$target" ;;
@@ -1570,6 +1572,7 @@ elif [[ "$query" == *"COUNT(*) FROM jobs"* ]]; then
     ((count += 1))
     printf '%s\n' "$count" >"$DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS"
   fi
+  printf 'bootstrap-idle-check\n' >>"$DEPLOY_TEST_EVENTS"
   printf '0\n'
 elif [[ "$query" == *"COUNT(*) FROM stage_runs"* ]]; then
   printf '0\n'
@@ -2166,6 +2169,31 @@ PY
             fs::read_link(&fixture.current).unwrap(),
             PathBuf::from(format!("releases/{NEW_DEPLOY_REVISION}"))
         );
+    }
+
+    #[test]
+    fn deploy_bootstrap_stops_service_after_second_idle_before_backup() {
+        let fixture = deploy_fixture_legacy("success", 17);
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        let idle_positions: Vec<usize> = events
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| *line == "bootstrap-idle-check")
+            .map(|(index, _)| index)
+            .collect();
+        assert!(idle_positions.len() >= 2, "{events}");
+        let second_idle = idle_positions[1];
+        let stop = events
+            .lines()
+            .position(|line| line.starts_with("stop:"))
+            .unwrap();
+        let backup = events
+            .lines()
+            .position(|line| line.starts_with("backup:"))
+            .unwrap();
+        assert!(second_idle < stop && stop < backup, "{events}");
     }
 
     #[test]

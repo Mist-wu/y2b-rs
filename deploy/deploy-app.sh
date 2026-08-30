@@ -226,6 +226,7 @@ deployment_complete=false
 rollback_required=false
 database_restore_required=false
 release_created=false
+service_stopped=false
 migration_backup=
 backup_temp=
 integrity_output=
@@ -392,6 +393,12 @@ rollback_on_error() {
         rollback_ok=false
       fi
     fi
+  elif [[ "$service_stopped" == true ]]; then
+    # 自举模式在备份前就停服；若此时尚未武装成对回滚，只需恢复服务继续运行。
+    if ! "$systemctl_cmd" start "$service" >/dev/null 2>&1; then
+      rollback_ok=false
+      echo "自举部署在迁移前快照之前失败，恢复服务运行失败" >&2
+    fi
   fi
 
   # 回滚健康检查结束后才释放锁；数据库已恢复时 current 中的旧二进制与 schema 精确匹配。
@@ -541,6 +548,14 @@ wait_for_two_idle_checks_bootstrap() {
 
 if [[ "$bootstrap_deploy" == true ]]; then
   wait_for_two_idle_checks_bootstrap
+  # 自举模式没有 hold 挡住新领取：第二次 idle 通过后立即停服并确认 inactive，
+  # 之后才做 legacy 捕获、staging 与迁移前快照，确保快照反映停服后的静止状态。
+  "$systemctl_cmd" stop "$service"
+  service_stopped=true
+  if "$systemctl_cmd" is-active --quiet "$service"; then
+    echo "$service 停止后仍处于 active 状态，拒绝继续" >&2
+    exit 1
+  fi
 else
   wait_for_two_idle_checks
 fi
@@ -623,7 +638,9 @@ backup_temp=
 
 database_restore_required=true
 rollback_required=true
-"$systemctl_cmd" stop "$service"
+if [[ "$bootstrap_deploy" != true ]]; then
+  "$systemctl_cmd" stop "$service"
+fi
 
 # 固定兼容路径只间接指向 current；以后 binary、Pi、Cargo.lock 与运维脚本同步切换。
 install_release_alias "$app_root/pi" 'current/pi'
