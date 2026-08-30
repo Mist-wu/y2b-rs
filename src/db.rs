@@ -130,7 +130,9 @@ pub(crate) const PREPARE_CLAIM_KIND: &str = "prepare";
 pub(crate) const SUBTITLE_CLAIM_KIND: &str = "subtitle";
 pub(crate) const UPLOAD_CLAIM_KIND: &str = "upload";
 pub const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
-pub const BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
+const LEGACY_BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
+const LEGACY_BILIBILI_UPLOAD_HOLD_PREVIOUS: &str = "bilibili.upload_hold_previous";
+const LEGACY_BILIBILI_UPLOAD_HOLD_UNTIL: &str = "2099-12-31T23:59:59+00:00";
 /// 当前二进制能够完整理解的数据库迁移版本。
 pub const CURRENT_SCHEMA_VERSION: i64 = 22;
 
@@ -611,6 +613,79 @@ impl Database {
               ON maintenance_hold_events(occurred_at DESC,id DESC);
             "#,
         )?;
+        // v21 live_once 可能遗留 2099 年的永久投稿窗口。迁移时恢复它之前保存的
+        // 冷却时间，并把持有者转换成五分钟租约；即使旧进程已经崩溃也会自然失效。
+        let legacy_owner: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key=?",
+                [LEGACY_BILIBILI_UPLOAD_HOLD_OWNER],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(legacy_owner) = legacy_owner {
+            let previous_json: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM settings WHERE key=?",
+                    [LEGACY_BILIBILI_UPLOAD_HOLD_PREVIOUS],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let previous_deadline = previous_json
+                .as_deref()
+                .map(serde_json::from_str::<Option<String>>)
+                .transpose()
+                .context("迁移 v22 失败：旧 live_once 投稿窗口的 previous 值无效")?
+                .flatten();
+            let current_deadline: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM settings WHERE key=?",
+                    [NEXT_BILIBILI_SUBMIT_AT],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current_deadline.as_deref() == Some(LEGACY_BILIBILI_UPLOAD_HOLD_UNTIL) {
+                if let Some(previous_deadline) = previous_deadline {
+                    tx.execute(
+                        "UPDATE settings SET value=?,updated_at=? WHERE key=?",
+                        params![
+                            previous_deadline,
+                            format_timestamp(Utc::now()),
+                            NEXT_BILIBILI_SUBMIT_AT
+                        ],
+                    )?;
+                } else {
+                    tx.execute(
+                        "DELETE FROM settings WHERE key=?",
+                        [NEXT_BILIBILI_SUBMIT_AT],
+                    )?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM settings WHERE key IN (?,?)",
+                params![
+                    LEGACY_BILIBILI_UPLOAD_HOLD_OWNER,
+                    LEGACY_BILIBILI_UPLOAD_HOLD_PREVIOUS
+                ],
+            )?;
+            let now = Utc::now();
+            let now_text = format_timestamp(now);
+            let expires_at = format_timestamp(now + chrono::Duration::minutes(5));
+            let reason = "从 v21 live_once 永久投稿 hold 迁移";
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO maintenance_hold(\
+                   singleton,owner,reason,acquired_at,heartbeat_at,expires_at\
+                 ) VALUES(1,?,?,?,?,?)",
+                params![&legacy_owner, reason, &now_text, &now_text, &expires_at],
+            )?;
+            if inserted == 1 {
+                tx.execute(
+                    "INSERT INTO maintenance_hold_events(\
+                       action,owner,reason,occurred_at,expires_at\
+                     ) VALUES('acquired',?,?,?,?)",
+                    params![&legacy_owner, reason, &now_text, &expires_at],
+                )?;
+            }
+        }
         tx.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,CURRENT_TIMESTAMP)",
             [CURRENT_SCHEMA_VERSION],
@@ -1972,8 +2047,8 @@ impl Database {
     /// 原子检查全局投稿窗口、创建 attempt 并领取任务。
     ///
     /// `live_once` 与普通调度器都通过 SQLite 的写事务串行化：要么旁路先写入
-    /// hold，普通任务无法领取；要么普通任务先进入 uploading，旁路会等待它结束。
-    /// 返回 attempt ID；窗口未到、存在旁路 hold 或任务状态不匹配时返回 None。
+    /// 维护租约，普通任务无法领取；要么普通任务先进入 uploading，旁路会等待它结束。
+    /// 返回 attempt ID；窗口未到、维护租约生效或任务状态不匹配时返回 None。
     pub fn begin_prepared_upload(&self, id: &str) -> Result<Option<String>> {
         let attempt_id = Uuid::new_v4().to_string();
         let now = Utc::now();
@@ -1986,16 +2061,6 @@ impl Database {
             |row| row.get(0),
         )?;
         if maintenance_hold_active {
-            return Ok(None);
-        }
-        let hold_owner: Option<String> = tx
-            .query_row(
-                "SELECT value FROM settings WHERE key=?",
-                [BILIBILI_UPLOAD_HOLD_OWNER],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if hold_owner.is_some() {
             return Ok(None);
         }
         let deadline: Option<String> = tx
@@ -2945,9 +3010,7 @@ impl Database {
     /// 调度器的只读快速判断；真正的窗口与 hold 校验仍在 `begin_prepared_upload`
     /// 的写事务内重复执行，避免检查后领取前的竞态。
     pub fn bilibili_submission_due(&self, now: DateTime<Utc>) -> Result<bool> {
-        if self.maintenance_hold()?.is_some()
-            || self.get_setting(BILIBILI_UPLOAD_HOLD_OWNER)?.is_some()
-        {
+        if self.maintenance_hold()?.is_some() {
             return Ok(false);
         }
         self.setting_deadline_due(NEXT_BILIBILI_SUBMIT_AT, now)
@@ -3652,6 +3715,58 @@ mod tests {
             )
             .unwrap();
         assert!(subtitle_attempts_exists);
+    }
+
+    #[test]
+    fn v22_migrates_legacy_permanent_live_hold_to_a_short_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("v21-live-hold.db");
+        let old = Database::open(&path).unwrap();
+        let previous_deadline = format_timestamp(Utc::now() + chrono::Duration::minutes(20));
+        old.set_setting(LEGACY_BILIBILI_UPLOAD_HOLD_OWNER, "LIVE_ONCE:legacy:owner")
+            .unwrap();
+        old.set_setting(
+            LEGACY_BILIBILI_UPLOAD_HOLD_PREVIOUS,
+            &serde_json::to_string(&Some(&previous_deadline)).unwrap(),
+        )
+        .unwrap();
+        old.set_setting(NEXT_BILIBILI_SUBMIT_AT, LEGACY_BILIBILI_UPLOAD_HOLD_UNTIL)
+            .unwrap();
+        old.conn()
+            .execute_batch(
+                "DROP INDEX idx_maintenance_hold_events_time; \
+                 DROP TABLE maintenance_hold_events; \
+                 DROP TABLE maintenance_hold; \
+                 DELETE FROM schema_migrations WHERE version=22;",
+            )
+            .unwrap();
+        drop(old);
+
+        let migrated = Database::open(&path).unwrap();
+        assert_eq!(
+            migrated.get_setting(NEXT_BILIBILI_SUBMIT_AT).unwrap(),
+            Some(previous_deadline)
+        );
+        assert!(
+            migrated
+                .get_setting(LEGACY_BILIBILI_UPLOAD_HOLD_OWNER)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            migrated
+                .get_setting(LEGACY_BILIBILI_UPLOAD_HOLD_PREVIOUS)
+                .unwrap()
+                .is_none()
+        );
+        let hold = migrated.maintenance_hold().unwrap().unwrap();
+        assert_eq!(hold.owner, "LIVE_ONCE:legacy:owner");
+        assert!(hold.expires_at > Utc::now());
+        assert!(hold.expires_at <= Utc::now() + chrono::Duration::minutes(5));
+        let event = &migrated.maintenance_hold_events(1).unwrap()[0];
+        assert_eq!(event.action, "acquired");
+        assert_eq!(event.owner, hold.owner);
+        assert!(event.reason.contains("v21"));
     }
 
     #[test]
@@ -5128,7 +5243,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_claim_atomically_observes_deadline_and_live_hold() {
+    fn upload_claim_atomically_observes_deadline_and_maintenance_hold() {
         let t = tempfile::tempdir().unwrap();
         let db = Database::open(&t.path().join("upload-window.db")).unwrap();
         let id = db
@@ -5170,20 +5285,17 @@ mod tests {
             &(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
         )
         .unwrap();
-        db.set_setting(BILIBILI_UPLOAD_HOLD_OWNER, "live-once:test")
-            .unwrap();
+        assert!(
+            db.acquire_maintenance_hold("LIVE_ONCE:test", "一次性直播旁路", 300)
+                .unwrap()
+        );
         assert!(db.begin_prepared_upload(&id).unwrap().is_none());
         assert_eq!(
             db.get_job(&id).unwrap().unwrap().status,
             JobStatus::ReadyToUpload
         );
 
-        db.conn()
-            .execute(
-                "DELETE FROM settings WHERE key=?",
-                [BILIBILI_UPLOAD_HOLD_OWNER],
-            )
-            .unwrap();
+        assert!(db.release_maintenance_hold("LIVE_ONCE:test").unwrap());
         assert!(db.begin_prepared_upload(&id).unwrap().is_some());
         assert_eq!(
             db.get_job(&id).unwrap().unwrap().status,
