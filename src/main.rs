@@ -1607,6 +1607,9 @@ for argument in "$@"; do
 done
 (( ${{#operands[@]}} == 2 )) || {{ echo "mv 测试桩参数错误: $*" >&2; exit 2; }}
 if [[ ${{operands[1]}} == "$DEPLOY_TEST_CURRENT" ]]; then
+  if [[ "$DEPLOY_TEST_SCENARIO" == non_atomic ]]; then
+    rm -f -- "${{operands[1]}}"
+  fi
   sleep 0.02
 fi
 exec "{python}" - "${{operands[0]}}" "${{operands[1]}}" <<'PY'
@@ -1887,6 +1890,58 @@ PY
         assert!(new_start < old_start && old_start < release, "{events}");
     }
 
+    fn observe_current_switch(
+        child: &mut std::process::Child,
+        current: &Path,
+        releases_dir: &Path,
+    ) -> Option<String> {
+        let mut broken_observation = None;
+        loop {
+            // 触发瞬间一次性捕获完整状态：先 lstat 判断存在性与符号链接类型，
+            // 再在同一轮内读取目标并校验，避免诊断字符串在窗口关闭后才二次读盘。
+            let metadata = fs::symlink_metadata(current);
+            let mut problem = match &metadata {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Some("current 缺失（lstat 返回 ENOENT）".to_string())
+                }
+                Err(error) => Some(format!("current 无法 lstat: {error}")),
+                Ok(metadata) if !metadata.file_type().is_symlink() => Some(format!(
+                    "current 不是符号链接: file_type={:?}",
+                    metadata.file_type()
+                )),
+                Ok(_) => None,
+            };
+            if problem.is_none() {
+                // 悬空判定不通过 current 做跟随 stat：macOS 在 rename 符号链接的
+                // 瞬间会让跟随 stat 偶发 EINVAL，Path::exists 会把它误判成悬空。
+                // 改为读取目标后直接校验 release 目录（切换期间该目录始终稳定）。
+                if let Ok(target) = fs::read_link(current) {
+                    let resolved = current.parent().unwrap().join(&target);
+                    if fs::metadata(&resolved).is_err() {
+                        problem = Some(format!("current 指向不存在的目录: target={target:?}"));
+                    }
+                }
+            }
+            if let Some(problem) = problem
+                && broken_observation.is_none()
+            {
+                let releases = fs::read_dir(releases_dir)
+                    .map(|entries| {
+                        entries
+                            .map(|entry| entry.unwrap().file_name())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                broken_observation = Some(format!("{problem} releases={releases:?}"));
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        broken_observation
+    }
+
     #[test]
     fn deploy_switch_never_exposes_a_missing_or_dangling_current() {
         let fixture = deploy_fixture("success");
@@ -1895,31 +1950,37 @@ PY
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let mut child = command.spawn().unwrap();
-        let mut broken_observation = None;
-        loop {
-            let metadata = fs::symlink_metadata(&fixture.current).unwrap();
-            if (!metadata.file_type().is_symlink() || !fixture.current.exists())
-                && broken_observation.is_none()
-            {
-                broken_observation = Some(format!(
-                    "target={:?} releases={:?}",
-                    fs::read_link(&fixture.current),
-                    fs::read_dir(fixture.app_root.join("releases"))
-                        .unwrap()
-                        .map(|entry| entry.unwrap().file_name())
-                        .collect::<Vec<_>>()
-                ));
-            }
-            if child.try_wait().unwrap().is_some() {
-                break;
-            }
-            std::thread::yield_now();
-        }
+        let broken_observation = observe_current_switch(
+            &mut child,
+            &fixture.current,
+            &fixture.app_root.join("releases"),
+        );
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success(), "{}", output_detail(&output));
         assert!(
             broken_observation.is_none(),
             "current 在切换期间曾缺失或指向不存在的目录: {broken_observation:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_switch_observation_catches_a_non_atomic_switch() {
+        let fixture = deploy_fixture("non_atomic");
+        let mut command = fixture.command(3);
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let broken_observation = observe_current_switch(
+            &mut child,
+            &fixture.current,
+            &fixture.app_root.join("releases"),
+        );
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{}", output_detail(&output));
+        assert!(
+            broken_observation.is_some(),
+            "非原子切换应被观察者捕获，但未观察到缺失/悬空窗口"
         );
     }
 
