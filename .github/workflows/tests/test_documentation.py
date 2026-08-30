@@ -18,8 +18,8 @@ class DocumentationTests(unittest.TestCase):
             "## 强失败质量门禁",
             "maintenance hold",
             "原子 release",
-            "schema v19",
-            "弱证据",
+            "schema v21",
+            "只有标题匹配、稿件发布时间晚于本次 attempt 开始时间且 BVID 未被其他任务占用时才会确认",
             "不是“翻译压制”",
             "npm audit --audit-level=high",
             "cargo audit --no-yanked",
@@ -39,9 +39,9 @@ class DocumentationTests(unittest.TestCase):
         self.assertLess(deploy_position, restore_position)
         self.assertIn("不能只替换数据库或二进制", recovery)
 
-    def test_discovery_document_is_clearly_historical_and_points_to_v19(self) -> None:
+    def test_discovery_document_is_clearly_historical_and_points_to_v21(self) -> None:
         self.assertIn("（历史设计文档）", self.discovery.splitlines()[0])
-        self.assertIn("当前 schema 为 **v19**", self.discovery)
+        self.assertIn("当前 schema 为 **v21**", self.discovery)
         self.assertNotIn("确认部署提交位于 `feat/discovery-rearchitecture`", self.discovery)
         self.assertNotIn("确认 schema version 为 15", self.discovery)
 
