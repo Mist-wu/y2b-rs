@@ -429,9 +429,10 @@ rollback_on_error() {
 trap rollback_on_error EXIT
 trap 'exit 130' INT TERM
 
-# 自举检测：维护锁依赖当前 schema 的 maintenance_hold 表，而迁移发生在停服务之后。
-# 一旦数据库 schema 低于当前版本，锁在本次部署中不可用，只能走一次性自举路径；
-# 迁移完成后 schema 达到当前版本，后续部署会自动回到完整 hold 路径，不会退化成后门。
+# 自举检测：维护锁依赖 maintenance_hold 表，而建表迁移发生在停服务之后。只有锁的
+# 落点表确实不存在时才退化到自举路径；schema 只是比当前旧、但已有该表的库必须走
+# 完整 hold 路径（由与旧 schema 匹配的 current 二进制获取锁），避免每次 schema
+# 升级都重新打开无锁的 TOCTOU 窗口。
 bootstrap_deploy=false
 current_schema_version=$("$binary" schema-version)
 db_schema_version=$("$sqlite3_cmd" "$database" \
@@ -444,16 +445,23 @@ db_schema_version=$("$sqlite3_cmd" "$database" \
   echo "无法读取数据库 schema 版本: $db_schema_version" >&2
   exit 1
 }
-if (( db_schema_version < current_schema_version )); then
+maintenance_hold_tables=$("$sqlite3_cmd" "$database" \
+  "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='maintenance_hold';")
+[[ "$maintenance_hold_tables" =~ ^[0-9]+$ ]] || {
+  echo "无法判断 maintenance_hold 表是否存在: $maintenance_hold_tables" >&2
+  exit 1
+}
+if (( maintenance_hold_tables == 0 )); then
   bootstrap_deploy=true
 fi
 
 if [[ "$bootstrap_deploy" == true ]]; then
-  echo "自举部署: 数据库 schema v${db_schema_version} 低于当前 v${current_schema_version}，" >&2
-  echo "维护锁需要 schema v$current_schema_version 的 maintenance_hold 表，而迁移发生在停服务之后，" >&2
+  echo "自举部署: 数据库 schema v${db_schema_version} 缺少 maintenance_hold 表，" >&2
+  echo "维护锁依赖该表，而建表迁移只能发生在停服务之后，" >&2
   echo "因此本次无法使用维护锁，存在与线上任务并发的 TOCTOU 窗口。" >&2
   echo "本次回退到 jobs.status / stage_runs.status 做两次连续空闲判定，" >&2
-  echo "仍保留迁移前备份校验、原子切换与成对回滚；迁移完成后所有部署必须走完整 hold 路径。" >&2
+  echo "并在第二次 idle 通过后立即停服再生成快照；只要该表已存在，" >&2
+  echo "后续所有 schema 升级都必须走完整 hold 路径，不会重新打开无锁窗口。" >&2
 else
   # 先获取维护锁，之后所有 status 都带 owner，避免被自己的锁误判为 blocker。
   hold_acquired=true

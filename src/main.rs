@@ -1277,6 +1277,7 @@ mod tests {
         events: PathBuf,
         scenario: &'static str,
         schema_version: i64,
+        hold_table_exists: bool,
         credential_owner: String,
         path: String,
     }
@@ -1558,6 +1559,13 @@ elif [[ "$query" == *integrity_check* ]]; then
   else
     printf 'ok\n'
   fi
+elif [[ "$query" == *sqlite_master* ]]; then
+  content=$(<"$database")
+  if [[ "$content" == new-database* ]]; then
+    printf '1\n'
+  else
+    printf '%s\n' "${DEPLOY_TEST_MAINTENANCE_HOLD_TABLE:-0}"
+  fi
 elif [[ "$query" == *schema_migrations* ]]; then
   content=$(<"$database")
   if [[ "$content" == new-database* ]]; then
@@ -1683,6 +1691,7 @@ PY
             events,
             scenario,
             schema_version,
+            hold_table_exists: schema_version >= 22,
             credential_owner,
             path,
         }
@@ -1720,6 +1729,10 @@ PY
                 .env(
                     "DEPLOY_TEST_SCHEMA_VERSION",
                     self.schema_version.to_string(),
+                )
+                .env(
+                    "DEPLOY_TEST_MAINTENANCE_HOLD_TABLE",
+                    if self.hold_table_exists { "1" } else { "0" },
                 )
                 .env(
                     "DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS",
@@ -2220,6 +2233,36 @@ PY
             fs::read_link(&fixture.current).unwrap(),
             PathBuf::from("releases/cccccccccccc")
         );
+    }
+
+    #[test]
+    fn deploy_bootstraps_only_when_hold_table_is_absent() {
+        let fixture = deploy_fixture_legacy("success", 17);
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        let detail = output_detail(&output);
+        assert!(detail.contains("自举部署"), "{detail}");
+        assert!(detail.contains("缺少 maintenance_hold 表"), "{detail}");
+        assert!(!fixture.hold.exists());
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(!events.contains("acquire:"), "{events}");
+    }
+
+    #[test]
+    fn deploy_uses_full_hold_when_hold_table_exists_but_schema_is_older() {
+        let mut fixture = deploy_fixture_with_layout("success", false, 21);
+        fixture.hold_table_exists = true;
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        let detail = output_detail(&output);
+        assert!(!detail.contains("自举部署"), "{detail}");
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(events.contains("acquire:"), "{events}");
+        assert!(
+            events.contains(&format!("release:releases/{NEW_DEPLOY_REVISION}")),
+            "{events}"
+        );
+        assert!(!fixture.hold.exists());
     }
 
     #[test]
