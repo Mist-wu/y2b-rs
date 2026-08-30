@@ -158,14 +158,19 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    let mut config = Config::load(&cli.config)?;
+    let is_init = matches!(&cli.command, Cmd::Init);
+    let mut config = if is_init {
+        Config::load_or_default(&cli.config)?
+    } else {
+        Config::load(&cli.config)?
+    };
     if matches!(cli.command, Cmd::ConfigCheck) {
         println!(
             "AI profile: {AI_PROVIDER}/{AI_MODEL} translate={AI_TRANSLATION_MODEL} thinking={AI_THINKING}"
         );
         return Ok(());
     }
-    if matches!(cli.command, Cmd::Init) {
+    if is_init {
         config.ensure_dirs()?;
         config.save(&cli.config)?;
         println!("已初始化 {}", cli.config.display());

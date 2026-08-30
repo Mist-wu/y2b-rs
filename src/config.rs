@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -274,30 +273,15 @@ impl Default for WebSubConfig {
         }
     }
 }
-/// 主程序在分派子命令前加载配置；只有 `init` 可以在文件尚不存在时使用默认值。
-fn init_command_requested(args: impl IntoIterator<Item = OsString>) -> bool {
-    let mut skip_config_value = false;
-    for arg in args {
-        if skip_config_value {
-            skip_config_value = false;
-            continue;
-        }
-        let arg = arg.to_string_lossy();
-        if arg == "--config" {
-            skip_config_value = true;
-            continue;
-        }
-        if arg.starts_with("--config=") {
-            continue;
-        }
-        return arg == "init";
-    }
-    false
-}
-
 impl Config {
+    /// 严格读取配置，文件不存在也返回错误。
     pub fn load(path: &Path) -> Result<Self> {
-        Self::load_inner(path, init_command_requested(std::env::args_os().skip(1)))
+        Self::load_inner(path, false)
+    }
+
+    /// 读取配置；仅当文件不存在时使用默认值，其他读取错误仍返回错误。
+    pub fn load_or_default(path: &Path) -> Result<Self> {
+        Self::load_inner(path, true)
     }
 
     fn load_inner(path: &Path, allow_missing: bool) -> Result<Self> {
@@ -499,28 +483,75 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_is_only_allowed_for_init() {
+    fn strict_and_defaulting_loaders_handle_missing_files_explicitly() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.toml");
 
-        let error = Config::load_inner(&path, false).unwrap_err().to_string();
+        let error = Config::load(&path).unwrap_err().to_string();
         assert!(error.contains("读取配置失败"));
         assert!(error.contains("missing.toml"));
-        assert_eq!(Config::load_inner(&path, true).unwrap(), Config::default());
+        assert_eq!(Config::load_or_default(&path).unwrap(), Config::default());
+    }
 
-        assert!(init_command_requested(
-            ["--config", "missing.toml", "init"]
-                .into_iter()
-                .map(OsString::from)
-        ));
-        assert!(init_command_requested(
-            ["init", "--config=missing.toml"]
-                .into_iter()
-                .map(OsString::from)
-        ));
-        assert!(!init_command_requested(
-            ["jobs", "add", "init"].into_iter().map(OsString::from)
-        ));
+    #[test]
+    fn strict_load_is_independent_of_init_in_process_argv() {
+        const PROBE_ENV: &str = "Y2B_TEST_STRICT_CONFIG_LOAD_ARGV_PROBE";
+        if std::env::var_os(PROBE_ENV).is_some() {
+            assert_eq!(std::env::args().nth(1).as_deref(), Some("init"));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("missing.toml");
+            let error = Config::load(&path).unwrap_err().to_string();
+            assert!(error.contains("读取配置失败"));
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("init")
+            .arg("--test-threads=1")
+            .env(PROBE_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "argv 回归子进程失败：\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn both_loaders_reject_malformed_unknown_and_non_file_configs() {
+        type Loader = fn(&Path) -> Result<Config>;
+        let loaders: [(&str, Loader); 2] = [
+            ("load", Config::load),
+            ("load_or_default", Config::load_or_default),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        for (raw, expected) in [
+            ("[youtube\nmax_fps = 60", "配置格式无效"),
+            ("[youtube]\nmax_fpss = 60", "max_fpss"),
+        ] {
+            fs::write(&path, raw).unwrap();
+            for (name, loader) in loaders {
+                let error = loader(&path).unwrap_err().to_string();
+                assert!(
+                    error.contains(expected),
+                    "{name} 未拒绝配置或错误不明确: {error}"
+                );
+            }
+        }
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        for (name, loader) in loaders {
+            let error = loader(&path).unwrap_err().to_string();
+            assert!(
+                error.contains("读取配置失败"),
+                "{name} 错误地忽略了非 NotFound IO 错误: {error}"
+            );
+        }
     }
 
     #[test]
@@ -543,15 +574,6 @@ mod tests {
             let error = toml::from_str::<Config>(raw).unwrap_err().to_string();
             assert!(error.contains(field), "错误未指出字段 {field}: {error}");
         }
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("unknown.toml");
-        fs::write(&path, "[youtube]\nmax_fpss = 60").unwrap();
-        let error = Config::load_inner(&path, false).unwrap_err().to_string();
-        assert!(
-            error.contains("max_fpss"),
-            "加载错误未指出未知字段: {error}"
-        );
     }
 
     fn assert_invalid(config: &Config, field: &str) {
