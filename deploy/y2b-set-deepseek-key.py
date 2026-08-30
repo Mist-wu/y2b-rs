@@ -13,7 +13,7 @@ import stat
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 
 AUTH_DIR = Path("/var/lib/y2b/pi-agent")
@@ -31,6 +31,28 @@ class TopologyError(RuntimeError):
     """Credential topology is incomplete or unsafe."""
 
 
+def path_present(path: Path) -> bool:
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise TopologyError(f"cannot inspect credential path: {path}: {exc}") from exc
+
+
+def assert_path_type(path: Path, *, directory: bool) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise TopologyError(f"missing credential path: {path}") from exc
+    expected = "directory" if directory else "regular file"
+    matches = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
+    if stat.S_ISLNK(metadata.st_mode) or not matches:
+        raise TopologyError(f"credential path must be a {expected}, not a symlink: {path}")
+    return metadata
+
+
 def validate_key(value: Any) -> str:
     if not isinstance(value, str) or KEY_PATTERN.fullmatch(value) is None:
         raise TopologyError("invalid DeepSeek API key syntax")
@@ -38,6 +60,7 @@ def validate_key(value: Any) -> str:
 
 
 def read_json_object(path: Path) -> dict[str, Any]:
+    assert_path_type(path, directory=False)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -52,12 +75,19 @@ def render_json(value: dict[str, Any]) -> bytes:
 
 
 def ensure_private_dir(path: Path, uid: int, gid: int) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+    if path_present(path):
+        assert_path_type(path, directory=True)
+    else:
+        path.mkdir(parents=True)
+        assert_path_type(path, directory=True)
     os.chown(path, uid, gid)
     path.chmod(0o700)
 
 
 def atomic_write(path: Path, content: bytes, uid: int, gid: int) -> None:
+    assert_path_type(path.parent, directory=True)
+    if path_present(path):
+        assert_path_type(path, directory=False)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
     try:
@@ -82,6 +112,27 @@ def atomic_write(path: Path, content: bytes, uid: int, gid: int) -> None:
         raise
 
 
+def open_lock_file(path: Path) -> TextIO:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    assert_path_type(path.parent, directory=True)
+    if path_present(path):
+        assert_path_type(path, directory=False)
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise TopologyError(f"cannot safely open lock file: {path}: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise TopologyError(f"lock path must be a regular file: {path}")
+        os.set_blocking(descriptor, True)
+        return os.fdopen(descriptor, "w", encoding="utf-8")
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 def deepseek_document(key: str) -> dict[str, Any]:
     return {"deepseek": {"type": "api_key", "key": validate_key(key)}}
 
@@ -100,11 +151,15 @@ def without_global_deepseek(document: dict[str, Any]) -> tuple[dict[str, Any], b
     return cleaned, True
 
 
-def assert_private(path: Path, expected_uid: int, expected_gid: int, mode: int) -> None:
-    try:
-        metadata = path.stat()
-    except OSError as exc:
-        raise TopologyError(f"missing credential path: {path}") from exc
+def assert_private(
+    path: Path,
+    expected_uid: int,
+    expected_gid: int,
+    mode: int,
+    *,
+    directory: bool = False,
+) -> None:
+    metadata = assert_path_type(path, directory=directory)
     actual_mode = stat.S_IMODE(metadata.st_mode)
     if metadata.st_uid != expected_uid or metadata.st_gid != expected_gid:
         raise TopologyError(f"credential path must be owned by uid:gid {expected_uid}:{expected_gid}: {path}")
@@ -130,7 +185,7 @@ def check_topology(
     expected_uid: int = 0,
     expected_gid: int = 0,
 ) -> str:
-    assert_private(auth_dir, expected_uid, expected_gid, 0o700)
+    assert_private(auth_dir, expected_uid, expected_gid, 0o700, directory=True)
     assert_private(auth_file, expected_uid, expected_gid, 0o600)
     key = dedicated_key(auth_file)
 
@@ -138,7 +193,7 @@ def check_topology(
     if ENV_KEY_PATTERN.search(env_file.read_text(encoding="utf-8")):
         raise TopologyError(f"legacy DeepSeek key remains in environment file: {env_file}")
 
-    if global_auth.exists():
+    if path_present(global_auth):
         assert_private(global_auth, expected_uid, expected_gid, 0o600)
         if "deepseek" in read_json_object(global_auth):
             raise TopologyError(f"legacy DeepSeek credential remains in global Pi auth: {global_auth}")
@@ -154,7 +209,7 @@ def purge_legacy(
     assert_private(env_file, uid, gid, 0o600)
     global_document: dict[str, Any] | None = None
     cleaned_global: dict[str, Any] | None = None
-    if global_auth.exists():
+    if path_present(global_auth):
         assert_private(global_auth, uid, gid, 0o600)
         global_document = read_json_object(global_auth)
         cleaned_global, removed_global = without_global_deepseek(global_document)
@@ -186,7 +241,7 @@ def install_key(
     validate_key(key)
     # Parse both legacy stores before changing anything, so malformed input cannot
     # leave the topology half-migrated.
-    if global_auth.exists():
+    if path_present(global_auth):
         assert_private(global_auth, uid, gid, 0o600)
         read_json_object(global_auth)
     assert_private(env_file, uid, gid, 0o600)
@@ -213,14 +268,18 @@ def main() -> int:
     if os.geteuid() != 0:
         parser.error("must run as root")
 
-    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with LOCK_FILE.open("w", encoding="utf-8") as lock:
+    try:
+        lock_file = open_lock_file(LOCK_FILE)
+    except (OSError, TopologyError) as exc:
+        print(f"credential update failed: {exc}", file=sys.stderr)
+        return 1
+    with lock_file as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             if args.check:
                 digest = check_topology()
             elif args.purge_legacy:
-                assert_private(AUTH_DIR, 0, 0, 0o700)
+                assert_private(AUTH_DIR, 0, 0, 0o700, directory=True)
                 assert_private(AUTH_FILE, 0, 0, 0o600)
                 dedicated_key(AUTH_FILE)
                 removed_global, removed_env = purge_legacy()
