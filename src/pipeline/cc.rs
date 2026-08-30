@@ -1,11 +1,12 @@
 //! B站中文 CC 字幕补交（软字幕，提交后走平台审核）。
 use super::{Pipeline, subtitle_flow::load_segmented_cache};
 use crate::bilibili_api::{self, CcCue};
-use crate::db::SUBTITLE_CLAIM_KIND;
+use crate::db::{SUBTITLE_CLAIM_KIND, SubtitleAttempt, SubtitleAttemptDecision};
 use crate::model::{Job, JobStatus, VideoMetadata};
 use crate::subtitle::{self, Cue};
 use anyhow::{Context, Result, bail};
 use std::fs;
+use thiserror::Error;
 
 /// 投稿后到首次尝试补 CC 字幕的等待：B站稿件刚上传时查询 bvid 会返回 -404。
 pub const CC_INITIAL_DELAY_SECONDS: i64 = 90;
@@ -29,6 +30,35 @@ pub(super) const CC_NOT_READY_BASE_SECONDS: i64 = 30;
 pub(super) const CC_RETRY_BASE_SECONDS: i64 = 90;
 
 pub(super) const CC_RETRY_CAP_SECONDS: i64 = 3600;
+
+#[derive(Debug, Error)]
+#[error("{detail}")]
+struct CcSubmissionUncertainError {
+    detail: String,
+}
+
+fn is_cc_submission_uncertain(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CcSubmissionUncertainError>().is_some()
+}
+
+fn is_explicit_cc_rejection(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("提交字幕失败: code="))
+}
+
+fn uncertain_attempt_error(attempt: &SubtitleAttempt, detail: impl Into<String>) -> anyhow::Error {
+    CcSubmissionUncertainError {
+        detail: format!(
+            "CC 字幕 attempt={}（bvid={}）状态为 {}，{}；只查询平台已有 zh 字幕，禁止再次 submit",
+            attempt.id,
+            attempt.bvid,
+            attempt.status,
+            detail.into()
+        ),
+    }
+    .into()
+}
 
 /// CC 补交第 `attempt` 次失败后到下次可领取的秒数。
 pub(super) fn cc_retry_delay_seconds(attempt: i64, video_not_ready: bool) -> i64 {
@@ -237,8 +267,14 @@ impl Pipeline {
                 let detail = format!("{error:#}");
                 let attempt = job.subtitle_attempt + 1;
                 let missing_material = is_missing_subtitle_material(&error);
+                let uncertain_submission = is_cc_submission_uncertain(&error);
+                let explicit_rejection = is_explicit_cc_rejection(&error);
                 if attempt >= CC_MAX_ATTEMPTS {
-                    let exhausted = if missing_material {
+                    let exhausted = if uncertain_submission {
+                        format!(
+                            "CC 字幕投稿结果在 {CC_MAX_ATTEMPTS} 次只读核对后仍无法确认，已禁止重投并转人工: {detail}"
+                        )
+                    } else if missing_material {
                         format!(
                             "CC 字幕素材在 {CC_MAX_ATTEMPTS} 次检查后仍不可用，需手动补交: {detail}"
                         )
@@ -256,23 +292,29 @@ impl Pipeline {
                     return Err(error);
                 }
                 let delay = cc_retry_delay_seconds(attempt, is_bilibili_video_not_ready(&error));
-                self.db.defer_claimed_pending_subtitle(
-                    &job.id,
-                    &format!("CC 字幕提交失败: {detail}"),
-                    delay,
-                )?;
+                let retry_detail = if uncertain_submission {
+                    format!("CC 字幕投稿结果不确定，仅安排平台只读核对: {detail}")
+                } else if explicit_rejection {
+                    format!("CC 字幕被平台明确拒绝，允许稍后创建新 attempt: {detail}")
+                } else {
+                    format!("CC 字幕提交前检查失败: {detail}")
+                };
+                self.db
+                    .defer_claimed_pending_subtitle(&job.id, &retry_detail, delay)?;
                 tracing::warn!(
                     job_id = %job.id,
                     attempt,
                     delay,
                     missing_material,
+                    uncertain_submission,
+                    explicit_rejection,
                     error = %error,
-                    "CC 字幕提交失败，稍后重试"
+                    "CC 字幕处理未完成，稍后继续"
                 );
                 self.db.event(
                     Some(&job.id),
                     "warn",
-                    &format!("CC 字幕提交失败（第 {attempt}/{CC_MAX_ATTEMPTS} 次）: {detail}"),
+                    &format!("{retry_detail}（第 {attempt}/{CC_MAX_ATTEMPTS} 次，{delay} 秒后）"),
                 )?;
                 Err(error)
             }
@@ -287,6 +329,23 @@ impl Pipeline {
         let bvid = job.bvid.as_deref().unwrap_or_default();
         if bvid.is_empty() {
             bail!("任务 {} 没有 BVID", job.id)
+        }
+        let mut blocking_attempt = self.db.blocking_subtitle_attempt(&job.id)?;
+        if let Some(attempt) = blocking_attempt
+            .as_mut()
+            .filter(|attempt| attempt.status == "started")
+        {
+            let detail = "检测到上一次未完成的 started attempt，提交是否到达平台无法确认";
+            if let Err(error) =
+                self.db
+                    .mark_subtitle_attempt_uncertain(&job.id, &attempt.id, detail)
+            {
+                return Err(uncertain_attempt_error(
+                    attempt,
+                    format!("{detail}；写入 uncertain 失败: {error:#}"),
+                ));
+            }
+            attempt.status = "uncertain".into();
         }
         let meta = self
             .db
@@ -317,11 +376,16 @@ impl Pipeline {
         if client.has_subtitle_lan(view.cid, "zh").await? {
             // `zh` 是投稿者提交的中文 CC；平台自动翻译使用 `zh-CN`，不能在这里
             // 当成已完成，否则待补任务会被静默跳过。
-            self.db.finish_subtitle_claim(
-                &job.id,
-                job.status == JobStatus::UploadedOriginalPendingSubtitle,
-            )?;
-            if job.status == JobStatus::UploadedOriginalPendingSubtitle {
+            let mark_completed = job.status == JobStatus::UploadedOriginalPendingSubtitle;
+            if let Some(attempt) = blocking_attempt.as_ref().filter(|attempt| {
+                attempt.bvid == bvid && matches!(attempt.status.as_str(), "started" | "uncertain")
+            }) {
+                self.db
+                    .reconcile_subtitle_attempt(&job.id, &attempt.id, mark_completed)?;
+            } else {
+                self.db.finish_subtitle_claim(&job.id, mark_completed)?;
+            }
+            if mark_completed {
                 self.db.event(
                     Some(&job.id),
                     "info",
@@ -329,6 +393,9 @@ impl Pipeline {
                 )?;
             }
             return Ok(format!("{bvid} 已有已提交中文 CC 字幕（zh），跳过"));
+        }
+        if let Some(attempt) = blocking_attempt {
+            return Err(uncertain_attempt_error(&attempt, "平台当前未返回 zh 字幕"));
         }
         let work = self.config.runtime.download_dir.join(&meta.id);
         let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
@@ -383,12 +450,61 @@ impl Pipeline {
         if cc_cues.is_empty() {
             bail!("{EMPTY_TRANSLATION_PREFIX}，没有可提交的中文字幕")
         }
-        client.submit(&view, "zh", &cc_cues).await?;
-        // 外部提交成功后先释放领取并落最终状态；审计事件失败不能导致整次提交重跑。
-        self.db.finish_subtitle_claim(
-            &job.id,
-            job.status == JobStatus::UploadedOriginalPendingSubtitle,
-        )?;
+        let attempt_id = match self.db.begin_subtitle_attempt(&job.id, bvid)? {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            SubtitleAttemptDecision::QueryOnly(attempt) => {
+                return Err(uncertain_attempt_error(
+                    &attempt,
+                    "创建 attempt 时发现已有提交记录",
+                ));
+            }
+        };
+        if let Err(error) = client.submit(&view, "zh", &cc_cues).await {
+            if is_explicit_cc_rejection(&error) {
+                if let Err(mark_error) =
+                    self.db
+                        .reject_subtitle_attempt(&job.id, &attempt_id, &format!("{error:#}"))
+                {
+                    return Err(CcSubmissionUncertainError {
+                        detail: format!(
+                            "平台明确拒绝字幕 attempt={attempt_id}，但本地写入 rejected 失败: {mark_error:#}；原错误: {error:#}"
+                        ),
+                    }
+                    .into());
+                }
+                return Err(error);
+            }
+            let detail =
+                format!("字幕 attempt={attempt_id} 调用后响应丢失、超时或无法验证: {error:#}");
+            let detail =
+                match self
+                    .db
+                    .mark_subtitle_attempt_uncertain(&job.id, &attempt_id, &detail)
+                {
+                    Ok(()) => detail,
+                    Err(mark_error) => format!("{detail}；写入 uncertain 失败: {mark_error:#}"),
+                };
+            return Err(CcSubmissionUncertainError { detail }.into());
+        }
+        // 外部明确成功后，attempt 与任务/领取终态必须一起提交；本地失败则固定为
+        // uncertain，下一次只查询平台，审计事件失败也不能触发第二次 submit。
+        let mark_completed = job.status == JobStatus::UploadedOriginalPendingSubtitle;
+        if let Err(error) = self
+            .db
+            .finish_subtitle_attempt(&job.id, &attempt_id, mark_completed)
+        {
+            let detail =
+                format!("Bilibili 已接受字幕 attempt={attempt_id}，但本地确认事务失败: {error:#}");
+            let detail =
+                match self
+                    .db
+                    .mark_subtitle_attempt_uncertain(&job.id, &attempt_id, &detail)
+                {
+                    Ok(()) => detail,
+                    Err(mark_error) => format!("{detail}；写入 uncertain 失败: {mark_error:#}"),
+                };
+            return Err(CcSubmissionUncertainError { detail }.into());
+        }
         self.db.event(
             Some(&job.id),
             "info",
@@ -404,6 +520,28 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cc_submission_errors_only_treat_platform_code_as_explicit_rejection() {
+        let rejected =
+            anyhow::anyhow!("提交字幕失败: code=1001 参数错误").context("Bilibili 字幕提交失败");
+        assert!(is_explicit_cc_rejection(&rejected));
+        assert!(!is_cc_submission_uncertain(&rejected));
+
+        for message in [
+            "request timed out",
+            "连接在发送后断开",
+            "提交字幕失败: 响应缺少 code",
+        ] {
+            let error = anyhow::anyhow!(message);
+            assert!(!is_explicit_cc_rejection(&error), "{message}");
+        }
+        let uncertain: anyhow::Error = CcSubmissionUncertainError {
+            detail: "响应丢失".into(),
+        }
+        .into();
+        assert!(is_cc_submission_uncertain(&uncertain));
+    }
 
     #[test]
     fn cc_failures_distinguish_missing_material_from_platform_not_ready() {

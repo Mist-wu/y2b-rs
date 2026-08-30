@@ -42,6 +42,19 @@ pub struct UploadCompletionTiming {
     pub next_submit_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubtitleAttempt {
+    pub id: String,
+    pub bvid: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubtitleAttemptDecision {
+    Submit(String),
+    QueryOnly(SubtitleAttempt),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DiscoveryQuota {
     pub used: u32,
@@ -78,7 +91,7 @@ pub(crate) const UPLOAD_CLAIM_KIND: &str = "upload";
 pub const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
 pub const BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
 /// 当前二进制能够完整理解的数据库迁移版本。
-pub const CURRENT_SCHEMA_VERSION: i64 = 20;
+pub const CURRENT_SCHEMA_VERSION: i64 = 21;
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -474,6 +487,34 @@ impl Database {
             r#"
             CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_bvid_unique
               ON jobs(bvid) WHERE bvid IS NOT NULL;
+            "#,
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(20,CURRENT_TIMESTAMP)",
+            [],
+        )?;
+        tx.commit()?;
+        // v21: CC 字幕提交也使用持久化 attempt。started/uncertain/confirmed/reconciled
+        // 都禁止创建下一次提交；只有平台明确 rejected 后才允许新 attempt。
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS subtitle_attempts(
+              id TEXT PRIMARY KEY,
+              job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+              bvid TEXT NOT NULL,
+              status TEXT NOT NULL CHECK(status IN(
+                'started','rejected','uncertain','confirmed','reconciled'
+              )),
+              detail TEXT,
+              started_at TEXT NOT NULL,
+              finished_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_subtitle_attempts_job
+              ON subtitle_attempts(job_id, started_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_subtitle_attempts_blocking
+              ON subtitle_attempts(job_id)
+              WHERE status IN('started','uncertain','confirmed','reconciled');
             "#,
         )?;
         tx.execute(
@@ -1495,8 +1536,14 @@ impl Database {
             params![&now, &now],
         )?;
         c.execute(
+            "UPDATE subtitle_attempts SET status='uncertain',detail=COALESCE(detail,'服务重启时字幕提交结果不确定'),finished_at=? \
+             WHERE status='started' AND job_id IN(SELECT id FROM jobs WHERE claim_kind=? \
+               AND (claim_expires_at IS NULL OR claim_expires_at<=?))",
+            params![&now, SUBTITLE_CLAIM_KIND, &now],
+        )?;
+        c.execute(
             "UPDATE jobs SET claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
-             WHERE status='uploaded_original_pending_subtitle' AND claim_kind=? \
+             WHERE status IN('completed','uploaded_original_pending_subtitle') AND claim_kind=? \
                AND (claim_expires_at IS NULL OR claim_expires_at<=?)",
             params![&now, SUBTITLE_CLAIM_KIND, &now],
         )?;
@@ -1993,6 +2040,178 @@ impl Database {
                 id
             ],
         )
+    }
+
+    /// 返回会阻止再次提交的字幕 attempt。rejected 是唯一允许新 attempt 的终态。
+    pub(crate) fn blocking_subtitle_attempt(&self, id: &str) -> Result<Option<SubtitleAttempt>> {
+        self.conn()
+            .query_row(
+                "SELECT id,bvid,status FROM subtitle_attempts \
+                 WHERE job_id=? AND status<>'rejected' \
+                 ORDER BY started_at DESC,id DESC LIMIT 1",
+                [id],
+                |row| {
+                    Ok(SubtitleAttempt {
+                        id: row.get(0)?,
+                        bvid: row.get(1)?,
+                        status: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// 真正调用字幕提交接口前创建 attempt；若已有非 rejected attempt，只允许查询。
+    pub(crate) fn begin_subtitle_attempt(
+        &self,
+        id: &str,
+        bvid: &str,
+    ) -> Result<SubtitleAttemptDecision> {
+        let attempt_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let claim_valid: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=? AND bvid=? \
+             AND status IN('completed','uploaded_original_pending_subtitle') \
+             AND claim_kind=? AND claim_owner=?)",
+            params![id, bvid, SUBTITLE_CLAIM_KIND, self.claim_owner.as_ref()],
+            |row| row.get(0),
+        )?;
+        if !claim_valid {
+            anyhow::bail!("任务 {id} 的字幕领取权已丢失或 BVID 已改变")
+        }
+        let blocking = tx
+            .query_row(
+                "SELECT id,bvid,status FROM subtitle_attempts \
+                 WHERE job_id=? AND status<>'rejected' \
+                 ORDER BY started_at DESC,id DESC LIMIT 1",
+                [id],
+                |row| {
+                    Ok(SubtitleAttempt {
+                        id: row.get(0)?,
+                        bvid: row.get(1)?,
+                        status: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(blocking) = blocking {
+            tx.commit()?;
+            return Ok(SubtitleAttemptDecision::QueryOnly(blocking));
+        }
+        tx.execute(
+            "INSERT INTO subtitle_attempts(id,job_id,bvid,status,started_at) \
+             VALUES(?,?,?,'started',?)",
+            params![&attempt_id, id, bvid, &now],
+        )?;
+        tx.commit()?;
+        Ok(SubtitleAttemptDecision::Submit(attempt_id))
+    }
+
+    /// 平台明确拒绝后结束 attempt；这是唯一允许按策略再次提交的分支。
+    pub(crate) fn reject_subtitle_attempt(
+        &self,
+        id: &str,
+        attempt_id: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE subtitle_attempts SET status='rejected',detail=?,finished_at=? \
+             WHERE id=? AND job_id=? AND status='started'",
+            params![detail, Utc::now().to_rfc3339(), attempt_id, id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} 已失效")
+        }
+        Ok(())
+    }
+
+    /// 响应丢失、超时或进程中断后固定为 uncertain，之后只能查询平台。
+    pub(crate) fn mark_subtitle_attempt_uncertain(
+        &self,
+        id: &str,
+        attempt_id: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let changed = self.conn().execute(
+            "UPDATE subtitle_attempts SET status='uncertain',detail=?,finished_at=? \
+             WHERE id=? AND job_id=? AND status IN('started','uncertain')",
+            params![detail, Utc::now().to_rfc3339(), attempt_id, id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} 已失效")
+        }
+        Ok(())
+    }
+
+    /// 平台明确返回成功后，把 attempt 与任务/领取终态放在同一事务。
+    pub(crate) fn finish_subtitle_attempt(
+        &self,
+        id: &str,
+        attempt_id: &str,
+        mark_completed: bool,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let attempt_changed = tx.execute(
+            "UPDATE subtitle_attempts SET status='confirmed',detail='Bilibili 明确返回字幕提交成功',finished_at=? \
+             WHERE id=? AND job_id=? AND status='started'",
+            params![&now, attempt_id, id],
+        )?;
+        let job_changed = tx.execute(
+            "UPDATE jobs SET status=CASE WHEN ? THEN 'completed' ELSE status END,error=NULL,subtitle_retry_at=CASE WHEN ? THEN NULL ELSE subtitle_retry_at END,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE id=? AND claim_kind=? AND claim_owner=?",
+            params![
+                mark_completed,
+                mark_completed,
+                &now,
+                id,
+                SUBTITLE_CLAIM_KIND,
+                self.claim_owner.as_ref()
+            ],
+        )?;
+        if attempt_changed != 1 || job_changed != 1 {
+            anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} 已失效")
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 查询到平台已有 zh 字幕后，把不确定 attempt 核对为 reconciled 并完成任务。
+    pub(crate) fn reconcile_subtitle_attempt(
+        &self,
+        id: &str,
+        attempt_id: &str,
+        mark_completed: bool,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let attempt_changed = tx.execute(
+            "UPDATE subtitle_attempts SET status='reconciled',detail='查询到平台已有 zh 字幕',finished_at=? \
+             WHERE id=? AND job_id=? AND status IN('started','uncertain')",
+            params![&now, attempt_id, id],
+        )?;
+        let job_changed = tx.execute(
+            "UPDATE jobs SET status=CASE WHEN ? THEN 'completed' ELSE status END,error=NULL,subtitle_retry_at=CASE WHEN ? THEN NULL ELSE subtitle_retry_at END,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE id=? AND claim_kind=? AND claim_owner=?",
+            params![
+                mark_completed,
+                mark_completed,
+                &now,
+                id,
+                SUBTITLE_CLAIM_KIND,
+                self.claim_owner.as_ref()
+            ],
+        )?;
+        if attempt_changed != 1 || job_changed != 1 {
+            anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} 无法核对")
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// CC 补交失败：计数加一并推迟 `delay_seconds` 后才允许再次领取。
@@ -2702,8 +2921,9 @@ mod tests {
         old.set_job_bvid(&id, "BV1uxE16ZE7e").unwrap();
         old.conn()
             .execute_batch(
-                "DROP INDEX idx_jobs_bvid_unique; \
-                 DELETE FROM schema_migrations WHERE version=20;",
+                "DROP TABLE subtitle_attempts; \
+                 DROP INDEX idx_jobs_bvid_unique; \
+                 DELETE FROM schema_migrations WHERE version>=20;",
             )
             .unwrap();
         drop(old);
@@ -2723,6 +2943,16 @@ mod tests {
             )
             .unwrap();
         assert!(index_exists);
+        let subtitle_attempts_exists: bool = migrated
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type='table' AND name='subtitle_attempts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(subtitle_attempts_exists);
     }
 
     #[test]
@@ -2748,8 +2978,9 @@ mod tests {
         }
         old.conn()
             .execute_batch(
-                "DROP INDEX idx_jobs_bvid_unique; \
-                 DELETE FROM schema_migrations WHERE version=20;",
+                "DROP TABLE subtitle_attempts; \
+                 DROP INDEX idx_jobs_bvid_unique; \
+                 DELETE FROM schema_migrations WHERE version>=20;",
             )
             .unwrap();
         old.conn()
@@ -3504,6 +3735,25 @@ mod tests {
         );
     }
 
+    fn claimed_subtitle_job(db: &Database, video_id: &str, bvid: &str) -> (String, Job) {
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id,
+                url: &format!("https://youtu.be/{video_id}"),
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        db.set_job_bvid(&id, bvid).unwrap();
+        db.queue_pending_subtitle(&id, -1).unwrap();
+        let job = db.claim_next_pending_subtitle_job(16).unwrap().unwrap();
+        (id, job)
+    }
+
     #[test]
     fn subtitle_claim_blocks_automatic_and_manual_duplicate_submission() {
         let t = tempfile::tempdir().unwrap();
@@ -3558,6 +3808,238 @@ mod tests {
                 .defer_claimed_pending_subtitle(&id, "stale", 60)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn uncertain_subtitle_attempt_allows_only_query_and_reconciliation() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("subtitle-uncertain.db")).unwrap();
+        let (id, _) = claimed_subtitle_job(&db, "subtitle-response-lost", "BV1subtitle1");
+        let attempt_id = match db.begin_subtitle_attempt(&id, "BV1subtitle1").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("首次字幕提交未创建 attempt: {decision:?}"),
+        };
+        // 故障注入：平台已经接受，但客户端响应丢失。
+        db.mark_subtitle_attempt_uncertain(&id, &attempt_id, "平台响应丢失")
+            .unwrap();
+        db.defer_claimed_pending_subtitle(&id, "仅查询平台", -1)
+            .unwrap();
+        db.claim_next_pending_subtitle_job(16).unwrap().unwrap();
+
+        let blocking = db.begin_subtitle_attempt(&id, "BV1subtitle1").unwrap();
+        assert_eq!(
+            blocking,
+            SubtitleAttemptDecision::QueryOnly(SubtitleAttempt {
+                id: attempt_id.clone(),
+                bvid: "BV1subtitle1".into(),
+                status: "uncertain".into(),
+            })
+        );
+        let attempt_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM subtitle_attempts WHERE job_id=?",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_count, 1, "不确定结果后又创建了第二次 submit");
+
+        // 只读查询一旦看到平台已有 zh，才把 attempt 核对成功。
+        db.reconcile_subtitle_attempt(&id, &attempt_id, true)
+            .unwrap();
+        assert_eq!(
+            db.get_job(&id).unwrap().unwrap().status,
+            JobStatus::Completed
+        );
+        let status: String = db
+            .conn()
+            .query_row(
+                "SELECT status FROM subtitle_attempts WHERE id=?",
+                [&attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "reconciled");
+    }
+
+    #[test]
+    fn exhausted_uncertain_subtitle_attempt_stays_manual_and_query_only() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("subtitle-manual.db")).unwrap();
+        let (id, _) = claimed_subtitle_job(&db, "subtitle-manual", "BV1subtitle6");
+        let attempt_id = match db.begin_subtitle_attempt(&id, "BV1subtitle6").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("首次字幕提交未创建 attempt: {decision:?}"),
+        };
+        db.mark_subtitle_attempt_uncertain(&id, &attempt_id, "长期无法确认")
+            .unwrap();
+        db.exhaust_claimed_pending_subtitle(&id, 16, "投稿结果无法确认，已转人工")
+            .unwrap();
+
+        assert!(db.next_pending_subtitle_job(16).unwrap().is_none());
+        let job = db.get_job(&id).unwrap().unwrap();
+        assert_eq!(job.subtitle_attempt, 16);
+        assert!(job.error.as_deref().unwrap().contains("已转人工"));
+        db.claim_subtitle_job_now(&id).unwrap().unwrap();
+        assert!(matches!(
+            db.begin_subtitle_attempt(&id, "BV1subtitle6").unwrap(),
+            SubtitleAttemptDecision::QueryOnly(_)
+        ));
+    }
+
+    #[test]
+    fn rejected_subtitle_attempt_allows_policy_retry() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("subtitle-rejected.db")).unwrap();
+        let (id, _) = claimed_subtitle_job(&db, "subtitle-rejected", "BV1subtitle2");
+        let first_attempt = match db.begin_subtitle_attempt(&id, "BV1subtitle2").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("首次字幕提交未创建 attempt: {decision:?}"),
+        };
+        db.reject_subtitle_attempt(&id, &first_attempt, "code=1001 平台明确拒绝")
+            .unwrap();
+
+        let second_attempt = match db.begin_subtitle_attempt(&id, "BV1subtitle2").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("rejected 后未允许策略重试: {decision:?}"),
+        };
+        assert_ne!(first_attempt, second_attempt);
+        let statuses: Vec<String> = db
+            .conn()
+            .prepare("SELECT status FROM subtitle_attempts WHERE job_id=? ORDER BY started_at,id")
+            .unwrap()
+            .query_map([&id], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(statuses, ["rejected", "started"]);
+    }
+
+    #[test]
+    fn interrupted_subtitle_attempt_becomes_uncertain_after_restart() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("subtitle-interrupted.db");
+        let first = Database::open(&path).unwrap();
+        let (id, _) = claimed_subtitle_job(&first, "subtitle-interrupted", "BV1subtitle3");
+        let attempt_id = match first.begin_subtitle_attempt(&id, "BV1subtitle3").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("首次字幕提交未创建 attempt: {decision:?}"),
+        };
+        first
+            .conn()
+            .execute(
+                "UPDATE jobs SET claim_expires_at=? WHERE id=?",
+                params![
+                    (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
+                    &id
+                ],
+            )
+            .unwrap();
+
+        let restarted = Database::open(&path).unwrap();
+        restarted.recover_incomplete_jobs().unwrap();
+        let attempt = restarted.blocking_subtitle_attempt(&id).unwrap().unwrap();
+        assert_eq!(attempt.id, attempt_id);
+        assert_eq!(attempt.status, "uncertain");
+        restarted
+            .claim_next_pending_subtitle_job(16)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            restarted
+                .begin_subtitle_attempt(&id, "BV1subtitle3")
+                .unwrap(),
+            SubtitleAttemptDecision::QueryOnly(_)
+        ));
+        let attempt_count: i64 = restarted
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM subtitle_attempts WHERE job_id=?",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_count, 1);
+    }
+
+    #[test]
+    fn subtitle_success_with_local_commit_failure_blocks_resubmit() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("subtitle-commit-failure.db")).unwrap();
+        let (id, _) = claimed_subtitle_job(&db, "subtitle-commit-failure", "BV1subtitle5");
+        let attempt_id = match db.begin_subtitle_attempt(&id, "BV1subtitle5").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("首次字幕提交未创建 attempt: {decision:?}"),
+        };
+        db.conn()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_subtitle_job_finish
+                BEFORE UPDATE ON jobs
+                WHEN OLD.id=NEW.id AND NEW.claim_kind IS NULL
+                BEGIN
+                  SELECT RAISE(ABORT, '模拟字幕平台成功后的本地提交失败');
+                END;
+                "#,
+            )
+            .unwrap();
+
+        let error = db
+            .finish_subtitle_attempt(&id, &attempt_id, true)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("模拟字幕平台成功后的本地提交失败")
+        );
+        let status: String = db
+            .conn()
+            .query_row(
+                "SELECT status FROM subtitle_attempts WHERE id=?",
+                [&attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "started", "事务失败后 attempt 被写成了半完成状态");
+        db.mark_subtitle_attempt_uncertain(&id, &attempt_id, "本地确认事务失败")
+            .unwrap();
+        db.conn()
+            .execute_batch("DROP TRIGGER fail_subtitle_job_finish")
+            .unwrap();
+        db.defer_claimed_pending_subtitle(&id, "仅查询平台", -1)
+            .unwrap();
+        db.claim_next_pending_subtitle_job(16).unwrap().unwrap();
+        assert!(matches!(
+            db.begin_subtitle_attempt(&id, "BV1subtitle5").unwrap(),
+            SubtitleAttemptDecision::QueryOnly(_)
+        ));
+    }
+
+    #[test]
+    fn confirmed_subtitle_attempt_finishes_with_job_atomically() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("subtitle-confirmed.db")).unwrap();
+        let (id, _) = claimed_subtitle_job(&db, "subtitle-confirmed", "BV1subtitle4");
+        let attempt_id = match db.begin_subtitle_attempt(&id, "BV1subtitle4").unwrap() {
+            SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
+            decision => panic!("首次字幕提交未创建 attempt: {decision:?}"),
+        };
+        db.finish_subtitle_attempt(&id, &attempt_id, true).unwrap();
+
+        assert_eq!(
+            db.get_job(&id).unwrap().unwrap().status,
+            JobStatus::Completed
+        );
+        let status: String = db
+            .conn()
+            .query_row(
+                "SELECT status FROM subtitle_attempts WHERE id=?",
+                [&attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "confirmed");
     }
 
     #[test]
