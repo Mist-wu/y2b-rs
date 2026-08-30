@@ -1,6 +1,7 @@
 import argparse
 import datetime as dt
 import json
+import re
 import sqlite3
 import tempfile
 import threading
@@ -77,6 +78,8 @@ def make_database(path: Path, schema_version: int = EXPECTED_SCHEMA_VERSION) -> 
           title TEXT, status TEXT, transfer_mode TEXT, published_at TEXT,
           discovered_at TEXT, error TEXT, created_at TEXT, updated_at TEXT, bvid TEXT
         );
+        CREATE UNIQUE INDEX idx_jobs_bvid_unique
+          ON jobs(bvid) WHERE bvid IS NOT NULL;
         CREATE TABLE events(
           id INTEGER PRIMARY KEY, job_id TEXT, level TEXT, message TEXT, created_at TEXT
         );
@@ -413,6 +416,15 @@ class LiveOnceTests(unittest.TestCase):
             self.assertEqual(statuses, ["failed", "succeeded"])
             self.assertEqual(stored_bvid, bvid)
 
+    def test_python_schema_version_matches_rust(self) -> None:
+        rust_database = Path(__file__).resolve().parents[1] / "src" / "db.rs"
+        versions = re.findall(
+            r"^pub const CURRENT_SCHEMA_VERSION: i64 = (\d+);$",
+            rust_database.read_text(encoding="utf-8"),
+            flags=re.MULTILINE,
+        )
+        self.assertEqual(versions, [str(EXPECTED_SCHEMA_VERSION)])
+
     def test_schema_version_mismatch_refuses_to_run(self) -> None:
         for version in (EXPECTED_SCHEMA_VERSION - 1, EXPECTED_SCHEMA_VERSION + 1):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
@@ -431,6 +443,49 @@ class LiveOnceTests(unittest.TestCase):
                     connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0
                 )
                 connection.close()
+
+    def test_duplicate_bvid_is_marked_uncertain_for_manual_review(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            item, video = self.prepare_upload(Path(directory))
+            bvid = "BV1uxE16ZE7e"
+            connection = sqlite3.connect(item.args.database)
+            connection.execute(
+                """
+                INSERT INTO jobs(
+                  id,video_id,url,status,transfer_mode,created_at,updated_at,bvid
+                ) VALUES('other','other','https://youtu.be/other','completed','direct','now','now',?)
+                """,
+                (bvid,),
+            )
+            connection.commit()
+            connection.close()
+            popen = fake_biliup(
+                [(0, f'{{"code":0,"data":{{"bvid":"{bvid}"}}}}\n')]
+            )
+
+            with mock.patch("live_once.subprocess.Popen", popen):
+                with self.assertRaisesRegex(
+                    UploadUncertainError, "已归属其他任务.*人工核对"
+                ):
+                    item.upload_video(video)
+
+            connection = sqlite3.connect(item.args.database)
+            attempt = connection.execute(
+                "SELECT status,bvid,detail FROM upload_attempts WHERE job_id=?",
+                (item.state["job_id"],),
+            ).fetchone()
+            job = connection.execute(
+                "SELECT status,bvid,error FROM jobs WHERE id=?",
+                (item.state["job_id"],),
+            ).fetchone()
+            connection.close()
+            self.assertEqual(attempt[0], "uncertain")
+            self.assertEqual(attempt[1], bvid)
+            self.assertIn("处理 BVID 归属冲突", attempt[2])
+            self.assertEqual(job[0], "upload_uncertain")
+            self.assertIsNone(job[1])
+            self.assertIn("禁止自动重投", job[2])
+            self.assertEqual(item.state["phase"], "upload_uncertain")
 
     def test_existing_bvid_skips_duplicate_upload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
