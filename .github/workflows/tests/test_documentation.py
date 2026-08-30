@@ -21,6 +21,9 @@ class DocumentationTests(unittest.TestCase):
             "schema v19",
             "弱证据",
             "不是“翻译压制”",
+            "npm audit --audit-level=high",
+            "cargo audit --no-yanked",
+            "unmaintained、yanked、unsound 等 warning",
         )
         for phrase in required:
             with self.subTest(phrase=phrase):
