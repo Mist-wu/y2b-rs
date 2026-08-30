@@ -307,7 +307,7 @@ yt-dlp -v --simulate 'https://www.youtube.com/watch?v=VIDEO_ID' 2>&1 \
 2. 空服务器先运行 `bootstrap-server.sh`，再恢复 `/etc/y2b/config.toml`、`/etc/y2b/y2b.env` 和两个 cookies 文件，并用 `y2b-set-deepseek-key` 重新注入 DeepSeek Key。Pi 资源随应用 release 安装，无需单独备份。
 3. 先用 `deploy-app.sh` 安装与当前代码匹配的完整 release，再从 `backups/daily` 或 `weekly` 选择数据库并执行 `deploy/restore.sh BACKUP.db`；不要手工覆盖在线 `state.db`，也不要并行运行部署和恢复。任何恢复决策都要记录 release 与数据库这一对，禁止只回退其中一边。
 4. `restore.sh` 在停服务前完成强预检：把备份复制到数据库所在文件系统的暂存路径，要求 SQLite `integrity_check` 精确返回单独一行 `ok`，同时检查关键表和可读 schema。预检通过后才记录原 service 状态、停服务、保存旧库，并以同文件系统 `mv` 原子替换数据库和清理旧 WAL/SHM。
-5. 原服务先前为 active 时，脚本启动它并等待幂等迁移到 schema v21，再复查数据库完整性，并通过稳定窗口健康检查确认 service 稳定。任一步骤失败，EXIT trap 都尝试恢复旧数据库及原 service 状态并返回非零；成功后仍要核对 schema v21、队列数量、最近备份、`upload_uncertain` 和 `subtitle_attempts` 中的 `uncertain`。不确定的投稿或字幕提交只能人工核对，不能因恢复而自动重试。
+5. 原服务先前为 active 时，脚本启动它并等待幂等迁移到 schema v22，再复查数据库完整性，并通过稳定窗口健康检查确认 service 稳定。任一步骤失败，EXIT trap 都尝试恢复旧数据库及原 service 状态并返回非零；成功后仍要核对 schema v22、队列数量、最近备份、`upload_uncertain` 和 `subtitle_attempts` 中的 `uncertain`。不确定的投稿或字幕提交只能人工核对，不能因恢复而自动重试。
 6. SQLite 保存完整队列：准备和 CC 字幕任务通过原子领取、租约与心跳避免多进程重复执行；过期租约在重启后恢复。任务模式和追加目标 BV 不丢失，`dead_letter` 可从 TUI 或 CLI 安全恢复。旧频道和任务模式均为 `translated`；升级前停在待补字幕的任务各获一次自动补交机会，旧 `retry_wait` 行沿用固定 10 分钟退避。
 
 ## 上线验收
