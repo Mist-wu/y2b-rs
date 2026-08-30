@@ -249,6 +249,26 @@ y2b maintenance release --database /var/lib/y2b/state.db --owner "$owner"
 
 回滚的最小单位是 **release + 数据库**，绝不能只切回 symlink。停服务之后任一步失败，EXIT trap 都会先确保新服务退出，再把 `current` 原子切回上一 release、从迁移前快照原子恢复数据库并清理 WAL/SHM，随后用旧二进制重新执行 `check`、启动旧服务并确认 active，最后释放 hold。只有这套成对回滚能满足精确 schema 匹配；若旧服务健康检查也失败，脚本保持非零退出并保留迁移前备份供人工处理。从旧的固定路径布局首次升级时，脚本会先只读捕获旧二进制、Pi 资源和 `Cargo.lock` 为回滚 release；旧文件集不完整则在停服务前拒绝部署。
 
+### 依赖基线（dependency-baseline.json）
+
+`y2b check --write-baseline` 把必选工具和资源文件的 sha256 写入
+`/var/lib/y2b/dependency-baseline.json`，后续每次 `y2b check` 都与基线比对。基线
+条目分两类，处理不同：
+
+| 类别 | 条目 | 漂移处理 |
+| --- | --- | --- |
+| 外部依赖 | `pi`、`yt-dlp`、`ffmpeg`、`biliup`、`pi-extension`、`pi-policy`、`pi-audit-policy`、`brawl-stars-glossary` | 漂移是意外，作为必选失败（FAIL）拦住部署 |
+| `y2b` 自身 | 部署的二进制 | 漂移是部署的预期结果，只降级为告警（WARN），不拦住部署 |
+
+这样区分是因为：部署一个新二进制必然改变 `y2b` 的 sha256，若把它的漂移当作必选
+失败，就会出现“部署要更新的那一项，恰恰是拦住部署的那一项”的死循环；回滚后的
+健康检查也会因旧二进制与基线不一致而误判。外部依赖被偷换时仍然会以必选失败拒绝
+部署，这是基线存在的意义。
+
+`deploy-app.sh` 在切换 `current` 后执行 `check --write-baseline`，把新二进制的
+sha 写回基线；回滚时用旧二进制再执行一次，把基线同步回旧值。因此只有 `y2b`
+漂移的部署和回滚都能通过门禁，而任何外部依赖漂移仍会阻断。
+
 PO Token Provider 使用独立的**原子 release**：安装器先写入版本化 `releases/<version>`，校验完整后再以临时符号链接和单次 `mv` 切换 `current`。失败时旧 `current` 仍可用，不会暴露半份 provider。
 
 需另行放置且权限 `0600` 的文件：

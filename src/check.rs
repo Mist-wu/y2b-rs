@@ -172,26 +172,42 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
             .and_then(|raw| serde_json::from_slice::<Baseline>(&raw).ok())
         {
             Some(baseline) => {
-                let drift = baseline
-                    .items
-                    .iter()
-                    .filter(|item| {
-                        item.sha256.as_ref().is_some_and(|expected| {
-                            hash_file(Path::new(&item.path))
-                                .map(|actual| actual != *expected)
-                                .unwrap_or(true)
-                        })
-                    })
-                    .map(|x| x.name.clone())
-                    .collect::<Vec<_>>();
+                // 基线条目分两类：外部依赖（pi、yt-dlp、ffmpeg、biliup、Pi 资源文件）
+                // 被偷换是意外，必须作为必选失败；y2b 自身的变化是部署的预期结果，
+                // 部署脚本本身就是变更来源，不应由它拦住部署，因此只降级为告警。
+                let mut external_drift = Vec::new();
+                let mut y2b_drift = false;
+                for item in &baseline.items {
+                    let drifted = item.sha256.as_ref().is_some_and(|expected| {
+                        hash_file(Path::new(&item.path))
+                            .map(|actual| actual != *expected)
+                            .unwrap_or(true)
+                    });
+                    if !drifted {
+                        continue;
+                    }
+                    if item.name == "y2b" {
+                        y2b_drift = true;
+                    } else {
+                        external_drift.push(item.name.clone());
+                    }
+                }
+                let y2b_only_drift = y2b_drift && external_drift.is_empty();
                 out.push(CheckItem {
                     name: "dependency baseline".into(),
-                    ok: drift.is_empty(),
-                    required: true,
-                    detail: if drift.is_empty() {
+                    ok: external_drift.is_empty() && !y2b_drift,
+                    required: !y2b_only_drift,
+                    detail: if external_drift.is_empty() && !y2b_drift {
                         format!("无漂移，基线 {}", baseline.generated_at)
                     } else {
-                        format!("漂移: {}", drift.join(", "))
+                        let mut parts = Vec::new();
+                        if !external_drift.is_empty() {
+                            parts.push(format!("漂移: {}", external_drift.join(", ")));
+                        }
+                        if y2b_drift {
+                            parts.push("y2b 自身与基线不一致（部署预期变更，仅告警）".into());
+                        }
+                        parts.join("；")
                     },
                 });
             }
@@ -383,5 +399,109 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("缺少必选工具 pi"));
         assert!(!destination.exists());
+    }
+
+    fn config_with_missing_tools(data_dir: &Path) -> Config {
+        let mut config = Config::default();
+        config.runtime.data_dir = data_dir.to_path_buf();
+        let missing = data_dir.join("missing-tool").display().to_string();
+        config.ai.pi = missing.clone();
+        config.youtube.yt_dlp = missing.clone();
+        config.render.ffmpeg = missing.clone();
+        config.render.ffprobe = missing.clone();
+        config.bilibili.biliup = missing;
+        config
+    }
+
+    fn write_baseline_json(dir: &Path, items: Vec<BaselineItem>) {
+        let baseline = Baseline {
+            generated_at: "test".into(),
+            os: "test".into(),
+            arch: "test".into(),
+            items,
+            details: std::collections::BTreeMap::new(),
+        };
+        fs::write(
+            dir.join("dependency-baseline.json"),
+            serde_json::to_vec_pretty(&baseline).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_dependency_drift_is_a_required_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_with_missing_tools(temp.path());
+        let ytdlp = temp.path().join("yt-dlp");
+        fs::write(&ytdlp, "2026.01.01\n").unwrap();
+        let y2b = temp.path().join("y2b");
+        fs::write(&y2b, "current-binary\n").unwrap();
+        write_baseline_json(
+            temp.path(),
+            vec![
+                BaselineItem {
+                    name: "yt-dlp".into(),
+                    path: ytdlp.display().to_string(),
+                    version: "2026.01.01".into(),
+                    // 与磁盘上的 yt-dlp 不一致，模拟外部依赖被偷换。
+                    sha256: Some("0".repeat(64)),
+                },
+                BaselineItem {
+                    name: "y2b".into(),
+                    path: y2b.display().to_string(),
+                    version: "test".into(),
+                    sha256: Some(hash_file(&y2b).unwrap()),
+                },
+            ],
+        );
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+
+        let checks = run(&config, &db).await;
+        let item = checks
+            .iter()
+            .find(|item| item.name == "dependency baseline")
+            .unwrap();
+        assert!(item.required, "外部依赖漂移必须保持必选失败");
+        assert!(!item.ok);
+        assert!(item.detail.contains("yt-dlp"), "{}", item.detail);
+    }
+
+    #[tokio::test]
+    async fn y2b_own_drift_is_only_a_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_with_missing_tools(temp.path());
+        let ytdlp = temp.path().join("yt-dlp");
+        fs::write(&ytdlp, "2026.01.01\n").unwrap();
+        let y2b = temp.path().join("y2b");
+        fs::write(&y2b, "new-binary\n").unwrap();
+        write_baseline_json(
+            temp.path(),
+            vec![
+                BaselineItem {
+                    name: "yt-dlp".into(),
+                    path: ytdlp.display().to_string(),
+                    version: "2026.01.01".into(),
+                    sha256: Some(hash_file(&ytdlp).unwrap()),
+                },
+                BaselineItem {
+                    name: "y2b".into(),
+                    path: y2b.display().to_string(),
+                    version: "test".into(),
+                    // 基线记录的是上一版二进制，当前二进制已经更新。
+                    sha256: Some("f".repeat(64)),
+                },
+            ],
+        );
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+
+        let checks = run(&config, &db).await;
+        let item = checks
+            .iter()
+            .find(|item| item.name == "dependency baseline")
+            .unwrap();
+        assert!(!item.required, "y2b 自身漂移不应构成必选失败");
+        assert!(!item.ok);
+        assert!(item.detail.contains("y2b"), "{}", item.detail);
+        assert!(item.detail.contains("仅告警"), "{}", item.detail);
     }
 }
