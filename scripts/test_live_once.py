@@ -6,13 +6,17 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from live_once import (
+    EXPECTED_SCHEMA_VERSION,
     HOLD_OWNER_KEY,
     HOLD_PREVIOUS_KEY,
     HOLD_UNTIL,
     NEXT_SUBMIT_KEY,
     LiveOnce,
+    SchemaVersionError,
+    UploadUncertainError,
     iso,
     parse_time,
     utc_now,
@@ -50,10 +54,12 @@ def arguments(root: Path) -> argparse.Namespace:
     )
 
 
-def make_database(path: Path) -> None:
+def make_database(path: Path, schema_version: int = EXPECTED_SCHEMA_VERSION) -> None:
     connection = sqlite3.connect(path)
     connection.executescript(
-        """
+        f"""
+        CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT);
+        INSERT INTO schema_migrations VALUES({schema_version}, 'now');
         CREATE TABLE channels(id INTEGER PRIMARY KEY, transfer_mode TEXT);
         INSERT INTO channels VALUES(2, 'translated');
         CREATE TABLE video_candidates(
@@ -75,13 +81,47 @@ def make_database(path: Path) -> None:
           id INTEGER PRIMARY KEY, job_id TEXT, level TEXT, message TEXT, created_at TEXT
         );
         CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
+        CREATE TABLE upload_attempts(
+          id TEXT PRIMARY KEY,
+          job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          status TEXT NOT NULL,
+          bvid TEXT,
+          detail TEXT,
+          started_at TEXT NOT NULL,
+          finished_at TEXT
+        );
         """
     )
     connection.commit()
     connection.close()
 
 
+def fake_biliup(responses: list[tuple[int, str]]) -> mock.Mock:
+    remaining = iter(responses)
+
+    def start(_command: list[str], *, stdout: object, stderr: object) -> mock.Mock:
+        del stderr
+        returncode, output = next(remaining)
+        stdout.write(output.encode("utf-8"))
+        process = mock.Mock()
+        process.wait.return_value = returncode
+        return process
+
+    return mock.Mock(side_effect=start)
+
+
 class LiveOnceTests(unittest.TestCase):
+    def prepare_upload(self, root: Path) -> tuple[LiveOnce, Path]:
+        args = arguments(root)
+        make_database(Path(args.database))
+        item = LiveOnce(args)
+        item.reserve_job()
+        video = root / "video.mp4"
+        video.write_bytes(b"video")
+        item.download_cover = mock.Mock(return_value=None)  # type: ignore[method-assign]
+        item.wait_until_sidecar_can_upload = mock.Mock()  # type: ignore[method-assign]
+        return item, video
+
     def test_time_and_trim_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             item = LiveOnce(arguments(Path(directory)))
@@ -313,6 +353,118 @@ class LiveOnceTests(unittest.TestCase):
             }
             self.assertEqual(set(value), expected)
             json.dumps(value)
+
+    def test_uncertain_upload_is_persisted_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            item, video = self.prepare_upload(Path(directory))
+            popen = fake_biliup([(0, "biliup exited without a response\n")])
+            with mock.patch("live_once.subprocess.Popen", popen):
+                with self.assertRaisesRegex(UploadUncertainError, "人工核对"):
+                    item.upload_video(video)
+                resumed = LiveOnce(item.args)
+                with self.assertRaisesRegex(UploadUncertainError, "人工核对"):
+                    resumed.upload_video(video)
+
+            self.assertEqual(popen.call_count, 1)
+            connection = sqlite3.connect(item.args.database)
+            attempt = connection.execute(
+                "SELECT status,detail FROM upload_attempts"
+            ).fetchone()
+            job = connection.execute(
+                "SELECT status FROM jobs WHERE id=?", (item.state["job_id"],)
+            ).fetchone()
+            connection.close()
+            self.assertEqual(attempt[0], "uncertain")
+            self.assertIn("禁止自动重投", attempt[1])
+            self.assertEqual(job[0], "upload_uncertain")
+            self.assertEqual(item.state["phase"], "upload_uncertain")
+            with self.assertRaisesRegex(RuntimeError, "禁止回滚"):
+                item.rollback()
+
+    def test_explicit_rejection_can_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            item, video = self.prepare_upload(Path(directory))
+            bvid = "BV1uxE16ZE7e"
+            popen = fake_biliup(
+                [
+                    (1, '{"code":21566,"message":"rate limited"}\n'),
+                    (0, f'{{"code":0,"data":{{"bvid":"{bvid}"}}}}\n'),
+                ]
+            )
+            with (
+                mock.patch("live_once.subprocess.Popen", popen),
+                mock.patch("live_once.time.sleep") as sleep,
+            ):
+                self.assertEqual(item.upload_video(video), bvid)
+
+            self.assertEqual(popen.call_count, 2)
+            sleep.assert_called_once_with(item.args.rate_limit_cooldown_seconds)
+            connection = sqlite3.connect(item.args.database)
+            statuses = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT status FROM upload_attempts ORDER BY rowid"
+                )
+            ]
+            stored_bvid = connection.execute(
+                "SELECT bvid FROM jobs WHERE id=?", (item.state["job_id"],)
+            ).fetchone()[0]
+            connection.close()
+            self.assertEqual(statuses, ["failed", "succeeded"])
+            self.assertEqual(stored_bvid, bvid)
+
+    def test_schema_version_mismatch_refuses_to_run(self) -> None:
+        for version in (EXPECTED_SCHEMA_VERSION - 1, EXPECTED_SCHEMA_VERSION + 1):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                args = arguments(root)
+                make_database(Path(args.database), version)
+                item = LiveOnce(args)
+                with mock.patch.object(item, "backup_database") as backup:
+                    with self.assertRaisesRegex(
+                        SchemaVersionError, "schema 版本不兼容"
+                    ):
+                        item.execute()
+                backup.assert_not_called()
+                connection = sqlite3.connect(args.database)
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0
+                )
+                connection.close()
+
+    def test_existing_bvid_skips_duplicate_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            item, video = self.prepare_upload(Path(directory))
+            bvid = "BV1uxE16ZE7e"
+            connection = sqlite3.connect(item.args.database)
+            connection.execute(
+                """
+                UPDATE jobs SET status='uploaded_original_pending_subtitle',bvid=?
+                WHERE id=?
+                """,
+                (bvid, item.state["job_id"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO upload_attempts(
+                  id,job_id,status,bvid,started_at,finished_at
+                ) VALUES('existing',?,'succeeded',?,'now','now')
+                """,
+                (item.state["job_id"], bvid),
+            )
+            connection.commit()
+            connection.close()
+
+            with mock.patch("live_once.subprocess.Popen") as popen:
+                self.assertEqual(item.upload_video(video), bvid)
+            popen.assert_not_called()
+            item.download_cover.assert_not_called()
+            connection = sqlite3.connect(item.args.database)
+            status = connection.execute(
+                "SELECT status FROM jobs WHERE id=?", (item.state["job_id"],)
+            ).fetchone()[0]
+            connection.close()
+            self.assertEqual(status, "uploaded_original_pending_subtitle")
 
 
 if __name__ == "__main__":

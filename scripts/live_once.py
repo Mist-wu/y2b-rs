@@ -34,7 +34,9 @@ NEXT_SUBMIT_KEY = "bilibili.next_submit_at"
 HOLD_OWNER_KEY = "bilibili.upload_hold_owner"
 HOLD_PREVIOUS_KEY = "bilibili.upload_hold_previous"
 HOLD_UNTIL = "2099-12-31T23:59:59+00:00"
-BVID_RE = re.compile(r"\bBV[0-9A-Za-z]+\b")
+EXPECTED_SCHEMA_VERSION = 19
+BVID_RE = re.compile(r"\bBV[0-9A-Za-z]{10}\b")
+BILIUP_DEBUG_RESPONSE_RE = re.compile(r"ResponseData\s*\{\s*code:\s*(-?\d+)")
 SEGMENT_RE = re.compile(r"segment-(\d{8}T\d{6}Z)\.ts$")
 END_STATUSES = {"post_live", "was_live", "not_live"}
 
@@ -109,6 +111,60 @@ def sqlite_connect(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def response_from_json_line(line: str) -> tuple[str, str | int | None] | None:
+    decoder = json.JSONDecoder()
+    for start, character in enumerate(line):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(line[start:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        code = value.get("code")
+        if isinstance(code, bool) or not isinstance(code, int):
+            continue
+        if code != 0:
+            return ("rejected", code)
+        data = value.get("data")
+        bvid = data.get("bvid") if isinstance(data, dict) else None
+        if isinstance(bvid, str) and BVID_RE.fullmatch(bvid):
+            return ("accepted", bvid)
+        return ("accepted_without_bvid", None)
+    return None
+
+
+def response_from_debug_line(line: str) -> tuple[str, str | int | None] | None:
+    match = BILIUP_DEBUG_RESPONSE_RE.search(line)
+    if match is None:
+        return None
+    code = int(match.group(1))
+    if code != 0:
+        return ("rejected", code)
+    bvid = BVID_RE.search(line)
+    if bvid:
+        return ("accepted", bvid.group(0))
+    return ("accepted_without_bvid", None)
+
+
+def parse_biliup_submission(output: str) -> tuple[str, str | int | None] | None:
+    response = None
+    for line in output.splitlines():
+        parsed = response_from_json_line(line) or response_from_debug_line(line)
+        if parsed is not None:
+            response = parsed
+    return response
+
+
+class UploadUncertainError(RuntimeError):
+    pass
+
+
+class SchemaVersionError(RuntimeError):
+    pass
+
+
 class LiveOnce:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -140,6 +196,28 @@ class LiveOnce:
             handle.close()
             raise RuntimeError(f"another live-once process owns {lock_path}") from error
         return handle
+
+    def validate_schema_version(self) -> None:
+        database = Path(self.args.database)
+        if not database.is_file():
+            raise SchemaVersionError(f"数据库不存在: {database}")
+        try:
+            with sqlite_connect(database) as connection:
+                version = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(version),0) FROM schema_migrations"
+                    ).fetchone()[0]
+                )
+        except (sqlite3.Error, TypeError, ValueError) as error:
+            raise SchemaVersionError(
+                f"无法读取数据库 schema_version，拒绝运行: {error}"
+            ) from error
+        if version != EXPECTED_SCHEMA_VERSION:
+            raise SchemaVersionError(
+                "数据库 schema 版本不兼容："
+                f"当前 v{version}，live_once.py 仅支持 v{EXPECTED_SCHEMA_VERSION}；"
+                "请同步脚本与 y2b 后再人工处理"
+            )
 
     def backup_database(self) -> None:
         if self.state.get("database_backup"):
@@ -855,43 +933,365 @@ class LiveOnce:
                 return match.group(0)
         return None
 
+    def recover_persisted_upload(self) -> str | None:
+        job_id = self.state.get("job_id")
+        state_bvid = str(self.state["bvid"]) if self.state.get("bvid") else None
+        if not job_id:
+            if state_bvid:
+                self.save(bvid=state_bvid, phase="uploaded")
+                return state_bvid
+            raise RuntimeError("一次性直播任务缺少已保留的 job_id")
+        log_bvid = self.recover_bvid_from_logs()
+        now = iso(utc_now())
+        with sqlite_connect(Path(self.args.database)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute(
+                "SELECT id,status,bvid FROM jobs WHERE video_id=?", (self.args.video_id,)
+            ).fetchone()
+            if job is None or job["id"] != job_id:
+                raise RuntimeError("一次性直播任务对应的数据库 job 不存在或已被替换")
+            attempt = connection.execute(
+                """
+                SELECT id,status,bvid,detail FROM upload_attempts
+                WHERE job_id=? ORDER BY started_at DESC,rowid DESC LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            attempt_status = attempt["status"] if attempt else None
+            bvid = job["bvid"] or state_bvid
+            if not bvid and attempt_status in {"succeeded", "reconciled"}:
+                bvid = attempt["bvid"]
+            if not bvid and attempt_status in {None, "running", "uncertain"}:
+                bvid = log_bvid
+
+            if attempt_status in {"running", "uncertain"} and bvid:
+                connection.execute(
+                    """
+                    UPDATE upload_attempts
+                    SET status='reconciled',bvid=?,detail='从本地持久化结果核对确认',finished_at=?
+                    WHERE id=? AND status IN ('running','uncertain')
+                    """,
+                    (bvid, now, attempt["id"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE jobs SET
+                      status=CASE WHEN status IN ('uploading','upload_uncertain')
+                                  THEN 'paused' ELSE status END,
+                      bvid=?,error=NULL,updated_at=?
+                    WHERE id=?
+                    """,
+                    (bvid, now, job_id),
+                )
+                connection.commit()
+                self.save(bvid=bvid, phase="uploaded")
+                log(f"从持久化投稿结果恢复 BVID，未重复投稿: {bvid}")
+                return str(bvid)
+
+            if attempt_status in {"running", "uncertain"}:
+                detail = (
+                    attempt["detail"]
+                    if attempt_status == "uncertain" and attempt["detail"]
+                    else f"投稿 attempt {attempt['id']} 在确认结果前中断"
+                )
+                if "禁止自动重投" not in detail:
+                    detail = f"{detail}；禁止自动重投，请人工核对 Bilibili 创作中心"
+                if attempt_status == "running":
+                    connection.execute(
+                        """
+                        UPDATE upload_attempts
+                        SET status='uncertain',detail=?,finished_at=?
+                        WHERE id=? AND status='running'
+                        """,
+                        (detail, now, attempt["id"]),
+                    )
+                connection.execute(
+                    "UPDATE jobs SET status='upload_uncertain',error=?,updated_at=? WHERE id=?",
+                    (f"{self.marker} {detail}", now, job_id),
+                )
+                connection.commit()
+                self.save(phase="upload_uncertain", last_upload_error=detail)
+                raise UploadUncertainError(detail)
+
+            if attempt_status in {"succeeded", "reconciled"} and not bvid:
+                detail = (
+                    f"投稿 attempt {attempt['id']} 状态为 {attempt_status}，但缺少 BVID；"
+                    "禁止自动重投，请人工核对 Bilibili 创作中心"
+                )
+                connection.execute(
+                    "UPDATE upload_attempts SET status='uncertain',detail=?,finished_at=? WHERE id=?",
+                    (detail, now, attempt["id"]),
+                )
+                connection.execute(
+                    "UPDATE jobs SET status='upload_uncertain',error=?,updated_at=? WHERE id=?",
+                    (f"{self.marker} {detail}", now, job_id),
+                )
+                connection.commit()
+                self.save(phase="upload_uncertain", last_upload_error=detail)
+                raise UploadUncertainError(detail)
+
+            if bvid:
+                connection.execute(
+                    """
+                    UPDATE jobs SET
+                      status=CASE WHEN status IN ('uploading','upload_uncertain')
+                                  THEN 'paused' ELSE status END,
+                      bvid=?,error=NULL,updated_at=?
+                    WHERE id=?
+                    """,
+                    (bvid, now, job_id),
+                )
+                connection.commit()
+                self.save(bvid=bvid, phase="uploaded")
+                return str(bvid)
+            connection.commit()
+        return None
+
+    def begin_upload_attempt(self) -> str:
+        attempt_id = str(uuid.uuid4())
+        now = iso(utc_now())
+        job_id = str(self.state["job_id"])
+        with sqlite_connect(Path(self.args.database)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO upload_attempts(id,job_id,status,started_at)
+                VALUES(?,?,'running',?)
+                """,
+                (attempt_id, job_id, now),
+            )
+            changed = connection.execute(
+                "UPDATE jobs SET status='uploading',error=NULL,updated_at=? WHERE id=? AND bvid IS NULL",
+                (now, job_id),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("投稿前持久化 attempt 时任务已失效或已有 BVID")
+            connection.commit()
+        return attempt_id
+
+    def finish_upload_attempt(self, attempt_id: str, bvid: str) -> None:
+        now = iso(utc_now())
+        job_id = str(self.state["job_id"])
+        with sqlite_connect(Path(self.args.database)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """
+                UPDATE upload_attempts
+                SET status='succeeded',bvid=?,detail=NULL,finished_at=?
+                WHERE id=? AND job_id=? AND status='running'
+                """,
+                (bvid, now, attempt_id, job_id),
+            ).rowcount
+            job_changed = connection.execute(
+                "UPDATE jobs SET status='paused',bvid=?,error=NULL,updated_at=? WHERE id=?",
+                (bvid, now, job_id),
+            ).rowcount
+            if changed != 1 or job_changed != 1:
+                raise RuntimeError(f"投稿 attempt {attempt_id} 已失效")
+            connection.commit()
+
+    def fail_upload_attempt(self, attempt_id: str, detail: str) -> None:
+        now = iso(utc_now())
+        job_id = str(self.state["job_id"])
+        with sqlite_connect(Path(self.args.database)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """
+                UPDATE upload_attempts SET status='failed',detail=?,finished_at=?
+                WHERE id=? AND job_id=? AND status='running'
+                """,
+                (detail, now, attempt_id, job_id),
+            ).rowcount
+            job_changed = connection.execute(
+                "UPDATE jobs SET status='paused',error=?,updated_at=? WHERE id=?",
+                (f"{self.marker} {detail}", now, job_id),
+            ).rowcount
+            if changed != 1 or job_changed != 1:
+                raise RuntimeError(f"投稿 attempt {attempt_id} 已失效")
+            connection.commit()
+
+    def mark_upload_attempt_uncertain(self, attempt_id: str, detail: str) -> None:
+        now = iso(utc_now())
+        job_id = str(self.state["job_id"])
+        with sqlite_connect(Path(self.args.database)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """
+                UPDATE upload_attempts SET status='uncertain',detail=?,finished_at=?
+                WHERE id=? AND job_id=? AND status='running'
+                """,
+                (detail, now, attempt_id, job_id),
+            ).rowcount
+            job_changed = connection.execute(
+                """
+                UPDATE jobs SET status='upload_uncertain',error=?,updated_at=?
+                WHERE id=?
+                """,
+                (f"{self.marker} {detail}", now, job_id),
+            ).rowcount
+            if changed != 1 or job_changed != 1:
+                raise RuntimeError(f"投稿 attempt {attempt_id} 已失效")
+            connection.commit()
+
     def upload_video(self, video: Path) -> str:
-        bvid = self.state.get("bvid") or self.recover_bvid_from_logs()
+        bvid = self.recover_persisted_upload()
         if bvid:
-            self.save(bvid=bvid, phase="uploaded")
-            return str(bvid)
+            return bvid
         cover = self.download_cover()
         attempt = int(self.state.get("upload_attempt", 0))
         while True:
             self.wait_until_sidecar_can_upload()
             attempt += 1
             upload_log = self.work / f"upload-attempt-{attempt:03d}.log"
-            self.save(upload_attempt=attempt, phase="uploading")
-            log(f"开始一次性直传，投稿尝试 {attempt}；标题={self.args.title}")
+            attempt_id = self.begin_upload_attempt()
+            self.save(
+                upload_attempt=attempt,
+                upload_attempt_id=attempt_id,
+                phase="uploading",
+            )
+            log(
+                f"开始一次性直传，投稿尝试 {attempt}，attempt={attempt_id}；"
+                f"标题={self.args.title}"
+            )
             command = self.upload_args(video, cover)
-            with upload_log.open("wb", buffering=0) as handle:
-                process = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT)
-                try:
-                    returncode = process.wait(timeout=4 * 3600)
-                except subprocess.TimeoutExpired:
-                    process.terminate()
+            launch_error: OSError | None = None
+            try:
+                handle = upload_log.open("wb", buffering=0)
+            except OSError as error:
+                launch_error = error
+            else:
+                with handle:
                     try:
-                        process.wait(timeout=20)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    returncode = -1
-            content = upload_log.read_text(encoding="utf-8", errors="replace")
-            match = BVID_RE.search(content)
-            if match:
-                bvid = match.group(0)
+                        process = subprocess.Popen(
+                            command, stdout=handle, stderr=subprocess.STDOUT
+                        )
+                    except OSError as error:
+                        launch_error = error
+                    else:
+                        timed_out = False
+                        try:
+                            returncode = process.wait(timeout=4 * 3600)
+                        except subprocess.TimeoutExpired:
+                            timed_out = True
+                            with contextlib.suppress(OSError):
+                                process.terminate()
+                            try:
+                                returncode = process.wait(timeout=20)
+                            except subprocess.TimeoutExpired:
+                                with contextlib.suppress(OSError):
+                                    process.kill()
+                                returncode = -1
+                        except KeyboardInterrupt as error:
+                            with contextlib.suppress(OSError):
+                                process.terminate()
+                            detail = (
+                                f"biliup 执行被中断（attempt={attempt_id}），无法确认平台结果；"
+                                "禁止自动重投，请人工核对 Bilibili 创作中心"
+                            )
+                            self.mark_upload_attempt_uncertain(attempt_id, detail)
+                            self.save(phase="upload_uncertain", last_upload_error=detail)
+                            raise UploadUncertainError(detail) from error
+                        except Exception as error:
+                            with contextlib.suppress(OSError):
+                                process.terminate()
+                            detail = (
+                                f"等待 biliup 结果异常（attempt={attempt_id}）: {error}；"
+                                "禁止自动重投，请人工核对 Bilibili 创作中心"
+                            )
+                            self.mark_upload_attempt_uncertain(attempt_id, detail)
+                            self.save(phase="upload_uncertain", last_upload_error=detail)
+                            raise UploadUncertainError(detail) from error
+            if launch_error is not None:
+                detail = f"biliup 未启动，确定没有产生投稿: {launch_error}"
+                self.fail_upload_attempt(attempt_id, detail)
+                delay = min(900, 60 * attempt)
+                self.save(
+                    last_upload_error=detail,
+                    next_upload_retry_at=iso(
+                        utc_now() + dt.timedelta(seconds=delay)
+                    ),
+                )
+                log(f"{detail}；{delay} 秒后重试")
+                time.sleep(delay)
+                continue
+
+            try:
+                content = upload_log.read_text(encoding="utf-8", errors="replace")
+            except OSError as error:
+                detail = (
+                    f"无法读取 biliup 完整输出（attempt={attempt_id}）: {error}；"
+                    "禁止自动重投，请人工核对 Bilibili 创作中心"
+                )
+                self.mark_upload_attempt_uncertain(attempt_id, detail)
+                self.save(phase="upload_uncertain", last_upload_error=detail)
+                raise UploadUncertainError(detail) from error
+            response = parse_biliup_submission(content)
+            if response and response[0] == "accepted":
+                bvid = str(response[1])
+            elif response is None:
+                match = BVID_RE.search(content)
+                bvid = match.group(0) if match else None
+            else:
+                bvid = None
+            if bvid:
+                try:
+                    self.finish_upload_attempt(attempt_id, bvid)
+                except Exception as error:
+                    detail = (
+                        f"Bilibili 已返回成功 {bvid}，但本地确认失败（attempt={attempt_id}）: "
+                        f"{error}；禁止自动重投，请人工核对"
+                    )
+                    with contextlib.suppress(Exception):
+                        self.mark_upload_attempt_uncertain(attempt_id, detail)
+                    self.save(phase="upload_uncertain", last_upload_error=detail)
+                    raise UploadUncertainError(detail) from error
                 self.save(bvid=bvid, phase="uploaded")
                 log(f"B站视频投稿成功: {bvid}")
                 return bvid
+
             tail = content[-1500:].replace(self.args.bilibili_cookies, "[cookies]")
-            log(f"投稿失败 exit={returncode}: {tail}")
-            delay = self.args.rate_limit_cooldown_seconds if "21566" in content else min(900, 60 * attempt)
-            self.save(last_upload_error=tail, next_upload_retry_at=iso(utc_now() + dt.timedelta(seconds=delay)))
-            time.sleep(delay)
+            tail = tail or "（无可用输出）"
+            if (
+                returncode != 0
+                and response is not None
+                and response[0] == "rejected"
+            ):
+                code = int(response[1])
+                detail = f"biliup 投稿被平台明确拒绝: code={code}, exit={returncode}: {tail}"
+                self.fail_upload_attempt(attempt_id, detail)
+                delay = (
+                    self.args.rate_limit_cooldown_seconds
+                    if code == 21566
+                    else min(900, 60 * attempt)
+                )
+                self.save(
+                    last_upload_error=detail,
+                    next_upload_retry_at=iso(
+                        utc_now() + dt.timedelta(seconds=delay)
+                    ),
+                )
+                log(f"{detail}；{delay} 秒后按策略重试")
+                time.sleep(delay)
+                continue
+
+            if timed_out:
+                reason = "biliup 投稿超时并被终止"
+            elif returncode < 0:
+                reason = f"biliup 被信号终止（exit={returncode}）"
+            elif response and response[0] == "accepted_without_bvid":
+                reason = "biliup 返回成功响应，但响应中没有合法 BVID"
+            elif returncode == 0:
+                reason = "biliup 退出成功，但没有可验证的结构化投稿响应或 BVID"
+            else:
+                reason = f"biliup 异常退出且没有明确的平台拒绝响应（exit={returncode}）"
+            detail = (
+                f"{reason}（attempt={attempt_id}）: {tail}；"
+                "结果不确定，禁止自动重投，请人工核对 Bilibili 创作中心"
+            )
+            self.mark_upload_attempt_uncertain(attempt_id, detail)
+            self.save(phase="upload_uncertain", last_upload_error=detail)
+            log(detail)
+            raise UploadUncertainError(detail)
 
     def source_metadata(self, video: Path) -> dict[str, Any]:
         probe = self.state.get("video_probe") or self.validate_video(video)
@@ -1026,9 +1426,15 @@ class LiveOnce:
         with sqlite_connect(Path(self.args.database)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             job = connection.execute(
-                "SELECT id,bvid,error FROM jobs WHERE video_id=?", (self.args.video_id,)
+                "SELECT id,status,bvid,error FROM jobs WHERE video_id=?",
+                (self.args.video_id,),
             ).fetchone()
-            if job and job["bvid"] is None and self.marker in (job["error"] or ""):
+            if job and (
+                job["bvid"] is not None
+                or job["status"] in {"uploading", "upload_uncertain"}
+            ):
+                raise RuntimeError("投稿已成功或结果不确定，禁止回滚；请先人工核对")
+            if job and self.marker in (job["error"] or ""):
                 connection.execute("DELETE FROM jobs WHERE id=?", (job["id"],))
             if original:
                 columns = [
@@ -1093,6 +1499,7 @@ class LiveOnce:
 
     def execute(self) -> None:
         with self.acquire_lock():
+            self.validate_schema_version()
             if self.args.rollback:
                 self.rollback()
                 return
@@ -1146,6 +1553,15 @@ def main() -> int:
         time.tzset()
     try:
         LiveOnce(args).execute()
+    except UploadUncertainError as error:
+        log(
+            "投稿结果已记录为 uncertain，已停止自动重投并正常退出；"
+            f"请人工核对 Bilibili 创作中心: {error}"
+        )
+        return 0
+    except SchemaVersionError as error:
+        log(f"数据库 schema 不兼容，已拒绝运行；请同步 y2b 与脚本后人工处理: {error}")
+        return 0
     except KeyboardInterrupt:
         log("收到中断信号；已落盘分段和状态可由 systemd 续跑")
         return 130
