@@ -34,7 +34,7 @@ NEXT_SUBMIT_KEY = "bilibili.next_submit_at"
 HOLD_OWNER_KEY = "bilibili.upload_hold_owner"
 HOLD_PREVIOUS_KEY = "bilibili.upload_hold_previous"
 HOLD_UNTIL = "2099-12-31T23:59:59+00:00"
-EXPECTED_SCHEMA_VERSION = 19
+EXPECTED_SCHEMA_VERSION = 21
 BVID_RE = re.compile(r"\bBV[0-9A-Za-z]{10}\b")
 BILIUP_DEBUG_RESPONSE_RE = re.compile(r"ResponseData\s*\{\s*code:\s*(-?\d+)")
 SEGMENT_RE = re.compile(r"segment-(\d{8}T\d{6}Z)\.ts$")
@@ -933,6 +933,65 @@ class LiveOnce:
                 return match.group(0)
         return None
 
+    def mark_bvid_conflict_uncertain(
+        self,
+        connection: sqlite3.Connection,
+        bvid: str,
+        attempt_id: str | None,
+    ) -> str | None:
+        connection.execute("BEGIN IMMEDIATE")
+        owner = connection.execute(
+            "SELECT id FROM jobs WHERE bvid=? AND id<>?",
+            (bvid, str(self.state["job_id"])),
+        ).fetchone()
+        if owner is None:
+            connection.rollback()
+            return None
+        attempt = f"（attempt={attempt_id}）" if attempt_id else ""
+        detail = (
+            f"平台结果 BVID {bvid} 已归属其他任务 {owner['id']}，"
+            f"当前任务无法自动确认{attempt}；结果不确定，禁止自动重投，"
+            "请人工核对 Bilibili 创作中心并处理 BVID 归属冲突"
+        )
+        now = iso(utc_now())
+        if attempt_id:
+            connection.execute(
+                """
+                UPDATE upload_attempts
+                SET status='uncertain',bvid=?,detail=?,finished_at=?
+                WHERE id=? AND job_id=?
+                """,
+                (bvid, detail, now, attempt_id, str(self.state["job_id"])),
+            )
+        changed = connection.execute(
+            "UPDATE jobs SET status='upload_uncertain',error=?,updated_at=? WHERE id=?",
+            (f"{self.marker} {detail}", now, str(self.state["job_id"])),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("BVID 归属冲突发生后无法标记当前任务为 uncertain")
+        connection.commit()
+        self.save(phase="upload_uncertain", last_upload_error=detail)
+        return detail
+
+    def update_job_bvid_or_mark_uncertain(
+        self,
+        connection: sqlite3.Connection,
+        statement: str,
+        parameters: tuple[Any, ...],
+        bvid: str,
+        attempt_id: str | None,
+    ) -> sqlite3.Cursor:
+        try:
+            return connection.execute(statement, parameters)
+        except sqlite3.IntegrityError as error:
+            connection.rollback()
+            detail = self.mark_bvid_conflict_uncertain(
+                connection, bvid, attempt_id
+            )
+            if detail is None:
+                raise
+            raise UploadUncertainError(detail) from error
+
     def recover_persisted_upload(self) -> str | None:
         job_id = self.state.get("job_id")
         state_bvid = str(self.state["bvid"]) if self.state.get("bvid") else None
@@ -973,7 +1032,8 @@ class LiveOnce:
                     """,
                     (bvid, now, attempt["id"]),
                 )
-                connection.execute(
+                self.update_job_bvid_or_mark_uncertain(
+                    connection,
                     """
                     UPDATE jobs SET
                       status=CASE WHEN status IN ('uploading','upload_uncertain')
@@ -982,6 +1042,8 @@ class LiveOnce:
                     WHERE id=?
                     """,
                     (bvid, now, job_id),
+                    str(bvid),
+                    str(attempt["id"]),
                 )
                 connection.commit()
                 self.save(bvid=bvid, phase="uploaded")
@@ -1031,7 +1093,13 @@ class LiveOnce:
                 raise UploadUncertainError(detail)
 
             if bvid:
-                connection.execute(
+                attempt_id = (
+                    str(attempt["id"])
+                    if attempt_status in {"running", "uncertain", "succeeded", "reconciled"}
+                    else None
+                )
+                self.update_job_bvid_or_mark_uncertain(
+                    connection,
                     """
                     UPDATE jobs SET
                       status=CASE WHEN status IN ('uploading','upload_uncertain')
@@ -1040,6 +1108,8 @@ class LiveOnce:
                     WHERE id=?
                     """,
                     (bvid, now, job_id),
+                    str(bvid),
+                    attempt_id,
                 )
                 connection.commit()
                 self.save(bvid=bvid, phase="uploaded")
@@ -1082,9 +1152,12 @@ class LiveOnce:
                 """,
                 (bvid, now, attempt_id, job_id),
             ).rowcount
-            job_changed = connection.execute(
+            job_changed = self.update_job_bvid_or_mark_uncertain(
+                connection,
                 "UPDATE jobs SET status='paused',bvid=?,error=NULL,updated_at=? WHERE id=?",
                 (bvid, now, job_id),
+                bvid,
+                attempt_id,
             ).rowcount
             if changed != 1 or job_changed != 1:
                 raise RuntimeError(f"投稿 attempt {attempt_id} 已失效")
@@ -1236,6 +1309,8 @@ class LiveOnce:
             if bvid:
                 try:
                     self.finish_upload_attempt(attempt_id, bvid)
+                except UploadUncertainError:
+                    raise
                 except Exception as error:
                     detail = (
                         f"Bilibili 已返回成功 {bvid}，但本地确认失败（attempt={attempt_id}）: "
@@ -1329,7 +1404,8 @@ class LiveOnce:
             ).fetchone()
             if job is None or job["id"] != self.state["job_id"]:
                 raise RuntimeError("reserved live-once job disappeared before upload recording")
-            connection.execute(
+            self.update_job_bvid_or_mark_uncertain(
+                connection,
                 """
                 UPDATE jobs SET
                   title=?,status='uploaded_original_pending_subtitle',bvid=?,error=NULL,
@@ -1350,6 +1426,10 @@ class LiveOnce:
                     now,
                     self.state["job_id"],
                 ),
+                bvid,
+                str(self.state["upload_attempt_id"])
+                if self.state.get("upload_attempt_id")
+                else None,
             )
             connection.execute(
                 """
