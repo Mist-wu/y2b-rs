@@ -8,6 +8,7 @@
 //!
 //! 提交的 `data` 是 JSON 字符串：{"body":[{"from":秒,"to":秒,"content":"文本","location":1|2}]}
 //! location: 1=底部, 2=顶部。语言用短码（zh/en/ja…）。
+use crate::youtube_api::{bounded_http_client, read_response_body};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::json;
@@ -16,6 +17,7 @@ use std::path::Path;
 const VIEW_API: &str = "https://api.bilibili.com/x/web-interface/view";
 const LAN_API: &str = "https://api.bilibili.com/x/v2/dm/subtitle/lan/search/cid";
 const SUBMIT_API: &str = "https://api.bilibili.com/x/v2/dm/subtitle/draft/save";
+const BILIBILI_API_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct VideoView {
@@ -54,6 +56,13 @@ struct Cookie {
     value: String,
 }
 
+async fn response_json(response: reqwest::Response) -> Result<serde_json::Value> {
+    let body = read_response_body(response, BILIBILI_API_BODY_LIMIT)
+        .await
+        .context("读取 Bilibili API 响应失败")?;
+    serde_json::from_slice(&body).context("解析 Bilibili API 响应失败")
+}
+
 fn language_matches(actual: &str, requested: &str) -> bool {
     // B站的 lan 不是可以按语言族折叠的普通 BCP 47 标签：`zh` 表示投稿者
     // 提交的中文 CC，`zh-CN` 表示平台自动翻译。若用前缀匹配，自动翻译会被
@@ -80,9 +89,9 @@ impl BiliSubtitleClient {
             bail!("cookies 缺少 bili_jct，请重新登录 Bilibili")
         }
         Ok(Self {
-            http: reqwest::Client::builder()
-                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .build()?,
+            http: bounded_http_client(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )?,
             cookie_header: parts.join("; "),
             csrf,
         })
@@ -97,7 +106,7 @@ impl BiliSubtitleClient {
             .header("Referer", "https://www.bilibili.com/")
             .send()
             .await?;
-        let value: serde_json::Value = resp.json().await?;
+        let value = response_json(resp).await?;
         if value["code"].as_i64() != Some(0) {
             bail!(
                 "查询稿件 {bvid} 失败: code={} {}",
@@ -128,7 +137,7 @@ impl BiliSubtitleClient {
             .header("Cookie", &self.cookie_header)
             .send()
             .await?;
-        let value: serde_json::Value = resp.json().await?;
+        let value = response_json(resp).await?;
         if value["code"].as_i64() != Some(0) {
             bail!(
                 "查询字幕语言失败: code={} {}",
@@ -178,7 +187,7 @@ impl BiliSubtitleClient {
             ])
             .send()
             .await?;
-        let value: serde_json::Value = resp.json().await?;
+        let value = response_json(resp).await?;
         match value["code"].as_i64() {
             Some(0) => Ok(()),
             Some(code) => {
@@ -218,5 +227,35 @@ mod tests {
         assert!(!language_matches("zh-Hans", "zh"));
         assert!(!language_matches("en-US", "zh"));
         assert!(!language_matches("zho", "zh"));
+    }
+
+    #[tokio::test]
+    async fn oversized_bilibili_response_is_rejected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                BILIBILI_API_BODY_LIMIT + 1
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let response = bounded_http_client("y2b-rs-test/0.1")
+            .unwrap()
+            .get(format!("http://{address}/bilibili"))
+            .send()
+            .await
+            .unwrap();
+        let error = response_json(response).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("HTTP 响应体超过上限"),
+            "超大 Bilibili 响应未被限长: {error:#}"
+        );
+        server.await.unwrap();
     }
 }

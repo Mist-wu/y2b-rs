@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::time::Duration;
 use thiserror::Error;
 
 pub const YOUTUBE_DAILY_QUOTA: u32 = 10_000;
@@ -21,6 +22,70 @@ pub const QUOTA_NARROW_HOT_AT: u32 = 9_000;
 pub const QUOTA_FALLBACK_ONLY_AT: u32 = 9_500;
 const DEFAULT_API_BASE_URL: &str = "https://www.googleapis.com/youtube/v3";
 const QUOTA_DEGRADATION_STATE_KEY: &str = "quota_degradation_warned_for_reset";
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const YOUTUBE_API_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// 为所有常驻 HTTP 调用构造相同的有界客户端，避免某个调用点漏掉超时。
+pub(crate) fn bounded_http_client(user_agent: &str) -> Result<reqwest::Client, reqwest::Error> {
+    bounded_http_client_with_timeouts(
+        user_agent,
+        HTTP_CONNECT_TIMEOUT,
+        HTTP_REQUEST_TIMEOUT,
+        HTTP_READ_TIMEOUT,
+    )
+}
+
+fn bounded_http_client_with_timeouts(
+    user_agent: &str,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent(user_agent)
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .read_timeout(read_timeout)
+        .build()
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ResponseBodyError {
+    #[error("HTTP 响应体超过上限 {limit} 字节")]
+    TooLarge { limit: usize },
+    #[error("读取 HTTP 响应体失败: {0}")]
+    Request(#[from] reqwest::Error),
+}
+
+/// 流式读取响应体；已知 Content-Length 时提前拒绝，未知长度时在追加前检查，
+/// 因而 Vec 永远不会随超限响应继续增长。
+pub(crate) async fn read_response_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, ResponseBodyError> {
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit_u64)
+    {
+        return Err(ResponseBodyError::TooLarge { limit });
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(limit);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(ResponseBodyError::TooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum QuotaDegradation {
@@ -96,6 +161,8 @@ pub enum YoutubeApiError {
     },
     #[error("YouTube Data API 请求失败: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("YouTube Data API 响应体超过上限 {limit} 字节")]
+    ResponseTooLarge { limit: usize },
     #[error("YouTube Data API 响应无效: {0}")]
     InvalidResponse(#[from] serde_json::Error),
     #[error("YouTube Data API 状态读写失败: {0:#}")]
@@ -322,7 +389,15 @@ impl YoutubeDataApi {
             .get(ETAG)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let body = response.bytes().await?;
+        let body = match read_response_body(response, YOUTUBE_API_BODY_LIMIT).await {
+            Ok(body) => body,
+            Err(ResponseBodyError::TooLarge { limit }) => {
+                return Err(YoutubeApiError::ResponseTooLarge { limit });
+            }
+            Err(ResponseBodyError::Request(source)) => {
+                return Err(YoutubeApiError::Request(source));
+            }
+        };
         if status == StatusCode::NOT_MODIFIED {
             return Ok(ApiResponse {
                 body: Vec::new(),
@@ -347,7 +422,7 @@ impl YoutubeDataApi {
             });
         }
         Ok(ApiResponse {
-            body: body.to_vec(),
+            body,
             etag: response_etag,
             not_modified: false,
         })
@@ -642,6 +717,102 @@ mod tests {
             }
         });
         (format!("http://{address}/youtube/v3"), requests, server)
+    }
+
+    #[tokio::test]
+    async fn bounded_client_times_out_when_server_stalls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = bounded_http_client_with_timeouts(
+            "y2b-rs-test/0.1",
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let error = client
+            .get(format!("http://{address}/stalled"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout(), "无响应服务应触发超时: {error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "HTTP 超时没有及时中止"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn streaming_body_is_rejected_before_exceeding_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let payload = "x".repeat(65);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{payload}\r\n0\r\n\r\n",
+                payload.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = bounded_http_client_with_timeouts(
+            "y2b-rs-test/0.1",
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let response = client
+            .get(format!("http://{address}/large"))
+            .send()
+            .await
+            .unwrap();
+        let error = read_response_body(response, 64).await.unwrap_err();
+        assert!(matches!(error, ResponseBodyError::TooLarge { limit: 64 }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn youtube_api_rejects_oversized_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                YOUTUBE_API_BODY_LIMIT + 1
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("oversized.db")).unwrap();
+        let api = YoutubeDataApi::with_base_url(
+            bounded_http_client("y2b-rs-test/0.1").unwrap(),
+            db,
+            "test-key".to_string(),
+            &format!("http://{address}/youtube/v3"),
+        );
+        let error = api.playlist_items("UU-test", 50, None).await.unwrap_err();
+        assert!(matches!(
+            error,
+            YoutubeApiError::ResponseTooLarge {
+                limit: YOUTUBE_API_BODY_LIMIT
+            }
+        ));
+        server.await.unwrap();
     }
 
     #[test]
