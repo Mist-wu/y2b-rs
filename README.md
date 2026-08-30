@@ -240,14 +240,14 @@ y2b maintenance release --database /var/lib/y2b/state.db --owner "$owner"
 
 1. 在获取 hold 之前完成 `config-check`、Pi extension 解析、凭据、Python、SQLite 等静态预检。
 2. 获取 hold，间隔等待两次连续 idle；hold 挡住新领取，两次检查只需排空存量工作。
-3. 把二进制、全部 Pi 资源、`Cargo.lock` 和 deploy 脚本写入隐藏 staging，完整后发布为不可变的 `/opt/y2b/releases/<revision>/`，不改动运行中的 `current`。
-4. 在停服务前用 SQLite 在线备份生成迁移前快照，并要求 `integrity_check` 严格只返回一行 `ok`。
-5. 停服务，以临时符号链接和单次 `mv -T` 原子切换 `/opt/y2b/current`，再依次执行显式迁移、`y2b check --write-baseline`、启动和健康检查。systemd 直接执行 `/opt/y2b/current/y2b`，Pi 兼容路径也经 `current/pi` 解析。
-6. 健康检查成功后才释放 hold。脚本保留当前版、上一版和若干旧 release；超出上限时只按修改时间清理名称符合十六进制 revision 规则的真实目录，不跟随符号链接。
+3. 把二进制、全部 Pi 资源、`Cargo.lock`、`scripts/live_once.py` 和 deploy 脚本（含两个 systemd 单元）写入隐藏 staging，完整后发布为不可变的 `/opt/y2b/releases/<revision>/`，不改动运行中的 `current`。
+4. 生成迁移前快照并做严格完整性校验（`integrity_check` 只返回一行 `ok`）。完整 hold 路径在停服前在线备份；自举路径在第二次 idle 通过后立即停服并确认 inactive 再备份，保证快照是停服后的静止状态。
+5. 以临时符号链接和单次 `mv -T` 原子切换 `/opt/y2b/current`，再依次执行显式迁移、`y2b check --write-baseline`、启动和稳定窗口健康检查。systemd 直接执行 `/opt/y2b/current/y2b`，Pi 兼容路径也经 `current/pi` 解析。
+6. 稳定窗口健康检查成功后才释放 hold。脚本保留当前版、上一版和若干旧 release；超出上限时只按修改时间清理名称符合十六进制 revision 规则的真实目录，不跟随符号链接。
 
-数据库 schema 低于当前二进制版本时（例如首次从 v17 的旧扁平布局升级），维护锁在本次部署中不可用：`maintenance acquire` 要求精确匹配当前 schema，而迁移只能发生在停服务之后。此时脚本进入一次性自举部署——明确打印无法使用维护锁及因此存在的 TOCTOU 窗口，回退到 v17 就存在的 `jobs.status` / `stage_runs.status` 做两次连续空闲判定，并保留迁移前备份校验、原子切换与成对回滚。迁移完成后 schema 达到当前版本，后续所有部署都会自动回到完整 maintenance hold 路径，不会再退化。
+自举只在维护锁的落点表 `maintenance_hold` 确实不存在时触发（例如首次从 v17 的旧扁平布局升级）：锁依赖这张表，而建表迁移只能发生在停服务之后。此时脚本进入自举部署——明确打印无法使用维护锁及因此存在的 TOCTOU 窗口，回退到 v17 就存在的 `jobs.status` / `stage_runs.status` 做两次连续空闲判定，第二次 idle 通过后立即停服并确认 inactive 再生成迁移前快照，仍保留迁移前备份校验、原子切换与成对回滚。只要 `maintenance_hold` 表已存在，即使 schema 仍比当前二进制旧，也必须走完整 maintenance hold 路径，不会因后续 schema 升级重新打开无锁窗口。
 
-回滚的最小单位是 **release + 数据库**，绝不能只切回 symlink。停服务之后任一步失败，EXIT trap 都会先确保新服务退出，再把 `current` 原子切回上一 release、从迁移前快照原子恢复数据库并清理 WAL/SHM，随后用旧二进制重新执行 `check`、启动旧服务并确认 active，最后释放 hold。只有这套成对回滚能满足精确 schema 匹配；若旧服务健康检查也失败，脚本保持非零退出并保留迁移前备份供人工处理。从旧的固定路径布局首次升级时，脚本会先只读捕获旧二进制、Pi 资源和 `Cargo.lock` 为回滚 release；旧文件集不完整则在停服务前拒绝部署。
+回滚的最小单位是 **release + 数据库**，绝不能只切回 symlink。停服务之后任一步失败，EXIT trap 都会先确保新服务退出，再把 `current` 原子切回上一 release、从迁移前快照原子恢复数据库并清理 WAL/SHM，随后用旧二进制重新执行 `check`、启动旧服务并通过稳定窗口健康检查，最后释放 hold。只有这套成对回滚能满足精确 schema 匹配；若旧服务健康检查也失败，脚本保持非零退出并保留迁移前备份供人工处理。从旧的固定路径布局首次升级时，脚本会先只读捕获旧二进制、Pi 资源和 `Cargo.lock` 为回滚 release；旧文件集不完整则在停服务前拒绝部署。
 
 ### 依赖基线（dependency-baseline.json）
 
@@ -307,7 +307,7 @@ yt-dlp -v --simulate 'https://www.youtube.com/watch?v=VIDEO_ID' 2>&1 \
 2. 空服务器先运行 `bootstrap-server.sh`，再恢复 `/etc/y2b/config.toml`、`/etc/y2b/y2b.env` 和两个 cookies 文件，并用 `y2b-set-deepseek-key` 重新注入 DeepSeek Key。Pi 资源随应用 release 安装，无需单独备份。
 3. 先用 `deploy-app.sh` 安装与当前代码匹配的完整 release，再从 `backups/daily` 或 `weekly` 选择数据库并执行 `deploy/restore.sh BACKUP.db`；不要手工覆盖在线 `state.db`，也不要并行运行部署和恢复。任何恢复决策都要记录 release 与数据库这一对，禁止只回退其中一边。
 4. `restore.sh` 在停服务前完成强预检：把备份复制到数据库所在文件系统的暂存路径，要求 SQLite `integrity_check` 精确返回单独一行 `ok`，同时检查关键表和可读 schema。预检通过后才记录原 service 状态、停服务、保存旧库，并以同文件系统 `mv` 原子替换数据库和清理旧 WAL/SHM。
-5. 原服务先前为 active 时，脚本启动它并等待幂等迁移到 schema v21，再复查数据库完整性和 service 状态。任一步骤失败，EXIT trap 都尝试恢复旧数据库及原 service 状态并返回非零；成功后仍要核对 schema v21、队列数量、最近备份、`upload_uncertain` 和 `subtitle_attempts` 中的 `uncertain`。不确定的投稿或字幕提交只能人工核对，不能因恢复而自动重试。
+5. 原服务先前为 active 时，脚本启动它并等待幂等迁移到 schema v21，再复查数据库完整性，并通过稳定窗口健康检查确认 service 稳定。任一步骤失败，EXIT trap 都尝试恢复旧数据库及原 service 状态并返回非零；成功后仍要核对 schema v21、队列数量、最近备份、`upload_uncertain` 和 `subtitle_attempts` 中的 `uncertain`。不确定的投稿或字幕提交只能人工核对，不能因恢复而自动重试。
 6. SQLite 保存完整队列：准备和 CC 字幕任务通过原子领取、租约与心跳避免多进程重复执行；过期租约在重启后恢复。任务模式和追加目标 BV 不丢失，`dead_letter` 可从 TUI 或 CLI 安全恢复。旧频道和任务模式均为 `translated`；升级前停在待补字幕的任务各获一次自动补交机会，旧 `retry_wait` 行沿用固定 10 分钟退避。
 
 ## 上线验收

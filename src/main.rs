@@ -1277,6 +1277,7 @@ mod tests {
         events: PathBuf,
         scenario: &'static str,
         schema_version: i64,
+        hold_table_exists: bool,
         credential_owner: String,
         path: String,
     }
@@ -1366,6 +1367,12 @@ elif [[ "$line" == *" maintenance renew "* ]]; then
   fi
   printf 'renewed\n'
 elif [[ "$line" == *" maintenance status "* ]]; then
+  if [[ "$line" != *" --owner "* ]]; then
+    # 健康检查探针：观察者视角不要求持锁，只证明进程能打开数据库并响应。
+    record_event "health-probe:$target"
+    printf '%s\n' '{"checked_at":"test","idle":true,"hold":null,"expired_hold":null,"blockers":[]}'
+    exit 0
+  fi
   owner=$(value_for --owner "$@")
   [[ -f "$DEPLOY_TEST_HOLD" && $(<"$DEPLOY_TEST_HOLD") == "$owner" ]] || exit 1
   count=0
@@ -1516,6 +1523,7 @@ printf '%s target=%s database=%s\n' "$*" "$target" "$content" >>"$DEPLOY_TEST_SY
 line=" $* "
 if [[ ${1:-} == stop ]]; then
   printf 'inactive\n' >"$DEPLOY_TEST_SERVICE_STATE"
+  printf 'stop:%s:%s\n' "$target" "$content" >>"$DEPLOY_TEST_EVENTS"
 elif [[ ${1:-} == start ]]; then
   if [[ "$DEPLOY_TEST_SCENARIO" == health_failure && "$target" == "releases/bbbbbbbbbbbb" ]]; then
     printf 'failed\n' >"$DEPLOY_TEST_SERVICE_STATE"
@@ -1524,8 +1532,40 @@ elif [[ ${1:-} == start ]]; then
   fi
   printf 'start:%s:%s\n' "$target" "$content" >>"$DEPLOY_TEST_EVENTS"
 elif [[ ${1:-} == is-active ]]; then
+  if [[ "$DEPLOY_TEST_SCENARIO" == health_exit && "$target" == "releases/bbbbbbbbbbbb" ]]; then
+    count=0
+    [[ ! -f "$DEPLOY_TEST_ISACTIVE_COUNT" ]] || count=$(<"$DEPLOY_TEST_ISACTIVE_COUNT")
+    ((count += 1))
+    printf '%s\n' "$count" >"$DEPLOY_TEST_ISACTIVE_COUNT"
+    if (( count >= 3 )); then
+      exit 3
+    fi
+  fi
   [[ $(<"$DEPLOY_TEST_SERVICE_STATE") == active ]] && exit 0
   exit 3
+elif [[ ${1:-} == show ]]; then
+  pid=${DEPLOY_TEST_MAINPID:-4242}
+  restarts=${DEPLOY_TEST_NRESTARTS:-0}
+  if [[ "$target" == "releases/bbbbbbbbbbbb" ]]; then
+    case "$DEPLOY_TEST_SCENARIO" in
+      health_pid_change)
+        if [[ -f "$DEPLOY_TEST_HEALTH_SAMPLE" ]]; then
+          pid=4243
+        else
+          printf 'sampled\n' >"$DEPLOY_TEST_HEALTH_SAMPLE"
+        fi
+        ;;
+      health_restart)
+        if [[ -f "$DEPLOY_TEST_HEALTH_SAMPLE" ]]; then
+          restarts=1
+        else
+          printf 'sampled\n' >"$DEPLOY_TEST_HEALTH_SAMPLE"
+        fi
+        ;;
+    esac
+  fi
+  printf '%s\n' "$pid"
+  printf '%s\n' "$restarts"
 elif [[ "$line" == *" status "* ]]; then
   [[ $(<"$DEPLOY_TEST_SERVICE_STATE") == active ]] && exit 0
   exit 3
@@ -1545,6 +1585,7 @@ query=$2
 if [[ "$query" == .backup\ * ]]; then
   target=${query#.backup \'}
   target=${target%\'}
+  printf 'backup:%s\n' "$target" >>"$DEPLOY_TEST_EVENTS"
   case "$DEPLOY_TEST_SCENARIO" in
     backup_missing) : ;;
     backup_corrupt) printf 'damaged-backup\n' >"$target" ;;
@@ -1555,6 +1596,13 @@ elif [[ "$query" == *integrity_check* ]]; then
     printf 'row 1 broken\nrow 2 missing\n'
   else
     printf 'ok\n'
+  fi
+elif [[ "$query" == *sqlite_master* ]]; then
+  content=$(<"$database")
+  if [[ "$content" == new-database* ]]; then
+    printf '1\n'
+  else
+    printf '%s\n' "${DEPLOY_TEST_MAINTENANCE_HOLD_TABLE:-0}"
   fi
 elif [[ "$query" == *schema_migrations* ]]; then
   content=$(<"$database")
@@ -1570,6 +1618,7 @@ elif [[ "$query" == *"COUNT(*) FROM jobs"* ]]; then
     ((count += 1))
     printf '%s\n' "$count" >"$DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS"
   fi
+  printf 'bootstrap-idle-check\n' >>"$DEPLOY_TEST_EVENTS"
   printf '0\n'
 elif [[ "$query" == *"COUNT(*) FROM stage_runs"* ]]; then
   printf '0\n'
@@ -1680,6 +1729,7 @@ PY
             events,
             scenario,
             schema_version,
+            hold_table_exists: schema_version >= 22,
             credential_owner,
             path,
         }
@@ -1711,12 +1761,25 @@ PY
                 .env("Y2B_IDLE_MAX_CHECKS", idle_max_checks.to_string())
                 .env("Y2B_HEALTH_INTERVAL_SECONDS", "0")
                 .env("Y2B_HEALTH_MAX_CHECKS", "2")
+                .env("Y2B_HEALTH_WINDOW_SECONDS", "0")
+                .env(
+                    "DEPLOY_TEST_HEALTH_SAMPLE",
+                    self.state_dir.join("health-sample"),
+                )
+                .env(
+                    "DEPLOY_TEST_ISACTIVE_COUNT",
+                    self.state_dir.join("isactive-count"),
+                )
                 .env("Y2B_HOLD_LEASE_SECONDS", "60")
                 .env("Y2B_RELEASE_KEEP", "5")
                 .env("DEPLOY_TEST_SCENARIO", self.scenario)
                 .env(
                     "DEPLOY_TEST_SCHEMA_VERSION",
                     self.schema_version.to_string(),
+                )
+                .env(
+                    "DEPLOY_TEST_MAINTENANCE_HOLD_TABLE",
+                    if self.hold_table_exists { "1" } else { "0" },
                 )
                 .env(
                     "DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS",
@@ -1912,6 +1975,52 @@ PY
         assert!(new_start < old_start && old_start < release, "{events}");
     }
 
+    fn assert_health_window_failure_rolls_back(scenario: &'static str) {
+        let fixture = deploy_fixture(scenario);
+        let output = fixture.run(3);
+        assert!(!output.status.success(), "{}", output_detail(&output));
+        assert_eq!(
+            fs::read_link(&fixture.current).unwrap(),
+            PathBuf::from(format!("releases/{OLD_DEPLOY_REVISION}"))
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.database).unwrap(),
+            "old-database\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "active\n"
+        );
+        assert!(!fixture.hold.exists());
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        let new_start = events
+            .find(&format!(
+                "start:releases/{NEW_DEPLOY_REVISION}:new-database"
+            ))
+            .unwrap();
+        let old_start = events
+            .find(&format!(
+                "start:releases/{OLD_DEPLOY_REVISION}:old-database"
+            ))
+            .unwrap();
+        assert!(new_start < old_start, "{events}");
+    }
+
+    #[test]
+    fn deploy_health_check_fails_when_process_restarts_in_window() {
+        assert_health_window_failure_rolls_back("health_restart");
+    }
+
+    #[test]
+    fn deploy_health_check_fails_when_process_exits_in_window() {
+        assert_health_window_failure_rolls_back("health_exit");
+    }
+
+    #[test]
+    fn deploy_health_check_fails_when_mainpid_changes() {
+        assert_health_window_failure_rolls_back("health_pid_change");
+    }
+
     #[test]
     fn deploy_rejects_when_external_dependency_drifts() {
         let fixture = deploy_fixture("success");
@@ -1941,6 +2050,39 @@ PY
             fs::read_to_string(&fixture.service_state).unwrap(),
             "inactive\n"
         );
+    }
+
+    #[test]
+    fn deploy_ships_live_once_bypass_and_installs_its_unit() {
+        let fixture = deploy_fixture("success");
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        let live_once = fixture
+            .app_root
+            .join("releases")
+            .join(NEW_DEPLOY_REVISION)
+            .join("scripts/live_once.py");
+        assert!(live_once.is_file());
+        assert!(
+            fixture
+                .app_root
+                .join("current/scripts/live_once.py")
+                .is_file()
+        );
+        let unit =
+            fs::read_to_string(fixture.unit_dir.join("y2b-live-once-qhvPlcwJUvk.service")).unwrap();
+        let exec_start = unit
+            .lines()
+            .find(|line| line.starts_with("ExecStart="))
+            .unwrap();
+        let script = exec_start
+            .trim_start_matches("ExecStart=")
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert_eq!(script, "/opt/y2b/current/scripts/live_once.py");
+        let relative = script.strip_prefix("/opt/y2b/").unwrap();
+        assert!(fixture.app_root.join(relative).is_file());
     }
 
     #[test]
@@ -2169,6 +2311,31 @@ PY
     }
 
     #[test]
+    fn deploy_bootstrap_stops_service_after_second_idle_before_backup() {
+        let fixture = deploy_fixture_legacy("success", 17);
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        let idle_positions: Vec<usize> = events
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| *line == "bootstrap-idle-check")
+            .map(|(index, _)| index)
+            .collect();
+        assert!(idle_positions.len() >= 2, "{events}");
+        let second_idle = idle_positions[1];
+        let stop = events
+            .lines()
+            .position(|line| line.starts_with("stop:"))
+            .unwrap();
+        let backup = events
+            .lines()
+            .position(|line| line.starts_with("backup:"))
+            .unwrap();
+        assert!(second_idle < stop && stop < backup, "{events}");
+    }
+
+    #[test]
     fn deploy_after_bootstrap_uses_full_hold_path() {
         let fixture = deploy_fixture_legacy("success", 17);
         let first = fixture.run(3);
@@ -2192,6 +2359,36 @@ PY
             fs::read_link(&fixture.current).unwrap(),
             PathBuf::from("releases/cccccccccccc")
         );
+    }
+
+    #[test]
+    fn deploy_bootstraps_only_when_hold_table_is_absent() {
+        let fixture = deploy_fixture_legacy("success", 17);
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        let detail = output_detail(&output);
+        assert!(detail.contains("自举部署"), "{detail}");
+        assert!(detail.contains("缺少 maintenance_hold 表"), "{detail}");
+        assert!(!fixture.hold.exists());
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(!events.contains("acquire:"), "{events}");
+    }
+
+    #[test]
+    fn deploy_uses_full_hold_when_hold_table_exists_but_schema_is_older() {
+        let mut fixture = deploy_fixture_with_layout("success", false, 21);
+        fixture.hold_table_exists = true;
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        let detail = output_detail(&output);
+        assert!(!detail.contains("自举部署"), "{detail}");
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(events.contains("acquire:"), "{events}");
+        assert!(
+            events.contains(&format!("release:releases/{NEW_DEPLOY_REVISION}")),
+            "{events}"
+        );
+        assert!(!fixture.hold.exists());
     }
 
     #[test]
@@ -2286,6 +2483,7 @@ case "$1" in
     fi
     printf 'active\n' >"$RESTORE_TEST_SERVICE_STATE"
     ;;
+  show) printf '4242\n0\n' ;;
   *) exit 2 ;;
 esac
 "#,
@@ -2305,6 +2503,7 @@ case "${1:-}" in
     printf '%sv__CURRENT_SCHEMA__' "$prefix" >"$database"
     printf '__CURRENT_SCHEMA__\n'
     ;;
+  maintenance) exit 0 ;;
   *) exit 2 ;;
 esac
 "#
@@ -2352,6 +2551,9 @@ esac
                 .env("Y2B_SQLITE3", sqlite3)
                 .env("Y2B_SYSTEMCTL", &self.systemctl)
                 .env("Y2B_BIN", &self.y2b)
+                .env("Y2B_HEALTH_INTERVAL_SECONDS", "0")
+                .env("Y2B_HEALTH_WINDOW_SECONDS", "0")
+                .env("Y2B_HEALTH_MAX_CHECKS", "2")
                 .env("RESTORE_TEST_SERVICE_STATE", &self.service_state)
                 .env("RESTORE_TEST_SYSTEMCTL_LOG", &self.systemctl_log)
                 .env("RESTORE_TEST_Y2B_LOG", &self.y2b_log)
@@ -2487,6 +2689,40 @@ esac
         );
         let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
         assert!(calls.matches("start\n").count() >= 2);
+    }
+
+    #[test]
+    fn restore_requires_stable_window_before_declaring_success() {
+        let fixture = restore_fixture(true);
+        let database = fixture.state_dir.join("state.db");
+        let old = format!("old-v{CURRENT_SCHEMA_VERSION}");
+        fs::write(&database, &old).unwrap();
+        fs::write(&fixture.backup, format!("new-v{CURRENT_SCHEMA_VERSION}")).unwrap();
+
+        let output = fixture.run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(database).unwrap(),
+            format!("new-v{CURRENT_SCHEMA_VERSION}")
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "active\n"
+        );
+        let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+        assert!(
+            calls.matches("show\n").count() >= 2,
+            "稳定窗口未采样: {calls}"
+        );
+        let y2b_calls = fs::read_to_string(&fixture.y2b_log).unwrap();
+        assert!(
+            y2b_calls.contains("maintenance status --database "),
+            "{y2b_calls}"
+        );
     }
 
     #[tokio::test]
