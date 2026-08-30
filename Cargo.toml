@@ -22,12 +22,6 @@ futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
-# lru 0.18.1（RUSTSEC-2026-0253，informational unsound）由 ratatui 0.30 的
-# ratatui-core 非可选依赖带入，且 Cargo.lock 固定在 0.18.1；离线环境既无法下载
-# >=0.18.2，也无法靠关闭 ratatui 的 layout-cache feature 移除该依赖（lru 在
-# ratatui-core 0.1.2 中不是 optional）。主 watch 路径不直接使用该缓存，风险集中在
-# TUI；CI 的 `cargo audit --no-yanked` 保持硬失败，`--deny warnings` 仍为
-# continue-on-error，分级处理合理。网络恢复后应优先升级到 lru >= 0.18.2。
 ratatui = "0.30"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "json"] }
