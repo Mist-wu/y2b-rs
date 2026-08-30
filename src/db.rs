@@ -1679,6 +1679,7 @@ impl Database {
              WHERE id=(SELECT id FROM jobs \
                WHERE (status='queued' OR (status='retry_wait' AND ((retry_at IS NULL AND updated_at<=?4) OR retry_at<=?5))) \
                  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?5) \
+                 AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?5) \
                ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1) \
              RETURNING {JOB_COLUMNS}"
         );
@@ -1705,6 +1706,7 @@ impl Database {
              WHERE id=?4 \
                AND (status='queued' OR (status='retry_wait' AND ((retry_at IS NULL AND updated_at<=?5) OR retry_at<=?6))) \
                AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?6) \
+               AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?6) \
              RETURNING {JOB_COLUMNS}"
         );
         self.job_opt(
@@ -1843,9 +1845,9 @@ impl Database {
         let due = Self::retry_due_clause("updated_at");
         self.job_opt(
             &format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='queued' OR (status='retry_wait' AND ({due})) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1"
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE (status='queued' OR (status='retry_wait' AND ({due}))) AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1"
             ),
-            params![legacy_before, now],
+            params![legacy_before, &now, &now],
         )
     }
 
@@ -1854,9 +1856,9 @@ impl Database {
         let due = Self::retry_due_clause("updated_at");
         self.job_opt(
             &format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE status='ready_to_upload' OR (status='upload_retry_wait' AND ({due})) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1"
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE (status='ready_to_upload' OR (status='upload_retry_wait' AND ({due}))) AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1"
             ),
-            params![legacy_before, now],
+            params![legacy_before, &now, &now],
         )
     }
 
@@ -1978,6 +1980,14 @@ impl Database {
         let now_text = now.to_rfc3339();
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let maintenance_hold_active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?)",
+            [&now_text],
+            |row| row.get(0),
+        )?;
+        if maintenance_hold_active {
+            return Ok(None);
+        }
         let hold_owner: Option<String> = tx
             .query_row(
                 "SELECT value FROM settings WHERE key=?",
@@ -2350,10 +2360,12 @@ impl Database {
                  AND bvid IS NOT NULL AND bvid<>'' AND subtitle_attempt<? \
                  AND (subtitle_retry_at IS NULL OR subtitle_retry_at<=?) \
                  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?) \
+                 AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?) \
                  ORDER BY discovered_at LIMIT 1"
             ),
             params![
                 max_attempts,
+                Utc::now().to_rfc3339(),
                 Utc::now().to_rfc3339(),
                 Utc::now().to_rfc3339()
             ],
@@ -2370,6 +2382,7 @@ impl Database {
                AND bvid IS NOT NULL AND bvid<>'' AND subtitle_attempt<?4 \
                AND (subtitle_retry_at IS NULL OR subtitle_retry_at<=?3) \
                AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?3) \
+               AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?3) \
                ORDER BY discovered_at LIMIT 1) \
              RETURNING {JOB_COLUMNS}"
         );
@@ -2393,6 +2406,7 @@ impl Database {
              WHERE id=?4 AND bvid IS NOT NULL AND bvid<>'' \
                AND status IN ('completed','uploaded_original_pending_subtitle') \
                AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?3) \
+               AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?3) \
              RETURNING {JOB_COLUMNS}"
         );
         self.job_opt(
@@ -2931,7 +2945,9 @@ impl Database {
     /// 调度器的只读快速判断；真正的窗口与 hold 校验仍在 `begin_prepared_upload`
     /// 的写事务内重复执行，避免检查后领取前的竞态。
     pub fn bilibili_submission_due(&self, now: DateTime<Utc>) -> Result<bool> {
-        if self.get_setting(BILIBILI_UPLOAD_HOLD_OWNER)?.is_some() {
+        if self.maintenance_hold()?.is_some()
+            || self.get_setting(BILIBILI_UPLOAD_HOLD_OWNER)?.is_some()
+        {
             return Ok(false);
         }
         self.setting_deadline_due(NEXT_BILIBILI_SUBMIT_AT, now)
@@ -4416,6 +4432,129 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn maintenance_hold_refuses_prepare_upload_and_subtitle_claims_until_expiry() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("maintenance-claims.db")).unwrap();
+        let prepare_id = maintenance_test_job(&db, "hold-prepare");
+        let upload_id = maintenance_test_job(&db, "hold-upload");
+        db.queue_prepared_upload(
+            &upload_id,
+            &PreparedUpload::Submission {
+                video_path: "/tmp/hold-upload.mp4".into(),
+                cover_path: "/tmp/hold-upload.jpg".into(),
+                mode: TransferMode::Direct,
+                completion_status: JobStatus::Completed,
+            },
+        )
+        .unwrap();
+        let subtitle_id = maintenance_test_job(&db, "hold-subtitle");
+        db.set_job_bvid(&subtitle_id, "BV1holdtest1").unwrap();
+        db.queue_pending_subtitle(&subtitle_id, -1).unwrap();
+
+        assert!(
+            db.acquire_maintenance_hold("deploy:claims", "验证队列暂停", 300)
+                .unwrap()
+        );
+        assert!(db.next_queued_job().unwrap().is_none());
+        assert!(db.claim_next_prepare_job().unwrap().is_none());
+        assert!(db.claim_prepare_job(&prepare_id).unwrap().is_none());
+        assert!(db.next_ready_to_upload_job().unwrap().is_none());
+        assert!(!db.bilibili_submission_due(Utc::now()).unwrap());
+        assert!(db.begin_prepared_upload(&upload_id).unwrap().is_none());
+        assert!(db.next_pending_subtitle_job(16).unwrap().is_none());
+        assert!(db.claim_next_pending_subtitle_job(16).unwrap().is_none());
+        assert!(db.claim_subtitle_job_now(&subtitle_id).unwrap().is_none());
+
+        db.conn()
+            .execute(
+                "UPDATE maintenance_hold SET expires_at=? WHERE singleton=1",
+                [format_timestamp(Utc::now() - chrono::Duration::seconds(1))],
+            )
+            .unwrap();
+        assert_eq!(db.claim_next_prepare_job().unwrap().unwrap().id, prepare_id);
+        assert!(db.begin_prepared_upload(&upload_id).unwrap().is_some());
+        assert_eq!(
+            db.claim_next_pending_subtitle_job(16).unwrap().unwrap().id,
+            subtitle_id
+        );
+    }
+
+    #[test]
+    fn maintenance_hold_does_not_interrupt_already_claimed_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("maintenance-inflight.db")).unwrap();
+        let prepare_id = maintenance_test_job(&db, "inflight-prepare");
+        db.claim_prepare_job(&prepare_id).unwrap().unwrap();
+
+        let upload_id = maintenance_test_job(&db, "inflight-upload");
+        db.queue_prepared_upload(
+            &upload_id,
+            &PreparedUpload::Submission {
+                video_path: "/tmp/inflight-upload.mp4".into(),
+                cover_path: "/tmp/inflight-upload.jpg".into(),
+                mode: TransferMode::Direct,
+                completion_status: JobStatus::Completed,
+            },
+        )
+        .unwrap();
+        let upload_attempt = db.begin_prepared_upload(&upload_id).unwrap().unwrap();
+
+        let subtitle_id = maintenance_test_job(&db, "inflight-subtitle");
+        db.set_job_bvid(&subtitle_id, "BV1holdtest2").unwrap();
+        db.queue_pending_subtitle(&subtitle_id, -1).unwrap();
+        db.claim_next_pending_subtitle_job(16).unwrap().unwrap();
+
+        assert!(
+            db.acquire_maintenance_hold("deploy:inflight", "等待存量任务", 300)
+                .unwrap()
+        );
+        assert!(db.renew_job_claim(&prepare_id, PREPARE_CLAIM_KIND).unwrap());
+        assert!(db.renew_job_claim(&upload_id, UPLOAD_CLAIM_KIND).unwrap());
+        assert!(
+            db.renew_job_claim(&subtitle_id, SUBTITLE_CLAIM_KIND)
+                .unwrap()
+        );
+        db.update_claimed_job_status(
+            &prepare_id,
+            PREPARE_CLAIM_KIND,
+            JobStatus::Processing,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            !db.finish_upload_attempt(
+                &upload_id,
+                &upload_attempt,
+                "BV1holdtest3",
+                JobStatus::Completed,
+                TransferMode::Direct,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: 90,
+                    next_submit_at: None,
+                },
+            )
+            .unwrap()
+        );
+        db.defer_claimed_pending_subtitle(&subtitle_id, "存量任务正常收尾", 60)
+            .unwrap();
+
+        assert_eq!(
+            db.get_job(&prepare_id).unwrap().unwrap().status,
+            JobStatus::Processing
+        );
+        assert_eq!(
+            db.get_job(&upload_id).unwrap().unwrap().status,
+            JobStatus::Completed
+        );
+        assert_eq!(
+            db.get_job(&subtitle_id).unwrap().unwrap().status,
+            JobStatus::UploadedOriginalPendingSubtitle
+        );
+        assert!(db.claim_next_pending_subtitle_job(16).unwrap().is_none());
     }
 
     fn claimed_subtitle_job(db: &Database, video_id: &str, bvid: &str) -> (String, Job) {
