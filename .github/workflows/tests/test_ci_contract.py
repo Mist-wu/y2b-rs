@@ -22,13 +22,51 @@ class CiContractTests(unittest.TestCase):
             "python3 -m compileall -q scripts deploy",
             "shellcheck deploy/*.sh",
             "bash -n deploy/*.sh",
-            "npm audit",
-            "cargo audit",
+            "npm audit --audit-level=high",
+            "cargo audit --no-yanked",
+            "cargo audit --deny warnings",
         )
         for command in required_commands:
             with self.subTest(command=command):
                 self.assertIn(command, quality)
         self.assertIn("gitleaks/gitleaks-action@", secret_scan)
+
+    def test_dependency_audits_have_stable_failure_semantics(self) -> None:
+        quality = (WORKFLOWS / "quality-gates.yml").read_text(encoding="utf-8")
+        self.assertNotRegex(quality, r"(?m)^\s+npm audit\s*$")
+        self.assertNotRegex(quality, r"(?m)^\s+run: cargo audit\s*$")
+        vulnerability_step = quality.split("- name: 审计 Rust 漏洞", 1)[1].split(
+            "- name:", 1
+        )[0]
+        self.assertIn("run: cargo audit --no-yanked", vulnerability_step)
+        self.assertNotIn("continue-on-error", vulnerability_step)
+        self.assertRegex(
+            quality,
+            r"(?s)name: 报告 RustSec warning（非阻断）\s+continue-on-error: true\s+run: cargo audit --deny warnings",
+        )
+        self.assertIn("uses: actions/cache/restore@", quality)
+        self.assertIn("uses: actions/cache/save@", quality)
+        self.assertEqual(quality.count("path: ~/.cargo/bin/cargo-audit"), 2)
+        self.assertIn("cargo-audit-0.22.2", quality)
+        self.assertIn("if: steps.cargo-audit-cache.outputs.cache-hit != 'true'", quality)
+        self.assertIn("cargo install cargo-audit --version 0.22.2 --locked", quality)
+        self.assertLess(
+            quality.index("name: 保存 cargo-audit 二进制缓存"),
+            quality.index("name: 审计 Rust 漏洞"),
+        )
+
+    def test_branch_triggers_do_not_duplicate_pull_request_runs(self) -> None:
+        for filename in ("quality-gates.yml", "secret-scan.yml"):
+            workflow = (WORKFLOWS / filename).read_text(encoding="utf-8")
+            with self.subTest(workflow=filename):
+                self.assertRegex(
+                    workflow,
+                    r"(?m)^  push:\n    branches:\n      - main$",
+                )
+                self.assertIn("  pull_request:", workflow)
+                self.assertIn("concurrency:", workflow)
+                self.assertIn("github.head_ref || github.ref", workflow)
+                self.assertIn("cancel-in-progress: true", workflow)
 
     def test_every_action_is_pinned_to_a_commit(self) -> None:
         action_pattern = re.compile(r"^\s*uses:\s*([^\s@]+)@([^\s#]+)", re.MULTILINE)
