@@ -7,7 +7,7 @@
 单二进制 Rust CLI/TUI，SQLite 持久化队列，全流程无人值守。
 
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-000?logo=rust)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT-blue)](Cargo.toml)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Target](https://img.shields.io/badge/deploy-Ubuntu%2022.04%20musl-E95420?logo=ubuntu&logoColor=white)](#部署)
 
 </div>
@@ -22,6 +22,8 @@
 | `translated` | 英文字幕 → Pi 分句 → Pi 翻译 → 上传原片 → 提交中文 CC | B 站软字幕，观众可开关，不走压制 |
 
 频道模式只是**新任务的默认值**：任务入队即固化模式，之后 `channels set-mode` 不改写旧任务。`video_id` 全局唯一，同一视频不会二次入队或二次投稿。
+
+`translated` 在 CLI 中表示“翻译后补交软 CC”，不是“翻译压制”：项目已移除生成硬字幕成片的路径，上传的始终是原片。
 
 频道优先级分为 `normal` 和 `priority`。优先频道拥有独立的 60 秒 RSS 轮询和 60 秒 Data API 调度，并在候选闸门、准备队列和上传队列中排在全部普通频道之前；同一优先级内部仍按发现时间 FIFO。已经开始执行的任务不会被中断。
 
@@ -47,7 +49,7 @@ y2b channels enable <ID> | disable <ID> | sync
 
 # 任务
 y2b jobs add <URL> --mode direct|translated       # 必须显式指定 --mode
-y2b run <URL> [--mode translated]                 # 单次跑完，默认 translated
+y2b run <URL> [--mode translated]                 # 单次跑完，默认上传原片并补中文 CC
 y2b jobs list [N] | show <JOB_ID> | retry <JOB_ID> | reconcile-upload <JOB_ID>
 
 # 字幕 / 模型 / 运维
@@ -108,7 +110,11 @@ y2b backup | auth-check | check --write-baseline
 
 - SQLite 持久化频道、任务、阶段、峰值 RSS、Pi token/cost 和认证状态。普通故障连续失败 5 次进 `dead_letter` 并删除大型视频；失败间按 `min(5min × 2^n, 1h)` 退避，首次重试仍是 10 分钟。直播／预约／回放生成中不消耗失败次数。
 - `watch` 使用单个准备 worker + 单个上传 worker + 单个字幕 worker。任务准备完成后持久化为 `ready_to_upload`，投稿冷却期间仍可继续下载和翻译后续任务，实际上传严格串行。最终领取任务的写事务会同时复核投稿冷却和 `live_once` 独占 hold，避免旁路暂停与普通投稿抢跑；hold 只允许 owner 自己释放，并保留期间写入的更晚平台冷却。CC 字幕补交独立成队列，不占用上传 worker。
-- 每次真正投稿先持久化 attempt；中断且无法确认结果时进入 `upload_uncertain`，禁止自动重投。`jobs reconcile-upload` 只在创作中心最近稿件中找到唯一同名记录时确认成功。
+- 每次真正投稿先持久化 attempt；中断且无法确认结果时进入 `upload_uncertain`，禁止自动重投。`jobs reconcile-upload` 会查询创作中心辅助人工核对。
+
+> [!CAUTION]
+> “创作中心唯一同名即确认 BVID”只是**弱证据**：标题可能重复，也可能命中另一条投稿，误关联后会污染字幕和任务状态。这是已知的数据一致性风险；在更强的投稿关联校验完成前，只能在人工同时核对标题、时间和稿件内容后执行 `jobs reconcile-upload`，不能把唯一同名当作自动确认依据。
+
 - RSS 轮询／yt-dlp 校对与备份／认证各跑独立任务，长时间 yt-dlp 调用不阻塞队列调度。裸频道 URL 规范化到内容标签页，校对结果中的频道／播放列表条目不会被误当视频。
 - 所有外部命令独占 Unix 进程组；超时或并行分支提前取消都会清理完整后代树，避免 PyInstaller yt-dlp／Node 变成孤儿进程继续写临时分片。
 - 新投稿默认至少间隔 30 分钟；B 站返回 `21566` 时全局冷却 6 小时并自动等待后重试。
@@ -153,6 +159,31 @@ python3 scripts/audit_brawl_glossary.py \
 
 </details>
 
+## 强失败质量门禁
+
+提交前统一运行 `npm run check`；它同时执行 TypeScript 类型检查和 `pi/y2b-extension.ts` 的真实 import 解析。完整的本地门禁与 CI 一致：
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+npm ci
+npm run check
+python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 -m unittest discover -s deploy/tests -p 'test_*.py'
+python3 -m unittest discover -s .github/workflows/tests -p 'test_*.py'
+python3 -m compileall -q scripts deploy
+shellcheck deploy/*.sh
+bash -n deploy/*.sh
+npm audit --audit-level=high
+cargo audit --no-yanked
+gitleaks git --gitleaks-ignore-path .github/workflows/gitleaksignore .
+```
+
+格式、类型、测试、脚本语法、Gitleaks 以及真正的 RustSec vulnerability 都是**强失败门禁**：任一命令非零退出就阻断合并和发布，不得用 `|| true`、跳过测试或宽泛 allowlist 降级。Gitleaks 扫描完整历史，仓库中的测试假 Key 只按唯一 fingerprint 精确放行。
+
+依赖审计刻意采用不同阈值，因为 advisory 会在上游发布后异步改变，与当前提交未必相关：npm 只让 high／critical 发现阻断，low／moderate 仍显示在报告中；RustSec 的 vulnerability 全部阻断，而 unmaintained、yanked、unsound 等 warning 由 CI 另跑 `cargo audit --deny warnings` 并标为非阻断。这样既不隐藏漏洞和维护风险，也不会因低级噪音让主门禁长期失去可信度。
+
 ## 部署
 
 目标：Ubuntu 22.04 x86_64，`azureuser@20.89.60.23`。Azure 镜像禁止 root 直接 SSH，特权操作走 `azureuser` 免密 `sudo`。服务器不编译 Rust 或 FFmpeg。
@@ -168,17 +199,18 @@ cargo install cargo-zigbuild --locked
 rustup target add x86_64-unknown-linux-musl
 cargo zigbuild --release --target x86_64-unknown-linux-musl
 
-# 3. 上传二进制、运行资源和安全换钥工具
-scp target/x86_64-unknown-linux-musl/release/y2b azureuser@20.89.60.23:/tmp/y2b
-ssh azureuser@20.89.60.23 'mkdir -p /tmp/y2b-release'
-scp -r pi config.example.toml deploy Cargo.lock azureuser@20.89.60.23:/tmp/y2b-release/
-ssh azureuser@20.89.60.23 'sudo install -o root -g root -m 755 /tmp/y2b-release/deploy/y2b-set-deepseek-key.py /usr/local/sbin/y2b-set-deepseek-key'
+# 3. 按 commit 建独立传输目录，上传二进制、运行资源和安全换钥工具
+release_id=$(git rev-parse --short=12 HEAD)
+scp target/x86_64-unknown-linux-musl/release/y2b azureuser@20.89.60.23:/tmp/y2b-$release_id
+ssh azureuser@20.89.60.23 "install -d /tmp/y2b-release-$release_id"
+scp -r pi config.example.toml deploy Cargo.lock azureuser@20.89.60.23:/tmp/y2b-release-$release_id/
+ssh azureuser@20.89.60.23 "sudo install -o root -g root -m 755 /tmp/y2b-release-$release_id/deploy/y2b-set-deepseek-key.py /usr/local/sbin/y2b-set-deepseek-key"
 
 # 4. 在 Mac 终端输入新 Key；输入不回显，Key 只经 stdin 发送且不会出现在命令历史
 (read -r -s 'Y2B_DEEPSEEK_KEY?请输入新的 DeepSeek API Key: '; printf '\n'; printf '%s' "$Y2B_DEEPSEEK_KEY" | ssh azureuser@20.89.60.23 'sudo /usr/local/sbin/y2b-set-deepseek-key')
 
 # 5. 部署应用
-ssh azureuser@20.89.60.23 'sudo bash /tmp/y2b-release/deploy/deploy-app.sh /tmp/y2b'
+ssh azureuser@20.89.60.23 "sudo bash /tmp/y2b-release-$release_id/deploy/deploy-app.sh /tmp/y2b-$release_id"
 ```
 
 换钥工具会原子写入专用认证文件，并删除 `/etc/y2b/y2b.env` 和全局 Pi 认证中的旧 DeepSeek 条目；它不会打印明文 Key。部署前可用 `sudo y2b-set-deepseek-key --check` 只读检查单一路径约束。
@@ -189,7 +221,13 @@ ssh azureuser@20.89.60.23 'sudo bash /tmp/y2b-release/deploy/deploy-app.sh /tmp/
 > [!WARNING]
 > 部署前确认没有投稿在途（`y2b jobs list` 无 `uploading`），避免中断真实上传。
 
-`deploy-app.sh` 先用新二进制执行只读 `config-check`，再停服务、跑迁移和基线，最后 `restart`——迁移需要独占数据库，且 `enable --now` 对已在运行的服务是空操作，会出现「装上了但跑的还是旧二进制」。
+### maintenance hold 与 release 边界
+
+这里的 **maintenance hold** 是运维窗口约定：确认没有 `uploading`／运行中的 stage，并保证同一时间只有一个部署或恢复进程后才能动生产文件。它不是 `live_once` 的投稿 hold；后者只挡上传 worker，准备和字幕 worker 仍会运行，不能代替完整维护窗口。
+
+按 commit 隔离的 `/tmp/y2b-release-$release_id` 是不可混用的 release 输入，但应用 release 当前不是原子切换：`deploy-app.sh` 仍把二进制和 Pi 资源安装到固定路径。因此必须保留上一版的完整文件集，任何安装失败都停止后续迁移／重启，不能只回退二进制而留下新旧资源混搭。脚本的 `config-check`、extension 解析、凭据检查、空闲检查和 SQLite 依赖检查均为强失败门禁。
+
+真正使用**原子 release** 的是 PO Token Provider：安装器先写入版本化 `releases/<version>`，校验完整后再以临时符号链接和单次 `mv` 切换 `current`。失败时旧 `current` 仍可用，不会暴露半份 provider。
 
 需另行放置且权限 `0600` 的文件：
 
@@ -214,19 +252,21 @@ yt-dlp -v --simulate 'https://www.youtube.com/watch?v=VIDEO_ID' 2>&1 \
 ```
 
 `deploy/install-ytdlp-pot-provider.sh` 固定并校验 `bgutil-ytdlp-pot-provider`
-的 provider 源码与插件版本，使用按需启动的 `script-node` 模式；它不监听网络端口，
-也不需要重启 `y2b-watch.service`。y2b 的 systemd 单元设置 `HOME=/root`，因此每次
-新启动的 yt-dlp 子进程会从 `/root/bgutil-ytdlp-pot-provider` 自动发现 provider。
+的 provider 源码与插件版本，使用版本化目录和原子 `current` 切换，并以按需启动的
+`script-node` 模式运行；它不监听网络端口，也不需要重启 `y2b-watch.service`。y2b
+的 systemd 单元设置 `HOME=/root`，因此每次新启动的 yt-dlp 子进程会从
+`/root/bgutil-ytdlp-pot-provider` 自动发现 provider。
 
 ## 备份与恢复
 
-在线备份每 6 小时一次，保留 4 个小时备份、7 个日备份、4 个周备份。数据库迁移前先执行 `y2b backup`。
+在线备份每 6 小时一次，保留 4 个小时备份、7 个日备份、4 个周备份。数据库迁移前先执行 `y2b backup`。恢复必须使用与备份兼容的完整 release，不能只替换数据库或二进制。
 
-1. 空服务器运行 `bootstrap-server.sh`。
-2. 恢复 `/etc/y2b/config.toml`、`/etc/y2b/y2b.env`、两个 cookies 文件，并用 `y2b-set-deepseek-key` 重新注入 DeepSeek Key；`/opt/y2b/pi/` 下的资源由 `deploy-app.sh` 从仓库安装，无需单独备份。
-3. 从 `/var/lib/y2b/backups/daily` 或 `weekly` 选数据库，执行 `deploy/restore.sh BACKUP.db`。
-4. 部署静态 `y2b`，执行 `y2b check --write-baseline`，再启动 `y2b-watch.service`。打开数据库时自动升级到 v19（迁移幂等）。旧频道和任务模式均为 `translated`；升级前停在待补字幕的任务各获一次自动补交机会，升级前的 `retry_wait` 行沿用固定 10 分钟退避。
-5. SQLite 保存完整队列：准备和 CC 字幕任务通过原子领取、租约与心跳避免多进程重复执行；过期租约在重启后恢复。任务模式和追加目标 BV 不丢失，`dead_letter` 可从 TUI 或 CLI 安全恢复。
+1. 记录备份时间、来源 schema 和对应 release；进入 maintenance hold，确认没有 `uploading`／运行中的 stage，并保留当前数据库与整套应用文件作为回退点。
+2. 空服务器先运行 `bootstrap-server.sh`，再恢复 `/etc/y2b/config.toml`、`/etc/y2b/y2b.env` 和两个 cookies 文件，并用 `y2b-set-deepseek-key` 重新注入 DeepSeek Key。Pi 资源随应用 release 安装，无需单独备份。
+3. 先用 `deploy-app.sh` 安装与当前代码匹配的完整 release，再从 `backups/daily` 或 `weekly` 选择数据库并执行 `deploy/restore.sh BACKUP.db`；不要手工覆盖在线 `state.db`，也不要并行运行部署和恢复。
+4. `restore.sh` 在停服务前完成强预检：把备份复制到数据库所在文件系统的暂存路径，要求 SQLite `integrity_check` 精确返回单独一行 `ok`，同时检查关键表和可读 schema。预检通过后才记录原 service 状态、停服务、保存旧库，并以同文件系统 `mv` 原子替换数据库和清理旧 WAL/SHM。
+5. 原服务先前为 active 时，脚本启动它并等待幂等迁移到 schema v19，再复查数据库完整性和 service 状态。任一步骤失败，EXIT trap 都尝试恢复旧数据库及原 service 状态并返回非零；成功后仍要核对 schema v19、队列数量、最近备份和 `upload_uncertain`。不确定投稿只能人工核对，不能因恢复而自动重投。
+6. SQLite 保存完整队列：准备和 CC 字幕任务通过原子领取、租约与心跳避免多进程重复执行；过期租约在重启后恢复。任务模式和追加目标 BV 不丢失，`dead_letter` 可从 TUI 或 CLI 安全恢复。旧频道和任务模式均为 `translated`；升级前停在待补字幕的任务各获一次自动补交机会，旧 `retry_wait` 行沿用固定 10 分钟退避。
 
 ## 上线验收
 
