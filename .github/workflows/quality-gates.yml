@@ -31,7 +31,7 @@ jobs:
       - name: 运行 Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: 运行 Rust 测试
-        run: cargo test
+        run: cargo test --all-features
 
   typescript-and-data:
     name: TypeScript 和仓库结构
