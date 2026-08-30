@@ -22,6 +22,7 @@ idle_interval=${Y2B_IDLE_INTERVAL_SECONDS:-5}
 idle_max_checks=${Y2B_IDLE_MAX_CHECKS:-60}
 health_interval=${Y2B_HEALTH_INTERVAL_SECONDS:-1}
 health_max_checks=${Y2B_HEALTH_MAX_CHECKS:-30}
+health_window_seconds=${Y2B_HEALTH_WINDOW_SECONDS:-10}
 hold_lease_seconds=${Y2B_HOLD_LEASE_SECONDS:-3600}
 release_keep=${Y2B_RELEASE_KEEP:-5}
 releases_dir="$app_root/releases"
@@ -52,6 +53,7 @@ require_positive_integer Y2B_HOLD_LEASE_SECONDS "$hold_lease_seconds"
 require_positive_integer Y2B_RELEASE_KEEP "$release_keep"
 require_nonnegative_number Y2B_IDLE_INTERVAL_SECONDS "$idle_interval"
 require_nonnegative_number Y2B_HEALTH_INTERVAL_SECONDS "$health_interval"
+require_nonnegative_number Y2B_HEALTH_WINDOW_SECONDS "$health_window_seconds"
 
 revision=${Y2B_REVISION:-}
 if [[ -z "$revision" ]]; then
@@ -315,21 +317,80 @@ restore_database() {
 }
 
 wait_for_service() {
+  local run_app_probe=${1:-true}
   local attempt
+  local active_seen=false
+  local stable_samples
+  local required_stable_samples=2
+  local window_samples
+  local first_pid=
+  local current_pid=
+  local current_restarts=
+  local health_output
+
+  # 稳定窗口内除首次 active 外至少再采样一次；窗口按配置切成等间隔采样。
+  if (( health_interval > 0 )); then
+    window_samples=$(( health_window_seconds / health_interval + 1 ))
+    (( window_samples > required_stable_samples )) && required_stable_samples=$window_samples
+  fi
+
+  # 阶段一：等服务进入 active。
   for ((attempt = 1; attempt <= health_max_checks; attempt++)); do
     if "$systemctl_cmd" is-active --quiet "$service"; then
-      "$systemctl_cmd" --no-pager --full status "$service"
-      return
+      active_seen=true
+      break
     fi
     if (( attempt < health_max_checks )); then
       sleep "$health_interval"
     fi
   done
-  echo "$service 健康检查失败" >&2
-  set +e
-  "$systemctl_cmd" --no-pager --full status "$service" >&2
-  set -e
-  return 1
+  if [[ "$active_seen" != true ]]; then
+    echo "$service 健康检查失败" >&2
+    set +e
+    "$systemctl_cmd" --no-pager --full status "$service" >&2
+    set -e
+    return 1
+  fi
+
+  # 阶段二：稳定窗口内多次采样，全程 active、MainPID 不变、NRestarts 为 0。
+  for ((stable_samples = 1; stable_samples <= required_stable_samples; stable_samples++)); do
+    if ! "$systemctl_cmd" is-active --quiet "$service"; then
+      echo "$service 在稳定窗口内不再 active（第 $stable_samples/$required_stable_samples 次采样）" >&2
+      return 1
+    fi
+    if ! health_output=$("$systemctl_cmd" show -p MainPID -p NRestarts --value "$service"); then
+      echo "无法读取 $service 的 MainPID/NRestarts" >&2
+      return 1
+    fi
+    current_pid=${health_output%%$'\n'*}
+    current_restarts=${health_output#*$'\n'}
+    if [[ ! "$current_pid" =~ ^[1-9][0-9]*$ ]]; then
+      echo "无法读取 $service 的有效 MainPID: $current_pid" >&2
+      return 1
+    fi
+    if [[ "$stable_samples" == 1 ]]; then
+      first_pid=$current_pid
+    elif [[ "$current_pid" != "$first_pid" ]]; then
+      echo "$service 的 MainPID 在稳定窗口内变化: $first_pid -> $current_pid" >&2
+      return 1
+    fi
+    if [[ ! "$current_restarts" =~ ^[0-9]+$ ]] || (( current_restarts != 0 )); then
+      echo "$service 在稳定窗口内发生重启: NRestarts=$current_restarts" >&2
+      return 1
+    fi
+    if (( stable_samples < required_stable_samples )); then
+      sleep "$health_interval"
+    fi
+  done
+
+  if [[ "$run_app_probe" == true ]]; then
+    if ! "$current_link/y2b" maintenance status --database "$database" --json >/dev/null; then
+      echo "$service 应用级探针失败: maintenance status 无法正常返回" >&2
+      return 1
+    fi
+  fi
+
+  "$systemctl_cmd" --no-pager --full status "$service"
 }
 
 release_hold() {
@@ -388,7 +449,7 @@ rollback_on_error() {
       elif ! "$systemctl_cmd" start "$service"; then
         echo "旧 release 启动失败" >&2
         rollback_ok=false
-      elif ! wait_for_service; then
+      elif ! wait_for_service false; then
         echo "旧 release 启动后未通过健康检查" >&2
         rollback_ok=false
       fi
