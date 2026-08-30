@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
@@ -85,6 +85,38 @@ impl ProcessDrainFailure {
     }
 }
 
+/// 总超时触发时，直接子进程（及其进程组）被终止；已捕获的输出和真实耗时随错误
+/// 保留，供 Pi 审计回收供应商已经返回但本地尚未落账的 token/费用。
+#[derive(Debug, Error)]
+#[error("子进程超时: {detail}")]
+pub struct ProcessTimeoutFailure {
+    detail: String,
+    output: ProcessOutput,
+}
+
+impl ProcessTimeoutFailure {
+    pub fn output(&self) -> &ProcessOutput {
+        &self.output
+    }
+}
+
+/// 从错误里取回各失败路径携带的已捕获输出（供审计恢复 token/费用）。
+pub fn process_error_output(error: &anyhow::Error) -> Option<&ProcessOutput> {
+    error
+        .downcast_ref::<ProcessFailure>()
+        .map(ProcessFailure::output)
+        .or_else(|| {
+            error
+                .downcast_ref::<ProcessDrainFailure>()
+                .map(ProcessDrainFailure::output)
+        })
+        .or_else(|| {
+            error
+                .downcast_ref::<ProcessTimeoutFailure>()
+                .map(ProcessTimeoutFailure::output)
+        })
+}
+
 /// `run_monitored` future 被 `try_join!` 等调用方取消时，Tokio 的
 /// `kill_on_drop` 只保证终止直接子进程，无法覆盖 yt-dlp PyInstaller 启动器 fork
 /// 出来的后代。用独立进程组的 RAII guard 补齐取消路径，避免孤儿下载继续写
@@ -115,6 +147,24 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
+fn take_captured(
+    stdout_capture: &Arc<Mutex<Vec<u8>>>,
+    stderr_capture: &Arc<Mutex<Vec<u8>>>,
+    started: Instant,
+    peak: u64,
+) -> ProcessOutput {
+    let out = std::mem::take(&mut *stdout_capture.lock().unwrap());
+    let err = std::mem::take(&mut *stderr_capture.lock().unwrap());
+    let stdout = String::from_utf8_lossy(&out).to_string();
+    let stderr = String::from_utf8_lossy(&err).to_string();
+    ProcessOutput {
+        stdout,
+        stderr,
+        duration_ms: started.elapsed().as_millis() as i64,
+        peak_rss_kib: peak,
+    }
+}
+
 pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<ProcessOutput> {
     command
         .stdout(Stdio::piped())
@@ -138,14 +188,19 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
     let mut stderr_task =
         tokio::spawn(async move { read_capped(&mut stderr, &stderr_buffer).await });
     let started = Instant::now();
-    let mut sys = System::new();
-    let (status, peak) = match tokio::time::timeout(timeout, async {
-        let mut peak = 0u64;
+    let peak_cell = Arc::new(Mutex::new(0u64));
+    let peak_holder = Arc::clone(&peak_cell);
+    let status = match tokio::time::timeout(timeout, async {
+        let mut sys = System::new();
+        let mut peak_value = 0u64;
         let mut ticker = tokio::time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
-                _ = ticker.tick() => { peak = peak.max(process_tree_rss(pid, &mut sys)); }
-                status = child.wait() => return Ok::<(std::process::ExitStatus, u64), anyhow::Error>((status?, peak)),
+                _ = ticker.tick() => {
+                    peak_value = peak_value.max(process_tree_rss(pid, &mut sys));
+                    *peak_holder.lock().unwrap() = peak_value;
+                }
+                status = child.wait() => return status.context("等待子进程退出失败"),
             }
         }
     })
@@ -162,9 +217,16 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
             let _ = stdout_task.await;
             let _ = stderr_task.await;
             let _ = child.wait().await;
-            bail!("子进程超时: {}s", timeout.as_secs());
+            let peak = *peak_cell.lock().unwrap();
+            let output = take_captured(&stdout_capture, &stderr_capture, started, peak);
+            return Err(ProcessTimeoutFailure {
+                detail: format!("{}s", timeout.as_secs()),
+                output,
+            }
+            .into());
         }
     };
+    let peak = *peak_cell.lock().unwrap();
     // 直接子进程退出并不代表管道已经关闭：PyInstaller 启动的后代可能继续持有
     // stdout/stderr。宽限期从直接子进程退出时独立起算，不能被总超时的剩余预算截短。
     let drain_deadline = tokio::time::Instant::now() + PIPE_DRAIN_TIMEOUT;
@@ -210,16 +272,7 @@ pub async fn run_monitored(mut command: Command, timeout: Duration) -> Result<Pr
     }
     // 直接子进程已退出，且 reader 均已完成或显式 abort；此后不会再改动捕获缓冲。
     process_group.disarm();
-    let out = std::mem::take(&mut *stdout_capture.lock().unwrap());
-    let err = std::mem::take(&mut *stderr_capture.lock().unwrap());
-    let stdout = String::from_utf8_lossy(&out).to_string();
-    let stderr = String::from_utf8_lossy(&err).to_string();
-    let output = ProcessOutput {
-        stdout,
-        stderr,
-        duration_ms: started.elapsed().as_millis() as i64,
-        peak_rss_kib: peak,
-    };
+    let output = take_captured(&stdout_capture, &stderr_capture, started, peak);
     if stdout_incomplete {
         return Err(ProcessDrainFailure {
             detail: format!(
@@ -365,6 +418,23 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn timeout_preserves_captured_output_and_duration_for_audit() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '{\"type\":\"agent_end\"}'; printf 'provider stderr' >&2; sleep 30",
+        ]);
+        let error = run_monitored(command, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        let failure = error.downcast_ref::<ProcessTimeoutFailure>().unwrap();
+        assert!(failure.output().stdout.contains("agent_end"));
+        assert!(failure.output().stderr.contains("provider stderr"));
+        assert!(failure.output().duration_ms > 0);
+        assert!(error.to_string().contains("子进程超时"));
     }
 
     #[tokio::test]
