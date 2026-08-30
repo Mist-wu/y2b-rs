@@ -1526,8 +1526,40 @@ elif [[ ${1:-} == start ]]; then
   fi
   printf 'start:%s:%s\n' "$target" "$content" >>"$DEPLOY_TEST_EVENTS"
 elif [[ ${1:-} == is-active ]]; then
+  if [[ "$DEPLOY_TEST_SCENARIO" == health_exit && "$target" == "releases/bbbbbbbbbbbb" ]]; then
+    count=0
+    [[ ! -f "$DEPLOY_TEST_ISACTIVE_COUNT" ]] || count=$(<"$DEPLOY_TEST_ISACTIVE_COUNT")
+    ((count += 1))
+    printf '%s\n' "$count" >"$DEPLOY_TEST_ISACTIVE_COUNT"
+    if (( count >= 3 )); then
+      exit 3
+    fi
+  fi
   [[ $(<"$DEPLOY_TEST_SERVICE_STATE") == active ]] && exit 0
   exit 3
+elif [[ ${1:-} == show ]]; then
+  pid=${DEPLOY_TEST_MAINPID:-4242}
+  restarts=${DEPLOY_TEST_NRESTARTS:-0}
+  if [[ "$target" == "releases/bbbbbbbbbbbb" ]]; then
+    case "$DEPLOY_TEST_SCENARIO" in
+      health_pid_change)
+        if [[ -f "$DEPLOY_TEST_HEALTH_SAMPLE" ]]; then
+          pid=4243
+        else
+          printf 'sampled\n' >"$DEPLOY_TEST_HEALTH_SAMPLE"
+        fi
+        ;;
+      health_restart)
+        if [[ -f "$DEPLOY_TEST_HEALTH_SAMPLE" ]]; then
+          restarts=1
+        else
+          printf 'sampled\n' >"$DEPLOY_TEST_HEALTH_SAMPLE"
+        fi
+        ;;
+    esac
+  fi
+  printf '%s\n' "$pid"
+  printf '%s\n' "$restarts"
 elif [[ "$line" == *" status "* ]]; then
   [[ $(<"$DEPLOY_TEST_SERVICE_STATE") == active ]] && exit 0
   exit 3
@@ -1723,6 +1755,15 @@ PY
                 .env("Y2B_IDLE_MAX_CHECKS", idle_max_checks.to_string())
                 .env("Y2B_HEALTH_INTERVAL_SECONDS", "0")
                 .env("Y2B_HEALTH_MAX_CHECKS", "2")
+                .env("Y2B_HEALTH_WINDOW_SECONDS", "0")
+                .env(
+                    "DEPLOY_TEST_HEALTH_SAMPLE",
+                    self.state_dir.join("health-sample"),
+                )
+                .env(
+                    "DEPLOY_TEST_ISACTIVE_COUNT",
+                    self.state_dir.join("isactive-count"),
+                )
                 .env("Y2B_HOLD_LEASE_SECONDS", "60")
                 .env("Y2B_RELEASE_KEEP", "5")
                 .env("DEPLOY_TEST_SCENARIO", self.scenario)
@@ -1926,6 +1967,52 @@ PY
             .find(&format!("release:releases/{OLD_DEPLOY_REVISION}"))
             .unwrap();
         assert!(new_start < old_start && old_start < release, "{events}");
+    }
+
+    fn assert_health_window_failure_rolls_back(scenario: &'static str) {
+        let fixture = deploy_fixture(scenario);
+        let output = fixture.run(3);
+        assert!(!output.status.success(), "{}", output_detail(&output));
+        assert_eq!(
+            fs::read_link(&fixture.current).unwrap(),
+            PathBuf::from(format!("releases/{OLD_DEPLOY_REVISION}"))
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.database).unwrap(),
+            "old-database\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "active\n"
+        );
+        assert!(!fixture.hold.exists());
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        let new_start = events
+            .find(&format!(
+                "start:releases/{NEW_DEPLOY_REVISION}:new-database"
+            ))
+            .unwrap();
+        let old_start = events
+            .find(&format!(
+                "start:releases/{OLD_DEPLOY_REVISION}:old-database"
+            ))
+            .unwrap();
+        assert!(new_start < old_start, "{events}");
+    }
+
+    #[test]
+    fn deploy_health_check_fails_when_process_restarts_in_window() {
+        assert_health_window_failure_rolls_back("health_restart");
+    }
+
+    #[test]
+    fn deploy_health_check_fails_when_process_exits_in_window() {
+        assert_health_window_failure_rolls_back("health_exit");
+    }
+
+    #[test]
+    fn deploy_health_check_fails_when_mainpid_changes() {
+        assert_health_window_failure_rolls_back("health_pid_change");
     }
 
     #[test]
@@ -2357,6 +2444,7 @@ case "$1" in
     fi
     printf 'active\n' >"$RESTORE_TEST_SERVICE_STATE"
     ;;
+  show) printf '4242\n0\n' ;;
   *) exit 2 ;;
 esac
 "#,
@@ -2376,6 +2464,7 @@ case "${1:-}" in
     printf '%sv__CURRENT_SCHEMA__' "$prefix" >"$database"
     printf '__CURRENT_SCHEMA__\n'
     ;;
+  maintenance) exit 0 ;;
   *) exit 2 ;;
 esac
 "#
@@ -2423,6 +2512,9 @@ esac
                 .env("Y2B_SQLITE3", sqlite3)
                 .env("Y2B_SYSTEMCTL", &self.systemctl)
                 .env("Y2B_BIN", &self.y2b)
+                .env("Y2B_HEALTH_INTERVAL_SECONDS", "0")
+                .env("Y2B_HEALTH_WINDOW_SECONDS", "0")
+                .env("Y2B_HEALTH_MAX_CHECKS", "2")
                 .env("RESTORE_TEST_SERVICE_STATE", &self.service_state)
                 .env("RESTORE_TEST_SYSTEMCTL_LOG", &self.systemctl_log)
                 .env("RESTORE_TEST_Y2B_LOG", &self.y2b_log)
@@ -2558,6 +2650,40 @@ esac
         );
         let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
         assert!(calls.matches("start\n").count() >= 2);
+    }
+
+    #[test]
+    fn restore_requires_stable_window_before_declaring_success() {
+        let fixture = restore_fixture(true);
+        let database = fixture.state_dir.join("state.db");
+        let old = format!("old-v{CURRENT_SCHEMA_VERSION}");
+        fs::write(&database, &old).unwrap();
+        fs::write(&fixture.backup, format!("new-v{CURRENT_SCHEMA_VERSION}")).unwrap();
+
+        let output = fixture.run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(database).unwrap(),
+            format!("new-v{CURRENT_SCHEMA_VERSION}")
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "active\n"
+        );
+        let calls = fs::read_to_string(&fixture.systemctl_log).unwrap();
+        assert!(
+            calls.matches("show\n").count() >= 2,
+            "稳定窗口未采样: {calls}"
+        );
+        let y2b_calls = fs::read_to_string(&fixture.y2b_log).unwrap();
+        assert!(
+            y2b_calls.contains("maintenance status --database "),
+            "{y2b_calls}"
+        );
     }
 
     #[tokio::test]
