@@ -216,7 +216,8 @@ else
     echo "捕获旧 release 需要 sha256sum" >&2
     exit 1
   }
-  maintenance_y2b="$bin_link"
+  # 旧扁平布局没有可执行 maintenance 的上一版 release；维护相关操作必须用新上传的二进制。
+  maintenance_y2b="$binary"
   legacy_capture_required=true
 fi
 
@@ -410,23 +411,54 @@ rollback_on_error() {
     echo "自动回滚未完整成功，请保持服务停止并按迁移前备份手工恢复: ${migration_backup:-尚未生成}" >&2
     status=1
   elif [[ "$rollback_required" == true ]]; then
-    echo "成对回滚完成，旧 release 已通过健康检查，maintenance hold 已释放" >&2
+    if [[ "$bootstrap_deploy" == true ]]; then
+      echo "成对回滚完成，旧 release 已通过健康检查" >&2
+    else
+      echo "成对回滚完成，旧 release 已通过健康检查，maintenance hold 已释放" >&2
+    fi
   fi
   exit "$status"
 }
 trap rollback_on_error EXIT
 trap 'exit 130' INT TERM
 
-# 先获取维护锁，之后所有 status 都带 owner，避免被自己的锁误判为 blocker。
-hold_acquired=true
-if ! "$maintenance_y2b" maintenance acquire \
-  --database "$database" \
-  --owner "$owner" \
-  --reason "部署 release $revision" \
-  --lease-seconds "$hold_lease_seconds"; then
-  hold_acquired=false
-  echo "无法获取 maintenance hold" >&2
+# 自举检测：维护锁依赖当前 schema 的 maintenance_hold 表，而迁移发生在停服务之后。
+# 一旦数据库 schema 低于当前版本，锁在本次部署中不可用，只能走一次性自举路径；
+# 迁移完成后 schema 达到当前版本，后续部署会自动回到完整 hold 路径，不会退化成后门。
+bootstrap_deploy=false
+current_schema_version=$("$binary" schema-version)
+db_schema_version=$("$sqlite3_cmd" "$database" \
+  'SELECT COALESCE(MAX(version),0) FROM schema_migrations;')
+[[ "$current_schema_version" =~ ^[1-9][0-9]*$ ]] || {
+  echo "新二进制返回的 schema 版本无效: $current_schema_version" >&2
+  exit 2
+}
+[[ "$db_schema_version" =~ ^[0-9]+$ ]] || {
+  echo "无法读取数据库 schema 版本: $db_schema_version" >&2
   exit 1
+}
+if (( db_schema_version < current_schema_version )); then
+  bootstrap_deploy=true
+fi
+
+if [[ "$bootstrap_deploy" == true ]]; then
+  echo "自举部署: 数据库 schema v${db_schema_version} 低于当前 v${current_schema_version}，" >&2
+  echo "维护锁需要 schema v$current_schema_version 的 maintenance_hold 表，而迁移发生在停服务之后，" >&2
+  echo "因此本次无法使用维护锁，存在与线上任务并发的 TOCTOU 窗口。" >&2
+  echo "本次回退到 jobs.status / stage_runs.status 做两次连续空闲判定，" >&2
+  echo "仍保留迁移前备份校验、原子切换与成对回滚；迁移完成后所有部署必须走完整 hold 路径。" >&2
+else
+  # 先获取维护锁，之后所有 status 都带 owner，避免被自己的锁误判为 blocker。
+  hold_acquired=true
+  if ! "$maintenance_y2b" maintenance acquire \
+    --database "$database" \
+    --owner "$owner" \
+    --reason "部署 release $revision" \
+    --lease-seconds "$hold_lease_seconds"; then
+    hold_acquired=false
+    echo "无法获取 maintenance hold" >&2
+    exit 1
+  fi
 fi
 
 print_blockers() {
@@ -475,7 +507,43 @@ wait_for_two_idle_checks() {
   return 1
 }
 
-wait_for_two_idle_checks
+# 自举模式的空闲判定不依赖 maintenance_hold 表，直接读 v17 就存在的
+# jobs.status / stage_runs.status，判定逻辑与 maintenance status 保持一致。
+wait_for_two_idle_checks_bootstrap() {
+  local checks=0
+  local consecutive=0
+  local jobs_busy stages_running
+
+  while (( checks < idle_max_checks )); do
+    ((checks += 1))
+    jobs_busy=$("$sqlite3_cmd" "$database" \
+      "SELECT COUNT(*) FROM jobs WHERE status IN('inspecting','processing','downloading','segmenting','translating','rendering','uploading');")
+    stages_running=$("$sqlite3_cmd" "$database" \
+      "SELECT COUNT(*) FROM stage_runs WHERE status='running';")
+    if [[ "$jobs_busy" == 0 && "$stages_running" == 0 ]]; then
+      ((consecutive += 1))
+      echo "自举空闲连续检查: $consecutive/2"
+      if (( consecutive == 2 )); then
+        return
+      fi
+    else
+      consecutive=0
+      echo "数据库仍有存量工作，继续等待（${checks}/${idle_max_checks}）jobs=$jobs_busy stages=$stages_running" >&2
+    fi
+    if (( checks < idle_max_checks )); then
+      sleep "$idle_interval"
+    fi
+  done
+
+  echo "等待两次连续自举空闲超时，拒绝继续部署" >&2
+  return 1
+}
+
+if [[ "$bootstrap_deploy" == true ]]; then
+  wait_for_two_idle_checks_bootstrap
+else
+  wait_for_two_idle_checks
+fi
 
 install -d -m 0755 "$releases_dir"
 
@@ -530,8 +598,10 @@ install -m 0644 "$root_dir/deploy/y2b-watch.service" "$staging_dir/deploy/y2b-wa
 release_created=true
 
 # 服务停止前完成迁移前快照及严格完整性校验；缺文件或非单行 ok 都立即拒绝。
-"$maintenance_y2b" maintenance renew \
-  --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
+if [[ "$bootstrap_deploy" != true ]]; then
+  "$maintenance_y2b" maintenance renew \
+    --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
+fi
 install -d -m 0700 "$backup_dir"
 backup_temp=$(mktemp "$backup_dir/.state-before-${revision}-${deployment_timestamp}.XXXXXXXX")
 rm -f -- "$backup_temp"
@@ -566,11 +636,15 @@ atomic_set_current "releases/$revision"
 
 # current 和数据库必须视为一对：从这里开始任何错误都由 EXIT trap 同时恢复。
 "$current_link/y2b" migrate --database "$database"
-"$current_link/y2b" maintenance renew \
-  --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
+if [[ "$bootstrap_deploy" != true ]]; then
+  "$current_link/y2b" maintenance renew \
+    --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
+fi
 "$current_link/y2b" --config "$config_file" check --write-baseline
-"$current_link/y2b" maintenance renew \
-  --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
+if [[ "$bootstrap_deploy" != true ]]; then
+  "$current_link/y2b" maintenance renew \
+    --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
+fi
 
 install -m 0644 "$current_link/deploy/y2b-watch.service" "$unit_temp"
 "$mv_cmd" -Tf -- "$unit_temp" "$unit_path"
@@ -628,7 +702,9 @@ remove_quarantines
 cleanup_temporary_files
 # 健康检查后的最终窗口不再接受中断：先释放 hold，紧接着解除 EXIT 回滚 trap。
 trap '' INT TERM
-release_hold
+if [[ "$bootstrap_deploy" != true ]]; then
+  release_hold
+fi
 deployment_complete=true
 trap - EXIT INT TERM
 
