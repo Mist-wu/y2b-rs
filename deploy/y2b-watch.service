@@ -12,7 +12,12 @@ Environment=PI_CODING_AGENT_DIR=/var/lib/y2b/pi-agent
 EnvironmentFile=/etc/y2b/y2b.env
 UnsetEnvironment=DEEPSEEK_API_KEY
 Environment=RUST_LOG=y2b_rs=info
-ExecStart=/usr/local/bin/y2b --config /etc/y2b/config.toml watch
+# /opt/y2b/pi 是 deploy-app.sh 建立的 current/pi 兼容链接；启动前同时验证 release 资源完整。
+ExecStartPre=/usr/bin/test -r /opt/y2b/current/pi/y2b-extension.ts
+ExecStartPre=/usr/bin/test -r /opt/y2b/current/pi/policy.json
+ExecStartPre=/usr/bin/test -r /opt/y2b/current/pi/audit-policy.json
+ExecStartPre=/usr/bin/test -r /opt/y2b/current/pi/brawl-stars-glossary.json
+ExecStart=/opt/y2b/current/y2b --config /etc/y2b/config.toml watch
 Restart=on-failure
 RestartSec=15s
 MemoryAccounting=yes
