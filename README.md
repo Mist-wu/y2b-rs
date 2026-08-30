@@ -245,7 +245,7 @@ y2b maintenance release --database /var/lib/y2b/state.db --owner "$owner"
 5. 停服务，以临时符号链接和单次 `mv -T` 原子切换 `/opt/y2b/current`，再依次执行显式迁移、`y2b check --write-baseline`、启动和健康检查。systemd 直接执行 `/opt/y2b/current/y2b`，Pi 兼容路径也经 `current/pi` 解析。
 6. 健康检查成功后才释放 hold。脚本保留当前版、上一版和若干旧 release；超出上限时只按修改时间清理名称符合十六进制 revision 规则的真实目录，不跟随符号链接。
 
-数据库 schema 低于当前二进制版本时（例如首次从 v17 的旧扁平布局升级），维护锁在本次部署中不可用：`maintenance acquire` 要求精确匹配当前 schema，而迁移只能发生在停服务之后。此时脚本进入一次性自举部署——明确打印无法使用维护锁及因此存在的 TOCTOU 窗口，回退到 v17 就存在的 `jobs.status` / `stage_runs.status` 做两次连续空闲判定，并保留迁移前备份校验、原子切换与成对回滚。迁移完成后 schema 达到当前版本，后续所有部署都会自动回到完整 maintenance hold 路径，不会再退化。
+自举只在维护锁的落点表 `maintenance_hold` 确实不存在时触发（例如首次从 v17 的旧扁平布局升级）：锁依赖这张表，而建表迁移只能发生在停服务之后。此时脚本进入自举部署——明确打印无法使用维护锁及因此存在的 TOCTOU 窗口，回退到 v17 就存在的 `jobs.status` / `stage_runs.status` 做两次连续空闲判定，第二次 idle 通过后立即停服并确认 inactive 再生成迁移前快照，仍保留迁移前备份校验、原子切换与成对回滚。只要 `maintenance_hold` 表已存在，即使 schema 仍比当前二进制旧，也必须走完整 maintenance hold 路径，不会因后续 schema 升级重新打开无锁窗口。
 
 回滚的最小单位是 **release + 数据库**，绝不能只切回 symlink。停服务之后任一步失败，EXIT trap 都会先确保新服务退出，再把 `current` 原子切回上一 release、从迁移前快照原子恢复数据库并清理 WAL/SHM，随后用旧二进制重新执行 `check`、启动旧服务并确认 active，最后释放 hold。只有这套成对回滚能满足精确 schema 匹配；若旧服务健康检查也失败，脚本保持非零退出并保留迁移前备份供人工处理。从旧的固定路径布局首次升级时，脚本会先只读捕获旧二进制、Pi 资源和 `Cargo.lock` 为回滚 release；旧文件集不完整则在停服务前拒绝部署。
 
