@@ -78,7 +78,7 @@ pub(crate) const UPLOAD_CLAIM_KIND: &str = "upload";
 pub const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
 pub const BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
 /// 当前二进制能够完整理解的数据库迁移版本。
-pub const CURRENT_SCHEMA_VERSION: i64 = 19;
+pub const CURRENT_SCHEMA_VERSION: i64 = 20;
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -450,9 +450,37 @@ impl Database {
             "#,
         )?;
         self.conn().execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(19,CURRENT_TIMESTAMP)",
+            [],
+        )?;
+        // v20: 一个 BVID 只能归属一个任务。NULL 表示尚未投稿，不参与唯一性约束。
+        // 先单独检查历史重复值，避免把 SQLite 的索引错误直接暴露给运维人员。
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let duplicate: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT bvid,COUNT(*) FROM jobs WHERE bvid IS NOT NULL \
+                 GROUP BY bvid HAVING COUNT(*)>1 ORDER BY bvid LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((bvid, count)) = duplicate {
+            anyhow::bail!(
+                "迁移 v20 失败：jobs.bvid={bvid:?} 已被 {count} 个任务重复占用，请先人工修复重复 BVID"
+            )
+        }
+        tx.execute_batch(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_bvid_unique
+              ON jobs(bvid) WHERE bvid IS NOT NULL;
+            "#,
+        )?;
+        tx.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,CURRENT_TIMESTAMP)",
             [CURRENT_SCHEMA_VERSION],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1200,6 +1228,16 @@ impl Database {
             [bvid],
         )
     }
+
+    /// 核对投稿时确认候选 BVID 没有归属于另一个任务。
+    pub fn bvid_owned_by_other_job(&self, id: &str, bvid: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE bvid=? AND id<>?)",
+            params![bvid, id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// 已投稿且待补 CC 字幕的任务：完成或已直传待补字幕，且有 BVID。
     pub fn jobs_awaiting_subtitle(&self) -> Result<Vec<Job>> {
         let c = self.conn();
@@ -1574,6 +1612,20 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(Some(attempt_id))
+    }
+
+    /// 返回当前不确定投稿 attempt 的开始时间，供创作中心核对时间窗。
+    pub fn uncertain_upload_started_at(&self, id: &str) -> Result<Option<DateTime<Utc>>> {
+        let started_at = self
+            .conn()
+            .query_row(
+                "SELECT started_at FROM upload_attempts \
+                 WHERE job_id=? AND status='uncertain' ORDER BY started_at DESC LIMIT 1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        started_at.map(parse).transpose().map_err(Into::into)
     }
 
     /// biliup 明确返回成功后，把 attempt、任务终态和投稿冷却放在同一事务提交。
@@ -2628,6 +2680,125 @@ mod tests {
             db.get_job("job-v3").unwrap().unwrap().transfer_mode,
             TransferMode::Translated
         );
+    }
+
+    #[test]
+    fn migrates_v19_without_losing_jobs_or_bvids() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("v19.db");
+        let old = Database::open(&path).unwrap();
+        let id = old
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "v19-video",
+                url: "https://youtu.be/v19-video",
+                title: Some("v19 保留稿件"),
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        old.set_job_bvid(&id, "BV1uxE16ZE7e").unwrap();
+        old.conn()
+            .execute_batch(
+                "DROP INDEX idx_jobs_bvid_unique; \
+                 DELETE FROM schema_migrations WHERE version=20;",
+            )
+            .unwrap();
+        drop(old);
+
+        let migrated = Database::open(&path).unwrap();
+        assert_eq!(migrated.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        let job = migrated.get_job(&id).unwrap().unwrap();
+        assert_eq!(job.title.as_deref(), Some("v19 保留稿件"));
+        assert_eq!(job.bvid.as_deref(), Some("BV1uxE16ZE7e"));
+        let index_exists: bool = migrated
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type='index' AND name='idx_jobs_bvid_unique')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_exists);
+    }
+
+    #[test]
+    fn v20_migration_reports_duplicate_bvid_before_creating_index() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("v19-duplicate-bvid.db");
+        let old = Database::open(&path).unwrap();
+        let mut ids = Vec::new();
+        for video_id in ["duplicate-one", "duplicate-two"] {
+            ids.push(
+                old.create_job(NewJob {
+                    channel_id: None,
+                    video_id,
+                    url: &format!("https://youtu.be/{video_id}"),
+                    title: None,
+                    published: None,
+                    updated: None,
+                    transfer_mode: TransferMode::Direct,
+                })
+                .unwrap()
+                .unwrap(),
+            );
+        }
+        old.conn()
+            .execute_batch(
+                "DROP INDEX idx_jobs_bvid_unique; \
+                 DELETE FROM schema_migrations WHERE version=20;",
+            )
+            .unwrap();
+        old.conn()
+            .execute(
+                "UPDATE jobs SET bvid='BV1uxE16ZE7e' WHERE id IN (?,?)",
+                params![&ids[0], &ids[1]],
+            )
+            .unwrap();
+        drop(old);
+
+        let error = match Database::open(&path) {
+            Ok(_) => panic!("重复 BVID 不应迁移成功"),
+            Err(error) => error,
+        };
+        let detail = error.to_string();
+        assert!(detail.contains("迁移 v20 失败"), "{detail}");
+        assert!(detail.contains("BV1uxE16ZE7e"), "{detail}");
+        assert!(detail.contains("2 个任务重复占用"), "{detail}");
+    }
+
+    #[test]
+    fn jobs_bvid_is_unique_but_allows_multiple_nulls() {
+        let t = tempfile::tempdir().unwrap();
+        let db = Database::open(&t.path().join("unique-bvid.db")).unwrap();
+        let mut ids = Vec::new();
+        for video_id in ["null-bvid-one", "null-bvid-two"] {
+            ids.push(
+                db.create_job(NewJob {
+                    channel_id: None,
+                    video_id,
+                    url: &format!("https://youtu.be/{video_id}"),
+                    title: None,
+                    published: None,
+                    updated: None,
+                    transfer_mode: TransferMode::Direct,
+                })
+                .unwrap()
+                .unwrap(),
+            );
+        }
+        assert!(
+            ids.iter()
+                .all(|id| db.get_job(id).unwrap().unwrap().bvid.is_none())
+        );
+
+        db.set_job_bvid(&ids[0], "BV1uxE16ZE7e").unwrap();
+        let error = db.set_job_bvid(&ids[1], "BV1uxE16ZE7e").unwrap_err();
+        assert!(error.to_string().contains("UNIQUE constraint failed"));
+        assert!(db.get_job(&ids[1]).unwrap().unwrap().bvid.is_none());
     }
 
     #[test]
