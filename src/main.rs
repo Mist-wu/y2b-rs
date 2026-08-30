@@ -1403,6 +1403,24 @@ elif [[ "$line" == *" schema-version "* ]]; then
 elif [[ "$line" == *" check "* ]]; then
   content=$(<"$DEPLOY_TEST_DATABASE")
   record_event "check:$target:$content"
+  if [[ "$line" == *" --write-baseline "* ]]; then
+    baseline="$DEPLOY_TEST_BASELINE"
+    previous_y2b=
+    previous_external=
+    if [[ -f "$baseline" ]]; then
+      previous_y2b=$(sed -n 's/^y2b=//p' "$baseline")
+      previous_external=$(sed -n 's/^external=//p' "$baseline")
+    fi
+    # 模拟真实 check 的两类基线条目：外部依赖漂移是必选失败，y2b 自身漂移仅告警。
+    if [[ -n "$previous_external" && "$previous_external" != "external-stable" ]]; then
+      echo "FAIL dependency baseline 漂移: external" >&2
+      exit 1
+    fi
+    if [[ -n "$previous_y2b" && "$previous_y2b" != "$target" ]]; then
+      record_event 'baseline:y2b-drift-tolerated'
+    fi
+    printf 'y2b=%s\nexternal=external-stable\n' "$target" >"$baseline"
+  fi
 else
   echo "未预期的 y2b 参数: $*" >&2
   exit 2
@@ -1722,6 +1740,10 @@ PY
                 .env("DEPLOY_TEST_SERVICE_STATE", &self.service_state)
                 .env("DEPLOY_TEST_SYSTEMCTL_LOG", &self.systemctl_log)
                 .env("DEPLOY_TEST_EVENTS", &self.events)
+                .env(
+                    "DEPLOY_TEST_BASELINE",
+                    self.state_dir.join("dependency-baseline"),
+                )
                 .env("DEPLOY_TEST_Y2B_LOG", self.state_dir.join("y2b.log"));
             command
         }
@@ -1888,6 +1910,94 @@ PY
             .find(&format!("release:releases/{OLD_DEPLOY_REVISION}"))
             .unwrap();
         assert!(new_start < old_start && old_start < release, "{events}");
+    }
+
+    #[test]
+    fn deploy_rejects_when_external_dependency_drifts() {
+        let fixture = deploy_fixture("success");
+        fs::write(
+            fixture.state_dir.join("dependency-baseline"),
+            "y2b=releases/000000000000\nexternal=external-drifted\n",
+        )
+        .unwrap();
+        let output = fixture.run(3);
+        assert!(!output.status.success());
+        let detail = output_detail(&output);
+        assert!(
+            detail.contains("FAIL dependency baseline 漂移: external"),
+            "{detail}"
+        );
+        assert!(detail.contains("自动回滚未完整成功"), "{detail}");
+        // 外部依赖被偷换必须拦住部署：current 回滚到旧 release，数据库恢复，服务保持停止。
+        assert_eq!(
+            fs::read_link(&fixture.current).unwrap(),
+            PathBuf::from(format!("releases/{OLD_DEPLOY_REVISION}"))
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.database).unwrap(),
+            "old-database\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "inactive\n"
+        );
+    }
+
+    #[test]
+    fn deploy_continues_when_only_the_deployed_binary_drifts() {
+        let fixture = deploy_fixture("success");
+        fs::write(
+            fixture.state_dir.join("dependency-baseline"),
+            "y2b=releases/000000000000\nexternal=external-stable\n",
+        )
+        .unwrap();
+        let output = fixture.run(3);
+        assert!(output.status.success(), "{}", output_detail(&output));
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(events.contains("baseline:y2b-drift-tolerated"), "{events}");
+        assert_eq!(
+            fs::read_link(&fixture.current).unwrap(),
+            PathBuf::from(format!("releases/{NEW_DEPLOY_REVISION}"))
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.database).unwrap(),
+            "new-database\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "active\n"
+        );
+        assert!(!fixture.hold.exists());
+    }
+
+    #[test]
+    fn deploy_rollback_reports_success_when_only_y2b_drifts_from_baseline() {
+        let fixture = deploy_fixture("health_failure");
+        let output = fixture.run(3);
+        assert!(!output.status.success());
+        let detail = output_detail(&output);
+        assert!(
+            detail.contains("成对回滚完成，旧 release 已通过健康检查"),
+            "{detail}"
+        );
+        assert!(!detail.contains("自动回滚未完整成功"), "{detail}");
+        // 回滚切回旧 release 后，其 y2b 身份与部署写入的新基线不一致；门禁必须只当告警，
+        // 否则旧 release 的 check 会失败，脚本会误报“自动回滚未完整成功”。
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(events.contains("baseline:y2b-drift-tolerated"), "{events}");
+        assert_eq!(
+            fs::read_link(&fixture.current).unwrap(),
+            PathBuf::from(format!("releases/{OLD_DEPLOY_REVISION}"))
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.database).unwrap(),
+            "old-database\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.service_state).unwrap(),
+            "active\n"
+        );
+        assert!(!fixture.hold.exists());
     }
 
     fn observe_current_switch(
