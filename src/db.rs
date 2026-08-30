@@ -62,6 +62,47 @@ pub struct DiscoveryQuota {
     pub allowed: bool,
 }
 
+/// 全局维护锁。单例行只阻止领取新任务，不撤销已经发出的任务租约。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MaintenanceHold {
+    pub owner: String,
+    pub reason: String,
+    pub acquired_at: DateTime<Utc>,
+    pub heartbeat_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// 维护锁的获取、接管、续租和释放审计记录。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MaintenanceHoldEvent {
+    pub id: i64,
+    pub action: String,
+    pub owner: String,
+    pub previous_owner: Option<String>,
+    pub reason: String,
+    pub previous_reason: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// 维护前空闲判定中的一类阻塞项。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MaintenanceBlocker {
+    pub kind: String,
+    pub count: usize,
+    pub details: Vec<String>,
+}
+
+/// 可直接序列化给部署脚本使用的完整空闲状态。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MaintenanceStatus {
+    pub checked_at: DateTime<Utc>,
+    pub idle: bool,
+    pub hold: Option<MaintenanceHold>,
+    pub expired_hold: Option<MaintenanceHold>,
+    pub blockers: Vec<MaintenanceBlocker>,
+}
+
 /// WebSub 内部订阅信息。刻意不派生 Debug/Serialize，避免 secret 被意外写入日志。
 pub struct WebSubChannel {
     pub id: i64,
@@ -91,7 +132,7 @@ pub(crate) const UPLOAD_CLAIM_KIND: &str = "upload";
 pub const NEXT_BILIBILI_SUBMIT_AT: &str = "bilibili.next_submit_at";
 pub const BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
 /// 当前二进制能够完整理解的数据库迁移版本。
-pub const CURRENT_SCHEMA_VERSION: i64 = 21;
+pub const CURRENT_SCHEMA_VERSION: i64 = 22;
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
@@ -108,6 +149,27 @@ impl Database {
             claim_owner: Arc::from(Uuid::new_v4().to_string()),
         };
         db.migrate()?;
+        Ok(db)
+    }
+
+    /// 打开已经迁移完成的数据库，但不执行任何迁移写入。
+    ///
+    /// 维护命令会与线上服务并行查询或只更新维护锁，不能顺带重跑整套迁移。
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        anyhow::ensure!(path.is_file(), "数据库不存在: {}", path.display());
+        let conn = Connection::open(path)
+            .with_context(|| format!("打开数据库失败: {}", path.display()))?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let db = Self {
+            connection: Arc::new(Mutex::new(conn)),
+            claim_owner: Arc::from(Uuid::new_v4().to_string()),
+        };
+        let version = db.schema_version()?;
+        anyhow::ensure!(
+            version == CURRENT_SCHEMA_VERSION,
+            "数据库 schema 版本不兼容：当前 v{version}，需要 v{CURRENT_SCHEMA_VERSION}"
+        );
         Ok(db)
     }
 
@@ -518,6 +580,38 @@ impl Database {
             "#,
         )?;
         tx.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(21,CURRENT_TIMESTAMP)",
+            [],
+        )?;
+        tx.commit()?;
+        // v22: 部署和一次性旁路共用带租约的全局维护锁。锁的单例行保留最近一次
+        // 到期持有者，后续接管时可以完整记录谁接管了谁，避免崩溃后永久阻塞。
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS maintenance_hold(
+              singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+              owner TEXT NOT NULL CHECK(owner<>''),
+              reason TEXT NOT NULL,
+              acquired_at TEXT NOT NULL,
+              heartbeat_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS maintenance_hold_events(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              action TEXT NOT NULL CHECK(action IN('acquired','taken_over','renewed','released')),
+              owner TEXT NOT NULL,
+              previous_owner TEXT,
+              reason TEXT NOT NULL,
+              previous_reason TEXT,
+              occurred_at TEXT NOT NULL,
+              expires_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_maintenance_hold_events_time
+              ON maintenance_hold_events(occurred_at DESC,id DESC);
+            "#,
+        )?;
+        tx.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,CURRENT_TIMESTAMP)",
             [CURRENT_SCHEMA_VERSION],
         )?;
@@ -569,6 +663,276 @@ impl Database {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    fn maintenance_deadline(now: DateTime<Utc>, lease_seconds: i64) -> Result<DateTime<Utc>> {
+        anyhow::ensure!(lease_seconds > 0, "维护锁租约必须大于 0 秒");
+        now.checked_add_signed(chrono::Duration::seconds(lease_seconds))
+            .context("维护锁租约到期时间超出可表示范围")
+    }
+
+    /// 原子获取全局维护锁。仍有效的锁不会被覆盖；到期锁可被接管并写入审计表。
+    pub fn acquire_maintenance_hold(
+        &self,
+        owner: &str,
+        reason: &str,
+        lease_seconds: i64,
+    ) -> Result<bool> {
+        anyhow::ensure!(!owner.trim().is_empty(), "维护锁 owner 不能为空");
+        anyhow::ensure!(!reason.trim().is_empty(), "维护锁 reason 不能为空");
+        let now = Utc::now();
+        let expires_at = Self::maintenance_deadline(now, lease_seconds)?;
+        let now_text = format_timestamp(now);
+        let expires_text = format_timestamp(expires_at);
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let previous = tx
+            .query_row(
+                "SELECT owner,reason,acquired_at,heartbeat_at,expires_at \
+                 FROM maintenance_hold WHERE singleton=1",
+                [],
+                maintenance_hold_from_row,
+            )
+            .optional()?;
+        if previous.as_ref().is_some_and(|hold| hold.expires_at > now) {
+            return Ok(false);
+        }
+        let action = if previous.is_some() {
+            "taken_over"
+        } else {
+            "acquired"
+        };
+        tx.execute(
+            "INSERT INTO maintenance_hold(singleton,owner,reason,acquired_at,heartbeat_at,expires_at) \
+             VALUES(1,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET \
+             owner=excluded.owner,reason=excluded.reason,acquired_at=excluded.acquired_at,\
+             heartbeat_at=excluded.heartbeat_at,expires_at=excluded.expires_at",
+            params![owner, reason, &now_text, &now_text, &expires_text],
+        )?;
+        tx.execute(
+            "INSERT INTO maintenance_hold_events(\
+               action,owner,previous_owner,reason,previous_reason,occurred_at,expires_at\
+             ) VALUES(?,?,?,?,?,?,?)",
+            params![
+                action,
+                owner,
+                previous.as_ref().map(|hold| hold.owner.as_str()),
+                reason,
+                previous.as_ref().map(|hold| hold.reason.as_str()),
+                &now_text,
+                &expires_text
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 只有当前且尚未到期的持有者才能续租，避免旧进程在接管后复活自己的锁。
+    pub fn renew_maintenance_hold(&self, owner: &str, lease_seconds: i64) -> Result<bool> {
+        anyhow::ensure!(!owner.trim().is_empty(), "维护锁 owner 不能为空");
+        let now = Utc::now();
+        let expires_at = Self::maintenance_deadline(now, lease_seconds)?;
+        let now_text = format_timestamp(now);
+        let expires_text = format_timestamp(expires_at);
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let reason = tx
+            .query_row(
+                "UPDATE maintenance_hold SET heartbeat_at=?1,expires_at=?2 \
+                 WHERE singleton=1 AND owner=?3 AND expires_at>?1 RETURNING reason",
+                params![&now_text, &expires_text, owner],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(reason) = reason else {
+            return Ok(false);
+        };
+        tx.execute(
+            "INSERT INTO maintenance_hold_events(\
+               action,owner,reason,occurred_at,expires_at\
+             ) VALUES('renewed',?,?,?,?)",
+            params![owner, reason, &now_text, &expires_text],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 释放只按 owner 做比较删除，绝不会误删已经由另一进程接管的锁。
+    pub fn release_maintenance_hold(&self, owner: &str) -> Result<bool> {
+        anyhow::ensure!(!owner.trim().is_empty(), "维护锁 owner 不能为空");
+        let now_text = format_timestamp(Utc::now());
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let hold = tx
+            .query_row(
+                "SELECT owner,reason,acquired_at,heartbeat_at,expires_at \
+                 FROM maintenance_hold WHERE singleton=1",
+                [],
+                maintenance_hold_from_row,
+            )
+            .optional()?;
+        let Some(hold) = hold.filter(|hold| hold.owner == owner) else {
+            return Ok(false);
+        };
+        tx.execute(
+            "DELETE FROM maintenance_hold WHERE singleton=1 AND owner=?",
+            [owner],
+        )?;
+        tx.execute(
+            "INSERT INTO maintenance_hold_events(\
+               action,owner,reason,occurred_at,expires_at\
+             ) VALUES('released',?,?,?,?)",
+            params![
+                owner,
+                &hold.reason,
+                &now_text,
+                format_timestamp(hold.expires_at)
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 查询当前有效维护锁；到期行仅保留给接管审计，不再视为持有中。
+    pub fn maintenance_hold(&self) -> Result<Option<MaintenanceHold>> {
+        let hold = self
+            .conn()
+            .query_row(
+                "SELECT owner,reason,acquired_at,heartbeat_at,expires_at \
+                 FROM maintenance_hold WHERE singleton=1",
+                [],
+                maintenance_hold_from_row,
+            )
+            .optional()?;
+        Ok(hold.filter(|hold| hold.expires_at > Utc::now()))
+    }
+
+    pub fn maintenance_hold_events(&self, limit: usize) -> Result<Vec<MaintenanceHoldEvent>> {
+        let connection = self.conn();
+        let mut query = connection.prepare(
+            "SELECT id,action,owner,previous_owner,reason,previous_reason,occurred_at,expires_at \
+             FROM maintenance_hold_events ORDER BY id DESC LIMIT ?",
+        )?;
+        Ok(query
+            .query_map(
+                [i64::try_from(limit).unwrap_or(i64::MAX)],
+                maintenance_hold_event_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 返回维护所需的完整空闲快照。`owner` 可排除调用方自己持有的维护锁；
+    /// 其他持有者（尤其 live_once）仍会作为明确阻塞项返回。
+    pub fn maintenance_status(&self, owner: Option<&str>) -> Result<MaintenanceStatus> {
+        let checked_at = Utc::now();
+        let now_text = format_timestamp(checked_at);
+        let connection = self.conn();
+        let mut blockers = Vec::new();
+
+        push_maintenance_blocker(
+            &mut blockers,
+            "active_jobs",
+            query_text_rows(
+                &connection,
+                "SELECT id||':'||status FROM jobs \
+                 WHERE status IN('inspecting','processing','downloading','segmenting','translating','rendering') \
+                 ORDER BY id",
+                [],
+            )?,
+        );
+        push_maintenance_blocker(
+            &mut blockers,
+            "running_stages",
+            query_text_rows(
+                &connection,
+                "SELECT CAST(id AS TEXT)||':'||job_id||':'||stage FROM stage_runs \
+                 WHERE status='running' ORDER BY id",
+                [],
+            )?,
+        );
+        push_maintenance_blocker(
+            &mut blockers,
+            "active_claims",
+            query_text_rows(
+                &connection,
+                "SELECT id||':'||COALESCE(NULLIF(claim_kind,''),'-')||':'||\
+                   COALESCE(NULLIF(claim_owner,''),'-') FROM jobs \
+                 WHERE (NULLIF(claim_kind,'') IS NOT NULL OR NULLIF(claim_owner,'') IS NOT NULL) \
+                   AND (claim_expires_at IS NULL OR claim_expires_at>?) ORDER BY id",
+                [&now_text],
+            )?,
+        );
+        push_maintenance_blocker(
+            &mut blockers,
+            "uploading_jobs",
+            query_text_rows(
+                &connection,
+                "SELECT id||':'||video_id FROM jobs WHERE status='uploading' ORDER BY id",
+                [],
+            )?,
+        );
+        push_maintenance_blocker(
+            &mut blockers,
+            "upload_attempts",
+            query_text_rows(
+                &connection,
+                "SELECT id||':'||job_id||':'||status FROM upload_attempts \
+                 WHERE status IN('running','uncertain') ORDER BY id",
+                [],
+            )?,
+        );
+        push_maintenance_blocker(
+            &mut blockers,
+            "subtitle_attempts",
+            query_text_rows(
+                &connection,
+                "SELECT id||':'||job_id||':'||status FROM subtitle_attempts \
+                 WHERE status IN('started','uncertain') ORDER BY id",
+                [],
+            )?,
+        );
+
+        let hold_record = connection
+            .query_row(
+                "SELECT owner,reason,acquired_at,heartbeat_at,expires_at \
+                 FROM maintenance_hold WHERE singleton=1",
+                [],
+                maintenance_hold_from_row,
+            )
+            .optional()?;
+        let hold = hold_record
+            .as_ref()
+            .filter(|hold| hold.expires_at > checked_at)
+            .cloned();
+        let expired_hold = hold_record.filter(|hold| hold.expires_at <= checked_at);
+        if let Some(active_hold) = hold
+            .as_ref()
+            .filter(|hold| Some(hold.owner.as_str()) != owner)
+        {
+            let kind = if active_hold.owner.starts_with("LIVE_ONCE:") {
+                "live_once_hold"
+            } else {
+                "maintenance_hold"
+            };
+            push_maintenance_blocker(
+                &mut blockers,
+                kind,
+                vec![format!(
+                    "owner={} expires_at={} reason={}",
+                    active_hold.owner,
+                    format_timestamp(active_hold.expires_at),
+                    active_hold.reason
+                )],
+            );
+        }
+
+        Ok(MaintenanceStatus {
+            checked_at,
+            idle: blockers.is_empty(),
+            hold,
+            expired_hold,
+            blockers,
+        })
     }
 
     pub fn add_channel(
@@ -2648,6 +3012,56 @@ fn format_timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+fn maintenance_hold_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MaintenanceHold> {
+    Ok(MaintenanceHold {
+        owner: r.get(0)?,
+        reason: r.get(1)?,
+        acquired_at: parse(r.get(2)?)?,
+        heartbeat_at: parse(r.get(3)?)?,
+        expires_at: parse(r.get(4)?)?,
+    })
+}
+
+fn maintenance_hold_event_from_row(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MaintenanceHoldEvent> {
+    Ok(MaintenanceHoldEvent {
+        id: r.get(0)?,
+        action: r.get(1)?,
+        owner: r.get(2)?,
+        previous_owner: r.get(3)?,
+        reason: r.get(4)?,
+        previous_reason: r.get(5)?,
+        occurred_at: parse(r.get(6)?)?,
+        expires_at: parse_opt(r.get(7)?)?,
+    })
+}
+
+fn query_text_rows(
+    connection: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<String>> {
+    let mut query = connection.prepare(sql)?;
+    Ok(query
+        .query_map(params, |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn push_maintenance_blocker(
+    blockers: &mut Vec<MaintenanceBlocker>,
+    kind: &str,
+    details: Vec<String>,
+) {
+    if !details.is_empty() {
+        blockers.push(MaintenanceBlocker {
+            kind: kind.into(),
+            count: details.len(),
+            details,
+        });
+    }
+}
+
 fn channel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Channel> {
     let transfer_mode = TransferMode::from_str(&r.get::<_, String>(5)?).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, error.into())
@@ -2837,6 +3251,275 @@ mod tests {
             live_status: Some("not_live".into()),
             default_audio_language: Some("en".into()),
         }
+    }
+
+    fn maintenance_test_job(db: &Database, video_id: &str) -> String {
+        db.create_job(NewJob {
+            channel_id: None,
+            video_id,
+            url: &format!("https://youtu.be/{video_id}"),
+            title: None,
+            published: None,
+            updated: None,
+            transfer_mode: TransferMode::Direct,
+        })
+        .unwrap()
+        .unwrap()
+    }
+
+    fn assert_maintenance_blocker(status: &MaintenanceStatus, kind: &str, detail: &str) {
+        assert!(!status.idle);
+        let blocker = status
+            .blockers
+            .iter()
+            .find(|blocker| blocker.kind == kind)
+            .unwrap_or_else(|| panic!("缺少 {kind} 阻塞项: {:?}", status.blockers));
+        assert_eq!(blocker.count, blocker.details.len());
+        assert!(
+            blocker.details.iter().any(|value| value.contains(detail)),
+            "{kind} 未指出 {detail}: {:?}",
+            blocker.details
+        );
+    }
+
+    #[test]
+    fn maintenance_hold_acquisition_is_atomic_between_processes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("maintenance-race.db");
+        let first = Database::open(&path).unwrap();
+        let second = Database::open(&path).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_barrier = barrier.clone();
+        let second_barrier = barrier.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first
+                .acquire_maintenance_hold("deploy:first", "并发部署一", 300)
+                .unwrap()
+        });
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            second
+                .acquire_maintenance_hold("deploy:second", "并发部署二", 300)
+                .unwrap()
+        });
+        barrier.wait();
+        let acquired = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+        assert_eq!(acquired.into_iter().filter(|value| *value).count(), 1);
+
+        let reopened = Database::open_existing(&path).unwrap();
+        assert!(matches!(
+            reopened.maintenance_hold().unwrap().unwrap().owner.as_str(),
+            "deploy:first" | "deploy:second"
+        ));
+        assert_eq!(reopened.maintenance_hold_events(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expired_maintenance_hold_can_be_taken_over_with_audit() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("maintenance-takeover.db")).unwrap();
+        assert!(
+            db.acquire_maintenance_hold("deploy:old", "旧版本部署", 300)
+                .unwrap()
+        );
+        db.conn()
+            .execute(
+                "UPDATE maintenance_hold SET expires_at=? WHERE singleton=1",
+                [format_timestamp(Utc::now() - chrono::Duration::seconds(1))],
+            )
+            .unwrap();
+        assert!(db.maintenance_hold().unwrap().is_none());
+
+        assert!(
+            db.acquire_maintenance_hold("deploy:new", "接管过期部署", 300)
+                .unwrap()
+        );
+        let hold = db.maintenance_hold().unwrap().unwrap();
+        assert_eq!(hold.owner, "deploy:new");
+        let event = &db.maintenance_hold_events(1).unwrap()[0];
+        assert_eq!(event.action, "taken_over");
+        assert_eq!(event.owner, "deploy:new");
+        assert_eq!(event.previous_owner.as_deref(), Some("deploy:old"));
+        assert_eq!(event.previous_reason.as_deref(), Some("旧版本部署"));
+        assert_eq!(event.reason, "接管过期部署");
+    }
+
+    #[test]
+    fn maintenance_hold_can_be_renewed_but_not_released_by_another_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("maintenance-owner.db")).unwrap();
+        assert!(
+            db.acquire_maintenance_hold("deploy:owner", "发布维护", 1)
+                .unwrap()
+        );
+        let original_expiry = db.maintenance_hold().unwrap().unwrap().expires_at;
+        assert!(db.renew_maintenance_hold("deploy:owner", 300).unwrap());
+        assert!(
+            db.maintenance_hold().unwrap().unwrap().expires_at > original_expiry,
+            "续租没有延长到期时间"
+        );
+        assert!(!db.release_maintenance_hold("deploy:other").unwrap());
+        assert_eq!(
+            db.maintenance_hold().unwrap().unwrap().owner,
+            "deploy:owner"
+        );
+        assert!(db.release_maintenance_hold("deploy:owner").unwrap());
+        assert!(db.maintenance_hold().unwrap().is_none());
+    }
+
+    #[test]
+    fn idle_status_reports_active_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-active-job.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-active-job");
+        db.update_job_status(&id, JobStatus::Processing, None)
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "active_jobs", &format!("{id}:processing"));
+    }
+
+    #[test]
+    fn idle_status_reports_running_stage() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-running-stage.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-running-stage");
+        let stage_id = db.start_stage(&id, "render", None, None, None).unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(
+            &status,
+            "running_stages",
+            &format!("{stage_id}:{id}:render"),
+        );
+    }
+
+    #[test]
+    fn idle_status_reports_only_unexpired_nonempty_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-claim.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-claim");
+        db.conn()
+            .execute(
+                "UPDATE jobs SET claim_kind='prepare',claim_owner='worker',claim_expires_at=? \
+                 WHERE id=?",
+                params![
+                    format_timestamp(Utc::now() + chrono::Duration::minutes(1)),
+                    &id
+                ],
+            )
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "active_claims", &format!("{id}:prepare:worker"));
+
+        db.conn()
+            .execute(
+                "UPDATE jobs SET claim_expires_at=? WHERE id=?",
+                params![
+                    format_timestamp(Utc::now() - chrono::Duration::seconds(1)),
+                    &id
+                ],
+            )
+            .unwrap();
+        assert!(db.maintenance_status(None).unwrap().idle);
+    }
+
+    #[test]
+    fn idle_status_reports_uploading_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-uploading.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-uploading");
+        db.update_job_status(&id, JobStatus::Uploading, None)
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "uploading_jobs", &id);
+    }
+
+    #[test]
+    fn idle_status_reports_running_upload_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-upload-running.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-upload-running");
+        db.conn()
+            .execute(
+                "INSERT INTO upload_attempts(id,job_id,status,started_at) \
+                 VALUES('upload-running',?,'running',?)",
+                params![&id, format_timestamp(Utc::now())],
+            )
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "upload_attempts", "upload-running");
+    }
+
+    #[test]
+    fn idle_status_reports_uncertain_upload_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-upload-uncertain.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-upload-uncertain");
+        db.conn()
+            .execute(
+                "INSERT INTO upload_attempts(id,job_id,status,started_at) \
+                 VALUES('upload-uncertain',?,'uncertain',?)",
+                params![&id, format_timestamp(Utc::now())],
+            )
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "upload_attempts", "upload-uncertain");
+    }
+
+    #[test]
+    fn idle_status_reports_started_subtitle_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-subtitle-started.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-subtitle-started");
+        db.conn()
+            .execute(
+                "INSERT INTO subtitle_attempts(id,job_id,bvid,status,started_at) \
+                 VALUES('subtitle-started',?,'BV1idletest1','started',?)",
+                params![&id, format_timestamp(Utc::now())],
+            )
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "subtitle_attempts", "subtitle-started");
+    }
+
+    #[test]
+    fn idle_status_reports_uncertain_subtitle_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-subtitle-uncertain.db")).unwrap();
+        let id = maintenance_test_job(&db, "idle-subtitle-uncertain");
+        db.conn()
+            .execute(
+                "INSERT INTO subtitle_attempts(id,job_id,bvid,status,started_at) \
+                 VALUES('subtitle-uncertain',?,'BV1idletest2','uncertain',?)",
+                params![&id, format_timestamp(Utc::now())],
+            )
+            .unwrap();
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "subtitle_attempts", "subtitle-uncertain");
+    }
+
+    #[test]
+    fn idle_status_reports_live_once_lease_but_exempts_its_caller() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("idle-live-once.db")).unwrap();
+        let owner = "LIVE_ONCE:video:process";
+        assert!(
+            db.acquire_maintenance_hold(owner, "一次性直播投稿", 300)
+                .unwrap()
+        );
+        let status = db.maintenance_status(None).unwrap();
+        assert_maintenance_blocker(&status, "live_once_hold", owner);
+        assert!(db.maintenance_status(Some(owner)).unwrap().idle);
+
+        db.conn()
+            .execute(
+                "UPDATE maintenance_hold SET expires_at=? WHERE singleton=1",
+                [format_timestamp(Utc::now() - chrono::Duration::seconds(1))],
+            )
+            .unwrap();
+        let expired = db.maintenance_status(None).unwrap();
+        assert!(expired.idle);
+        assert_eq!(expired.expired_hold.unwrap().owner, owner);
     }
 
     #[test]
