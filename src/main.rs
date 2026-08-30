@@ -1477,25 +1477,7 @@ else
 fi
 "#
         .replace("__SCHEMA__", &CURRENT_SCHEMA_VERSION.to_string());
-        let old_y2b_stub = r#"#!/usr/bin/env bash
-set -euo pipefail
-printf 'old-binary args=%s\n' "$*" >>"$DEPLOY_TEST_OLD_Y2B_LOG"
-line=" $* "
-if [[ "$line" == *" maintenance "* ]]; then
-  echo "error: unrecognized subcommand 'maintenance'" >&2
-  exit 2
-fi
-if [[ "$line" == *" check "* ]]; then
-  printf 'old-check\n'
-  exit 0
-fi
-if [[ "$line" == *" config-check "* ]]; then
-  printf 'old-config-ok\n'
-  exit 0
-fi
-echo "未预期的旧版 y2b 参数: $*" >&2
-exit 2
-"#;
+        let old_y2b_stub = "#!/usr/bin/env bash\nexit 2\n";
         let candidate = bin_dir.join("y2b");
         write_executable(&candidate, &y2b_stub);
 
@@ -1654,17 +1636,6 @@ elif [[ "$query" == *schema_migrations* ]]; then
   else
     printf '%s\n' "${DEPLOY_TEST_SCHEMA_VERSION:-__SCHEMA__}"
   fi
-elif [[ "$query" == *"COUNT(*) FROM jobs"* ]]; then
-  if [[ -n "${DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS:-}" ]]; then
-    count=0
-    [[ ! -f "$DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS" ]] || count=$(<"$DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS")
-    ((count += 1))
-    printf '%s\n' "$count" >"$DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS"
-  fi
-  printf 'bootstrap-idle-check\n' >>"$DEPLOY_TEST_EVENTS"
-  printf '0\n'
-elif [[ "$query" == *"COUNT(*) FROM stage_runs"* ]]; then
-  printf '0\n'
 else
   echo "未预期的 sqlite3 查询: $query" >&2
   exit 2
@@ -1823,14 +1794,6 @@ PY
                 .env(
                     "DEPLOY_TEST_MAINTENANCE_HOLD_TABLE",
                     if self.hold_table_exists { "1" } else { "0" },
-                )
-                .env(
-                    "DEPLOY_TEST_BOOTSTRAP_IDLE_CHECKS",
-                    self.state_dir.join("bootstrap-idle-checks"),
-                )
-                .env(
-                    "DEPLOY_TEST_OLD_Y2B_LOG",
-                    self.state_dir.join("old-y2b.log"),
                 )
                 .env("DEPLOY_TEST_CURRENT", &self.current)
                 .env("DEPLOY_TEST_DATABASE", &self.database)
@@ -2269,119 +2232,48 @@ PY
     }
 
     #[test]
-    fn deploy_bootstraps_first_deploy_without_hold_and_completes() {
-        let fixture = deploy_fixture_legacy("success", 17);
+    fn deploy_rejects_legacy_flat_layout_without_touching_runtime() {
+        let fixture = deploy_fixture_legacy("success", CURRENT_SCHEMA_VERSION);
         let output = fixture.run(3);
-        assert!(output.status.success(), "{}", output_detail(&output));
+        assert!(!output.status.success(), "{}", output_detail(&output));
         let detail = output_detail(&output);
-        assert!(detail.contains("自举部署"), "{detail}");
-        assert!(detail.contains("TOCTOU"), "{detail}");
-        // 自举模式不获取维护锁，也不会留下 hold
+        assert!(detail.contains("不再支持旧扁平布局"), "{detail}");
+        assert!(detail.contains("一次性布局迁移"), "{detail}");
         assert!(!fixture.hold.exists());
-        let events = fs::read_to_string(&fixture.events).unwrap();
-        assert!(!events.contains("acquire:"), "{events}");
-        // 完成原子切换并迁移数据库
-        assert_eq!(
-            fs::read_link(&fixture.current).unwrap(),
-            PathBuf::from(format!("releases/{NEW_DEPLOY_REVISION}"))
-        );
         assert_eq!(
             fs::read_to_string(&fixture.database).unwrap(),
-            "new-database\n"
+            "old-database\n"
         );
         assert_eq!(
             fs::read_to_string(&fixture.service_state).unwrap(),
             "active\n"
         );
-    }
-
-    #[test]
-    fn deploy_bootstrap_still_runs_two_idle_checks_backup_and_atomic_switch() {
-        let fixture = deploy_fixture_legacy("success", 17);
-        let output = fixture.run(3);
-        assert!(output.status.success(), "{}", output_detail(&output));
-        // 每次自举空闲检查都会先查 jobs.status；连续两次 idle 才会继续。
-        let idle_checks =
-            fs::read_to_string(fixture.state_dir.join("bootstrap-idle-checks")).unwrap();
-        let idle_checks: usize = idle_checks.trim().parse().unwrap();
-        assert!(idle_checks >= 2, "自举空闲检查次数不足: {idle_checks}");
-        // 迁移前备份存在且通过完整性校验后保留为唯一备份文件
-        let backups: Vec<_> = fs::read_dir(fixture.state_dir.join("backups/deploy"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        assert_eq!(backups.len(), 1, "迁移前备份数量: {backups:?}");
-        // 原子切换：current 最终是符号链接并指向新 release
-        let metadata = fs::symlink_metadata(&fixture.current).unwrap();
-        assert!(metadata.file_type().is_symlink());
-        assert_eq!(
-            fs::read_link(&fixture.current).unwrap(),
-            PathBuf::from(format!("releases/{NEW_DEPLOY_REVISION}"))
-        );
-    }
-
-    #[test]
-    fn deploy_bootstrap_stops_service_after_second_idle_before_backup() {
-        let fixture = deploy_fixture_legacy("success", 17);
-        let output = fixture.run(3);
-        assert!(output.status.success(), "{}", output_detail(&output));
-        let events = fs::read_to_string(&fixture.events).unwrap();
-        let idle_positions: Vec<usize> = events
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| *line == "bootstrap-idle-check")
-            .map(|(index, _)| index)
-            .collect();
-        assert!(idle_positions.len() >= 2, "{events}");
-        let second_idle = idle_positions[1];
-        let stop = events
-            .lines()
-            .position(|line| line.starts_with("stop:"))
-            .unwrap();
-        let backup = events
-            .lines()
-            .position(|line| line.starts_with("backup:"))
-            .unwrap();
-        assert!(second_idle < stop && stop < backup, "{events}");
-    }
-
-    #[test]
-    fn deploy_after_bootstrap_uses_full_hold_path() {
-        let fixture = deploy_fixture_legacy("success", 17);
-        let first = fixture.run(3);
-        assert!(first.status.success(), "{}", output_detail(&first));
-        let first_events = fs::read_to_string(&fixture.events).unwrap();
-        assert!(!first_events.contains("acquire:"), "{first_events}");
-
-        // 第二次部署：数据库已迁移到当前 schema，必须走完整 hold 路径而非自举。
-        let second = fixture
-            .command(3)
-            .env("Y2B_REVISION", "cccccccccccc")
-            .output()
-            .unwrap();
-        assert!(second.status.success(), "{}", output_detail(&second));
-        let second_detail = output_detail(&second);
-        assert!(!second_detail.contains("自举部署"), "{second_detail}");
-        let events = fs::read_to_string(&fixture.events).unwrap();
-        assert!(events.contains("acquire:"), "{events}");
-        assert!(events.contains("release:releases/cccccccccccc"), "{events}");
-        assert_eq!(
-            fs::read_link(&fixture.current).unwrap(),
-            PathBuf::from("releases/cccccccccccc")
-        );
-    }
-
-    #[test]
-    fn deploy_bootstraps_only_when_hold_table_is_absent() {
-        let fixture = deploy_fixture_legacy("success", 17);
-        let output = fixture.run(3);
-        assert!(output.status.success(), "{}", output_detail(&output));
-        let detail = output_detail(&output);
-        assert!(detail.contains("自举部署"), "{detail}");
-        assert!(detail.contains("缺少 maintenance_hold 表"), "{detail}");
-        assert!(!fixture.hold.exists());
         let events = fs::read_to_string(&fixture.events).unwrap();
         assert!(!events.contains("acquire:"), "{events}");
+        assert!(!events.contains("stop:"), "{events}");
+    }
+
+    #[test]
+    fn deploy_rejects_database_without_maintenance_hold() {
+        let fixture = deploy_fixture_with_layout("success", false, 21);
+        let output = fixture.run(3);
+        assert!(!output.status.success(), "{}", output_detail(&output));
+        let detail = output_detail(&output);
+        assert!(detail.contains("schema v21"), "{detail}");
+        assert!(detail.contains("不再执行无锁自举"), "{detail}");
+        assert!(detail.contains("restore.sh"), "{detail}");
+        assert!(!fixture.hold.exists());
+        assert_eq!(
+            fs::read_link(&fixture.current).unwrap(),
+            PathBuf::from(format!("releases/{OLD_DEPLOY_REVISION}"))
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.database).unwrap(),
+            "old-database\n"
+        );
+        let events = fs::read_to_string(&fixture.events).unwrap();
+        assert!(!events.contains("acquire:"), "{events}");
+        assert!(!events.contains("stop:"), "{events}");
     }
 
     #[test]
@@ -2390,8 +2282,6 @@ PY
         fixture.hold_table_exists = true;
         let output = fixture.run(3);
         assert!(output.status.success(), "{}", output_detail(&output));
-        let detail = output_detail(&output);
-        assert!(!detail.contains("自举部署"), "{detail}");
         let events = fs::read_to_string(&fixture.events).unwrap();
         assert!(events.contains("acquire:"), "{events}");
         assert!(
@@ -2399,27 +2289,6 @@ PY
             "{events}"
         );
         assert!(!fixture.hold.exists());
-    }
-
-    #[test]
-    fn deploy_legacy_uses_new_binary_for_maintenance() {
-        let fixture = deploy_fixture_legacy("success", CURRENT_SCHEMA_VERSION);
-        let output = fixture.run(3);
-        assert!(output.status.success(), "{}", output_detail(&output));
-        // 旧扁平二进制不支持 maintenance（stub 遇 maintenance 即 exit 2）；
-        // 部署成功说明维护操作走的是新上传的二进制，而非旧的 /usr/local/bin/y2b。
-        let events = fs::read_to_string(&fixture.events).unwrap();
-        assert!(events.contains("acquire:"), "{events}");
-        assert!(
-            events.contains(&format!("release:releases/{NEW_DEPLOY_REVISION}")),
-            "{events}"
-        );
-        assert!(!fixture.hold.exists());
-        let old_log = fixture.state_dir.join("old-y2b.log");
-        if old_log.exists() {
-            let old_calls = fs::read_to_string(&old_log).unwrap();
-            assert!(!old_calls.contains("maintenance"), "{old_calls}");
-        }
     }
 
     struct RestoreFixture {

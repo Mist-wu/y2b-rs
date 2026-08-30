@@ -175,65 +175,43 @@ fi
 
 previous_target=
 maintenance_y2b=
-legacy_capture_required=false
-if [[ -L "$current_link" ]]; then
-  previous_target=$(readlink "$current_link")
-  case "$previous_target" in
-    releases/*) previous_name=${previous_target#releases/} ;;
-    "$releases_dir"/*) previous_name=${previous_target#"$releases_dir"/} ;;
-    *)
-      echo "current 必须指向 releases 下的版本目录: $current_link -> $previous_target" >&2
-      exit 1
-      ;;
-  esac
-  [[ "$previous_name" =~ ^[0-9a-f]{7,40}$ ]] || {
-    echo "current 的 release 名称不符合规则: $previous_name" >&2
-    exit 1
-  }
-  [[ -d "$current_link" && -x "$current_link/y2b" ]] || {
-    echo "current 没有指向完整 release: $current_link -> $previous_target" >&2
-    exit 1
-  }
-  maintenance_y2b="$current_link/y2b"
-elif [[ -e "$current_link" ]]; then
-  echo "current 必须是符号链接: $current_link" >&2
+if [[ ! -L "$current_link" ]]; then
+  if [[ -e "$current_link" ]]; then
+    echo "current 必须是符号链接: $current_link" >&2
+  else
+    echo "不再支持旧扁平布局或首次自举部署: 缺少 $current_link" >&2
+    echo "请先通过 restore.sh 或一次性布局迁移建立可成对回滚的 current release" >&2
+  fi
   exit 1
-else
-  # 从旧的固定路径升级时，先只读捕获完整旧版；真正切换仍只有第 7 步的一次 mv -T。
-  [[ -x "$bin_link" && -d "$app_root/pi" && ! -L "$app_root/pi" ]] || {
-    echo "缺少可成对回滚的上一版 release，拒绝部署" >&2
-    exit 1
-  }
-  for resource in y2b-extension.ts policy.json audit-policy.json brawl-stars-glossary.json; do
-    [[ -f "$app_root/pi/$resource" ]] || {
-      echo "旧版 Pi 资源不完整，无法建立回滚 release: $app_root/pi/$resource" >&2
-      exit 1
-    }
-  done
-  [[ -f "$app_root/Cargo.lock" ]] || {
-    echo "旧版 Cargo.lock 缺失，无法建立回滚 release: $app_root/Cargo.lock" >&2
-    exit 1
-  }
-  command -v sha256sum >/dev/null 2>&1 || {
-    echo "捕获旧 release 需要 sha256sum" >&2
-    exit 1
-  }
-  # 旧扁平布局没有可执行 maintenance 的上一版 release；维护相关操作必须用新上传的二进制。
-  maintenance_y2b="$binary"
-  legacy_capture_required=true
 fi
+previous_target=$(readlink "$current_link")
+case "$previous_target" in
+  releases/*) previous_name=${previous_target#releases/} ;;
+  "$releases_dir"/*) previous_name=${previous_target#"$releases_dir"/} ;;
+  *)
+    echo "current 必须指向 releases 下的版本目录: $current_link -> $previous_target" >&2
+    exit 1
+    ;;
+esac
+[[ "$previous_name" =~ ^[0-9a-f]{7,40}$ ]] || {
+  echo "current 的 release 名称不符合规则: $previous_name" >&2
+  exit 1
+}
+[[ -d "$current_link" && -x "$current_link/y2b" ]] || {
+  echo "current 没有指向完整 release: $current_link -> $previous_target" >&2
+  exit 1
+}
+maintenance_y2b="$current_link/y2b"
 
 hold_acquired=false
 deployment_complete=false
 rollback_required=false
 database_restore_required=false
 release_created=false
-service_stopped=false
 migration_backup=
 backup_temp=
 integrity_output=
 rollback_temp=
-legacy_staging=
 alias_temporaries=()
 quarantines=()
 
@@ -241,7 +219,6 @@ cleanup_temporary_files() {
   [[ -z "$backup_temp" || ! -e "$backup_temp" ]] || rm -f -- "$backup_temp"
   [[ -z "$integrity_output" || ! -e "$integrity_output" ]] || rm -f -- "$integrity_output"
   [[ -z "$rollback_temp" || ! -e "$rollback_temp" ]] || rm -f -- "$rollback_temp"
-  [[ -z "$legacy_staging" || ! -e "$legacy_staging" ]] || rm -rf -- "$legacy_staging"
   [[ ! -e "$staging_dir" ]] || rm -rf -- "$staging_dir"
   rm -f -- "$current_temp" "$unit_temp"
   local temporary
@@ -454,12 +431,6 @@ rollback_on_error() {
         rollback_ok=false
       fi
     fi
-  elif [[ "$service_stopped" == true ]]; then
-    # 自举模式在备份前就停服；若此时尚未武装成对回滚，只需恢复服务继续运行。
-    if ! "$systemctl_cmd" start "$service" >/dev/null 2>&1; then
-      rollback_ok=false
-      echo "自举部署在迁移前快照之前失败，恢复服务运行失败" >&2
-    fi
   fi
 
   # 回滚健康检查结束后才释放锁；数据库已恢复时 current 中的旧二进制与 schema 精确匹配。
@@ -479,22 +450,13 @@ rollback_on_error() {
     echo "自动回滚未完整成功，请保持服务停止并按迁移前备份手工恢复: ${migration_backup:-尚未生成}" >&2
     status=1
   elif [[ "$rollback_required" == true ]]; then
-    if [[ "$bootstrap_deploy" == true ]]; then
-      echo "成对回滚完成，旧 release 已通过健康检查" >&2
-    else
-      echo "成对回滚完成，旧 release 已通过健康检查，maintenance hold 已释放" >&2
-    fi
+    echo "成对回滚完成，旧 release 已通过健康检查，maintenance hold 已释放" >&2
   fi
   exit "$status"
 }
 trap rollback_on_error EXIT
 trap 'exit 130' INT TERM
 
-# 自举检测：维护锁依赖 maintenance_hold 表，而建表迁移发生在停服务之后。只有锁的
-# 落点表确实不存在时才退化到自举路径；schema 只是比当前旧、但已有该表的库必须走
-# 完整 hold 路径（由与旧 schema 匹配的 current 二进制获取锁），避免每次 schema
-# 升级都重新打开无锁的 TOCTOU 窗口。
-bootstrap_deploy=false
 current_schema_version=$("$binary" schema-version)
 db_schema_version=$("$sqlite3_cmd" "$database" \
   'SELECT COALESCE(MAX(version),0) FROM schema_migrations;')
@@ -512,29 +474,22 @@ maintenance_hold_tables=$("$sqlite3_cmd" "$database" \
   echo "无法判断 maintenance_hold 表是否存在: $maintenance_hold_tables" >&2
   exit 1
 }
-if (( maintenance_hold_tables == 0 )); then
-  bootstrap_deploy=true
+if (( maintenance_hold_tables != 1 )); then
+  echo "数据库 schema v${db_schema_version} 不具备唯一 maintenance_hold 表，拒绝部署" >&2
+  echo "deploy-app.sh 不再执行无锁自举；请先使用 restore.sh 迁移旧备份" >&2
+  exit 1
 fi
 
-if [[ "$bootstrap_deploy" == true ]]; then
-  echo "自举部署: 数据库 schema v${db_schema_version} 缺少 maintenance_hold 表，" >&2
-  echo "维护锁依赖该表，而建表迁移只能发生在停服务之后，" >&2
-  echo "因此本次无法使用维护锁，存在与线上任务并发的 TOCTOU 窗口。" >&2
-  echo "本次回退到 jobs.status / stage_runs.status 做两次连续空闲判定，" >&2
-  echo "并在第二次 idle 通过后立即停服再生成快照；只要该表已存在，" >&2
-  echo "后续所有 schema 升级都必须走完整 hold 路径，不会重新打开无锁窗口。" >&2
-else
-  # 先获取维护锁，之后所有 status 都带 owner，避免被自己的锁误判为 blocker。
-  hold_acquired=true
-  if ! "$maintenance_y2b" maintenance acquire \
-    --database "$database" \
-    --owner "$owner" \
-    --reason "部署 release $revision" \
-    --lease-seconds "$hold_lease_seconds"; then
-    hold_acquired=false
-    echo "无法获取 maintenance hold" >&2
-    exit 1
-  fi
+# 先获取维护锁，之后所有 status 都带 owner，避免被自己的锁误判为 blocker。
+hold_acquired=true
+if ! "$maintenance_y2b" maintenance acquire \
+  --database "$database" \
+  --owner "$owner" \
+  --reason "部署 release $revision" \
+  --lease-seconds "$hold_lease_seconds"; then
+  hold_acquired=false
+  echo "无法获取 maintenance hold" >&2
+  exit 1
 fi
 
 print_blockers() {
@@ -583,87 +538,9 @@ wait_for_two_idle_checks() {
   return 1
 }
 
-# 自举模式的空闲判定不依赖 maintenance_hold 表，直接读 v17 就存在的
-# jobs.status / stage_runs.status，判定逻辑与 maintenance status 保持一致。
-wait_for_two_idle_checks_bootstrap() {
-  local checks=0
-  local consecutive=0
-  local jobs_busy stages_running
-
-  while (( checks < idle_max_checks )); do
-    ((checks += 1))
-    jobs_busy=$("$sqlite3_cmd" "$database" \
-      "SELECT COUNT(*) FROM jobs WHERE status IN('inspecting','processing','downloading','segmenting','translating','rendering','uploading');")
-    stages_running=$("$sqlite3_cmd" "$database" \
-      "SELECT COUNT(*) FROM stage_runs WHERE status='running';")
-    if [[ "$jobs_busy" == 0 && "$stages_running" == 0 ]]; then
-      ((consecutive += 1))
-      echo "自举空闲连续检查: $consecutive/2"
-      if (( consecutive == 2 )); then
-        return
-      fi
-    else
-      consecutive=0
-      echo "数据库仍有存量工作，继续等待（${checks}/${idle_max_checks}）jobs=$jobs_busy stages=$stages_running" >&2
-    fi
-    if (( checks < idle_max_checks )); then
-      sleep "$idle_interval"
-    fi
-  done
-
-  echo "等待两次连续自举空闲超时，拒绝继续部署" >&2
-  return 1
-}
-
-if [[ "$bootstrap_deploy" == true ]]; then
-  wait_for_two_idle_checks_bootstrap
-  # 自举模式没有 hold 挡住新领取：第二次 idle 通过后立即停服并确认 inactive，
-  # 之后才做 legacy 捕获、staging 与迁移前快照，确保快照反映停服后的静止状态。
-  "$systemctl_cmd" stop "$service"
-  service_stopped=true
-  if "$systemctl_cmd" is-active --quiet "$service"; then
-    echo "$service 停止后仍处于 active 状态，拒绝继续" >&2
-    exit 1
-  fi
-else
-  wait_for_two_idle_checks
-fi
+wait_for_two_idle_checks
 
 install -d -m 0755 "$releases_dir"
-
-if [[ "$legacy_capture_required" == true ]]; then
-  legacy_digest=$(sha256sum "$bin_link")
-  legacy_revision=${legacy_digest%% *}
-  legacy_revision=${legacy_revision:0:12}
-  if [[ "$legacy_revision" == "$revision" ]]; then
-    legacy_revision="0$legacy_revision"
-  fi
-  legacy_release="$releases_dir/$legacy_revision"
-  if [[ ! -d "$legacy_release" ]]; then
-    legacy_staging="$releases_dir/.${legacy_revision}.legacy-${deployment_timestamp}-$$"
-    install -d -m 0755 "$legacy_staging/pi" "$legacy_staging/deploy"
-    install -m 0755 "$bin_link" "$legacy_staging/y2b"
-    install -m 0644 "$app_root/pi/y2b-extension.ts" "$legacy_staging/pi/y2b-extension.ts"
-    install -m 0644 "$app_root/pi/policy.json" "$legacy_staging/pi/policy.json"
-    install -m 0644 "$app_root/pi/audit-policy.json" "$legacy_staging/pi/audit-policy.json"
-    install -m 0644 "$app_root/pi/brawl-stars-glossary.json" "$legacy_staging/pi/brawl-stars-glossary.json"
-    install -m 0644 "$app_root/Cargo.lock" "$legacy_staging/Cargo.lock"
-    install -m 0644 "$root_dir/deploy/y2b-watch.service" "$legacy_staging/deploy/y2b-watch.service"
-    "$mv_cmd" -- "$legacy_staging" "$legacy_release"
-    legacy_staging=
-  fi
-  [[ -x "$legacy_release/y2b" && -f "$legacy_release/Cargo.lock" ]] || {
-    echo "旧 release 捕获失败: $legacy_release" >&2
-    exit 1
-  }
-  for resource in y2b-extension.ts policy.json audit-policy.json brawl-stars-glossary.json; do
-    [[ -f "$legacy_release/pi/$resource" ]] || {
-      echo "旧 release 捕获后缺少 Pi 资源: $legacy_release/pi/$resource" >&2
-      exit 1
-    }
-  done
-  previous_target="releases/$legacy_revision"
-fi
 
 # 新资源先写入隐藏 staging，完整后才发布为不可变 releases/<revision>；此时不碰 current。
 install -d -m 0755 "$staging_dir/pi" "$staging_dir/deploy"
@@ -681,11 +558,9 @@ install -m 0644 "$root_dir/deploy/y2b-watch.service" "$staging_dir/deploy/y2b-wa
 "$mv_cmd" -- "$staging_dir" "$release_dir"
 release_created=true
 
-# 非自举路径由 hold 挡住新领取：先续租，再在停服前在线备份。
-if [[ "$bootstrap_deploy" != true ]]; then
-  "$maintenance_y2b" maintenance renew \
-    --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
-fi
+# hold 挡住新领取：先续租，再在停服前在线备份。
+"$maintenance_y2b" maintenance renew \
+  --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
 install -d -m 0700 "$backup_dir"
 backup_temp=$(mktemp "$backup_dir/.state-before-${revision}-${deployment_timestamp}.XXXXXXXX")
 rm -f -- "$backup_temp"
@@ -707,15 +582,12 @@ backup_temp=
 
 database_restore_required=true
 rollback_required=true
-if [[ "$bootstrap_deploy" != true ]]; then
-  "$systemctl_cmd" stop "$service"
-fi
+"$systemctl_cmd" stop "$service"
 
 # 固定兼容路径只间接指向 current；以后 binary、Pi、Cargo.lock 与运维脚本同步切换。
 install_release_alias "$app_root/pi" 'current/pi'
 install_release_alias "$app_root/Cargo.lock" 'current/Cargo.lock'
 install_release_alias "$app_root/deploy" 'current/deploy'
-install_release_alias "$app_root/scripts" 'current/scripts'
 install_release_alias "$bin_link" "$current_link/y2b"
 install_release_alias "$key_tool_link" "$current_link/deploy/y2b-set-deepseek-key.py"
 
@@ -723,15 +595,11 @@ atomic_set_current "releases/$revision"
 
 # current 和数据库必须视为一对：从这里开始任何错误都由 EXIT trap 同时恢复。
 "$current_link/y2b" migrate --database "$database"
-if [[ "$bootstrap_deploy" != true ]]; then
-  "$current_link/y2b" maintenance renew \
-    --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
-fi
+"$current_link/y2b" maintenance renew \
+  --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
 "$current_link/y2b" --config "$config_file" check --write-baseline
-if [[ "$bootstrap_deploy" != true ]]; then
-  "$current_link/y2b" maintenance renew \
-    --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
-fi
+"$current_link/y2b" maintenance renew \
+  --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
 
 install -m 0644 "$current_link/deploy/y2b-watch.service" "$unit_temp"
 "$mv_cmd" -Tf -- "$unit_temp" "$unit_path"
@@ -789,9 +657,7 @@ remove_quarantines
 cleanup_temporary_files
 # 健康检查后的最终窗口不再接受中断：先释放 hold，紧接着解除 EXIT 回滚 trap。
 trap '' INT TERM
-if [[ "$bootstrap_deploy" != true ]]; then
-  release_hold
-fi
+release_hold
 deployment_complete=true
 trap - EXIT INT TERM
 
