@@ -512,13 +512,10 @@ pub fn apply_translations(cues: &mut [Cue], translations: &[(usize, String)]) ->
         if *i >= cues.len() {
             bail!("翻译索引越界: {i}")
         }
-        let clean = sanitize_caption_text(text);
-        // 单条空翻译直接跳过（保留 translation=None），避免整批失败；
-        // 后续 CC 提交会过滤无翻译的 cue。
-        if clean.is_empty() {
-            continue;
-        }
-        cues[*i].translation = Some(clean);
+        // 空译文也存档：模型按提示词丢弃语气词（Um、So…）属于有意留白，
+        // 存 Some("") 才能让检查点判定该批次已完成，不会在后续 CC 重试时
+        // 反复重翻同一批；CC 提交端会过滤空内容。
+        cues[*i].translation = Some(sanitize_caption_text(text));
     }
     Ok(())
 }
@@ -813,6 +810,9 @@ Brown noise and chill music.
         }];
         apply_translations(&mut c, &[(0, "你好".into())]).unwrap();
         assert_eq!(c[0].translation.as_deref(), Some("你好"));
+        // 空译文（模型丢弃语气词）也算已翻译，检查点才能收敛。
+        apply_translations(&mut c, &[(0, "  ".into())]).unwrap();
+        assert_eq!(c[0].translation.as_deref(), Some(""));
         // 分批应用：只传部分条目不要求与总 cues 数量相等。
         let mut batch = vec![Cue {
             start: 1.,

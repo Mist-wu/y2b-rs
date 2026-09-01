@@ -5,7 +5,6 @@ use super::ai::{
     is_ai_global_fault, parse_ranges, parse_translations, segment_cue_argument_bytes,
     segment_cue_tokens, translation_cue_tokens,
 };
-use super::publication::chinese_width;
 use super::{Pipeline, StageGuard};
 use crate::config::BatchMode;
 use crate::model::Job;
@@ -15,7 +14,6 @@ use crate::process::run_monitored;
 use crate::subtitle::{self, Cue};
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream};
-use regex::Regex;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,10 +31,6 @@ pub(super) const SEGMENT_MAX_DURATION_SECONDS: f64 = 8.0;
 pub(super) const SEGMENT_MAX_SOURCE_CHARS: usize = 72;
 pub(super) const SEGMENT_MAX_SOURCE_WORDS: usize = 16;
 pub(super) const SEGMENT_ORPHAN_MAX_DURATION_SECONDS: f64 = 1.0;
-
-/// 译文以 32 中文宽度为目标；64 是防止整段串入单句等异常输出的硬上限。
-/// 这里允许目标值两倍的余量，避免为了机械缩短而丢失名字、数字或事实。
-pub(super) const TRANSLATION_MAX_WIDTH: usize = 64;
 
 pub(super) fn max_segment_window_end(
     cues: &[Cue],
@@ -220,6 +214,11 @@ pub(super) fn merge_orphaned_short_ranges(
     Ok(merged)
 }
 
+/// 翻译输出只做结构校验：数量齐、索引有序。内容质量（词库译名、说话人/
+/// 音乐标记、行宽）交给提示词注入的词库和 `cc_cues_from` 的确定性清洗兜底。
+/// 线上数据（2026-08-22~09-01）显示内容校验 943 次重试里 82% 是词库误杀
+/// （`pro tip`、`max out`、`brawler` 等普通用法被强制要求专名），既烧掉约
+/// 1/4 的翻译 token，又逼模型输出更差的中文，还让单个"毒批次"拖垮整条任务。
 pub(super) fn validate_translation_indexes(
     len: usize,
     translations: &[(usize, String)],
@@ -230,119 +229,6 @@ pub(super) fn validate_translation_indexes(
     for (expected, (index, _)) in translations.iter().enumerate() {
         if *index != expected {
             bail!("Pi 翻译索引无序或缺失: index={index}, expected={expected}")
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn validate_translation_output(
-    source: &[Cue],
-    translations: &[(usize, String)],
-) -> Result<()> {
-    validate_translation_indexes(source.len(), translations)?;
-    let speaker_marker = Regex::new(r"(?:^|\s)(?:>>|＞＞)(?:\s|$)")?;
-    for (index, text) in translations {
-        let text = text.trim();
-        if text.is_empty() && source[*index].source.chars().any(char::is_alphanumeric) {
-            bail!("Pi 翻译第 {index} 条译文为空")
-        }
-        let lower = text.to_ascii_lowercase();
-        let has_speaker_marker = speaker_marker.is_match(text);
-        let has_music_marker = lower.contains("[music]")
-            || text.contains("[音乐]")
-            || text.contains("【音乐】")
-            || text.contains("（音乐）");
-        if has_speaker_marker || text.contains("&gt;") || has_music_marker {
-            bail!("Pi 翻译第 {index} 条含有禁止显示的说话人/音乐标记")
-        }
-        let width = chinese_width(text);
-        if width > TRANSLATION_MAX_WIDTH {
-            bail!("Pi 翻译第 {index} 条中文宽度 {width} 超过硬上限 {TRANSLATION_MAX_WIDTH}")
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn load_curated_glossary(path: &Path) -> Result<Vec<(String, String)>> {
-    let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)
-        .with_context(|| format!("读取翻译策略词库失败: {}", path.display()))?;
-    let glossary = value["glossary"]
-        .as_object()
-        .with_context(|| format!("翻译策略缺少 glossary: {}", path.display()))?;
-    Ok(glossary
-        .iter()
-        .filter_map(|(term, translation)| {
-            translation
-                .as_str()
-                .filter(|translation| !term.trim().is_empty() && !translation.trim().is_empty())
-                .map(|translation| (term.clone(), translation.to_string()))
-        })
-        .collect())
-}
-
-/// 词库里带大写的词条是专有名词（`Max`、`Surge`、`Shade`、`Pearl`…），只有源文
-/// 同样大写时才是游戏内含义；`max out that brawler`、`a surge in damage` 这类普通
-/// 英文用法必须放行。全小写词条（`ranked`、`skill`、`pro`…）本来就是行话，也用来
-/// 纠正 ASR 误听（`cult` => 柯尔特），继续大小写不敏感。
-///
-/// 原来一律 `(?i)` 匹配，比 Pi 提示词里写明的「仅在按 Brawl Stars 含义使用时应用
-/// 词库」更严：模型把 `max out` 正确译成「满级」，校验却要求出现「麦克斯」，
-/// 这个约束无法满足，整条任务重试到 dead_letter（线上 oXJ2y9BsNlU 的 253~256
-/// 四条 cue 都是 `max out`）。
-///
-/// 残留风险是句首大写的普通词（`Max out that brawler.`）仍会被要求译名；相比
-/// 整条任务作废，这个方向的误判代价小得多，且词库仍完整进入提示词。
-fn source_contains_glossary_term(source: &str, term: &str) -> Result<bool> {
-    let term = term.trim();
-    let case_insensitive = if term.chars().any(char::is_uppercase) {
-        ""
-    } else {
-        "(?i)"
-    };
-    let pattern = format!(
-        "{case_insensitive}(?:^|[^A-Za-z0-9]){}(?:$|[^A-Za-z0-9])",
-        regex::escape(term)
-    );
-    Ok(Regex::new(&pattern)?.is_match(source))
-}
-
-pub(super) fn validate_translation_glossary(
-    source: &[Cue],
-    translations: &[(usize, String)],
-    glossary: &[(String, String)],
-) -> Result<()> {
-    for (index, text) in translations {
-        for (term, required) in glossary {
-            if source_contains_glossary_term(&source[*index].source, term)?
-                && !text.contains(required)
-            {
-                bail!("Pi 翻译第 {index} 条未按词库使用 {term} => {required}")
-            }
-        }
-    }
-    // 硬分句可能恰好切在多词术语中间（例如 `draft` / `diff`）。逐 cue
-    // 校验看不到完整术语，模型就可能把它译成“阵容压制”。额外检查相邻 cue，
-    // 要求跨边界的源术语在两条译文拼接后仍出现规定译名。
-    for pair in translations.windows(2) {
-        let (left_index, left_translation) = &pair[0];
-        let (right_index, right_translation) = &pair[1];
-        if *right_index != *left_index + 1 {
-            continue;
-        }
-        let left_source = &source[*left_index].source;
-        let right_source = &source[*right_index].source;
-        let joined_source = format!("{left_source} {right_source}");
-        let joined_translation = format!("{left_translation}{right_translation}");
-        for (term, required) in glossary {
-            if !source_contains_glossary_term(left_source, term)?
-                && !source_contains_glossary_term(right_source, term)?
-                && source_contains_glossary_term(&joined_source, term)?
-                && !joined_translation.contains(required)
-            {
-                bail!(
-                    "Pi 翻译第 {left_index}/{right_index} 条跨句术语未按词库使用 {term} => {required}"
-                )
-            }
         }
     }
     Ok(())
@@ -375,18 +261,6 @@ pub(super) fn load_translation_checkpoint(path: &Path, source: &[Cue]) -> Result
             || (cached.end - original.end).abs() > 0.001
         {
             bail!("翻译缓存第 {index} 条与分句缓存不匹配")
-        }
-        if let Some(translation) = cached.translation.as_deref() {
-            if translation.trim().is_empty() && cached.source.chars().any(char::is_alphanumeric) {
-                bail!("翻译缓存第 {index} 条译文为空")
-            }
-            if translation.chars().any(|ch| ch.is_control() && ch != '\n') {
-                bail!("翻译缓存第 {index} 条含非法控制字符")
-            }
-            let width = chinese_width(translation.trim());
-            if width > TRANSLATION_MAX_WIDTH {
-                bail!("翻译缓存第 {index} 条中文宽度 {width} 超过硬上限 {TRANSLATION_MAX_WIDTH}")
-            }
         }
     }
     Ok(Some(cues))
@@ -1107,7 +981,6 @@ impl Pipeline {
             "target_lang":self.config.translation.target_lang,
             "items":items
         });
-        let glossary = load_curated_glossary(&self.config.ai.policy)?;
         // 每次尝试都会带上不同的 feedback；call_pi 在调用边界统一登记审计行。
         let attempts = self.config.ai.translation_batch_retries.saturating_add(1);
         let mut aggregate_duration_ms = 0;
@@ -1125,8 +998,7 @@ impl Pipeline {
                     aggregate_duration_ms += result.output.duration_ms;
                     peak_rss_kib = peak_rss_kib.max(result.output.peak_rss_kib);
                     match parse_translations(&result.value).and_then(|translations| {
-                        validate_translation_output(chunk, &translations)?;
-                        validate_translation_glossary(chunk, &translations, &glossary)?;
+                        validate_translation_indexes(chunk.len(), &translations)?;
                         Ok(translations)
                     }) {
                         Ok(translations) => {
@@ -1139,7 +1011,7 @@ impl Pipeline {
                             // 反馈仍无效则减半拆分重试，定位问题批次，避免整批 token 白烧。
                             if attempt < attempts {
                                 feedback = Some(format!(
-                                    "上一轮输出未通过解析/校验：{error_message}。请只输出符合要求的 JSON，不要输出解释、Markdown 或额外字段；每条译文必须完整保留原意、名字和数字，同时将中文宽度压缩到 {TRANSLATION_MAX_WIDTH} 以内。说话人切换请改写为自然中文标点，不得输出 >>、&gt;、[music] 或 [音乐]。"
+                                    "上一轮输出未通过解析：{error_message}。请只输出符合要求的 JSON：translations 数组必须按输入顺序包含每个 i 恰好一次，不要输出解释、Markdown 或额外字段。"
                                 ));
                                 self.db.event(
                                     Some(job_id),
@@ -1348,110 +1220,6 @@ mod tests {
             merge_orphaned_short_ranges(&cues, &[(0, 1), (2, 2)]).unwrap(),
             vec![(0, 0), (1, 2)]
         );
-    }
-
-    #[test]
-    fn translation_output_rejects_empty_and_overwide_text() {
-        let source = vec![cue(0, "hello")];
-        assert!(validate_translation_output(&source, &[(0, "你好".into())]).is_ok());
-        assert!(validate_translation_output(&source, &[(0, "".into())]).is_err());
-        assert!(validate_translation_output(&source, &[(0, "中".repeat(33))]).is_err());
-        assert!(validate_translation_output(&source, &[(0, ">> 你好".into())]).is_err());
-        assert!(validate_translation_output(&source, &[(0, "你好 [音乐]".into())]).is_err());
-        assert!(validate_translation_output(&source, &[(0, "你好。世界。".into())]).is_ok());
-    }
-
-    #[test]
-    fn translation_output_requires_curated_glossary_in_the_same_cue() {
-        let source = vec![cue(0, "Max gives Rico her Hypercharge.")];
-        let glossary = vec![
-            ("Max".into(), "麦克斯".into()),
-            ("Rico".into(), "瑞科".into()),
-            ("Hypercharge".into(), "极限充能".into()),
-        ];
-        assert!(
-            validate_translation_glossary(
-                &source,
-                &[(0, "麦克斯把极限充能给了瑞科。".into())],
-                &glossary
-            )
-            .is_ok()
-        );
-        let error =
-            validate_translation_glossary(&source, &[(0, "她把充能给了瑞科。".into())], &glossary)
-                .unwrap_err();
-        assert!(error.to_string().contains("Max => 麦克斯"));
-
-        let unrelated = vec![cue(0, "maximum speed")];
-        assert!(
-            validate_translation_glossary(&unrelated, &[(0, "最高速度".into())], &glossary).is_ok()
-        );
-    }
-
-    #[test]
-    fn glossary_proper_nouns_only_bind_when_the_source_is_capitalized() {
-        let glossary = vec![
-            ("Max".into(), "麦克斯".into()),
-            ("ranked".into(), "排位".into()),
-        ];
-        // 线上 oXJ2y9BsNlU 的原句：`max out` 是「练满」，不是麦克斯。旧的一律
-        // 忽略大小写会让这条 cue 永远无法通过校验，整条任务重试到 dead_letter。
-        let common_word = vec![cue(
-            0,
-            "And I calculated that out to 4% of the coins you need to max out that",
-        )];
-        assert!(
-            validate_translation_glossary(
-                &common_word,
-                &[(0, "才占你练满所需金币的4%".into())],
-                &glossary
-            )
-            .is_ok()
-        );
-        // 同一个词大写时仍然是英雄名，必须用译名。
-        let brawler = vec![cue(0, "Max is broken in ranked.")];
-        let error = validate_translation_glossary(
-            &brawler,
-            &[(0, "这英雄在排位太强了。".into())],
-            &glossary,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("Max => 麦克斯"));
-        assert!(
-            validate_translation_glossary(
-                &brawler,
-                &[(0, "麦克斯在排位太强了。".into())],
-                &glossary
-            )
-            .is_ok()
-        );
-        // 全小写词条是行话和 ASR 纠错，继续大小写不敏感。
-        let shouted = vec![cue(0, "RANKED is different now")];
-        let error =
-            validate_translation_glossary(&shouted, &[(0, "现在的天梯不一样了".into())], &glossary)
-                .unwrap_err();
-        assert!(error.to_string().contains("ranked => 排位"));
-    }
-
-    #[test]
-    fn translation_output_requires_glossary_across_a_cue_boundary() {
-        let source = vec![cue(0, "ranked no draft"), cue(1, "diff beats mechanics")];
-        let glossary = vec![("draft diff".into(), "BP差距".into())];
-        assert!(
-            validate_translation_glossary(
-                &source,
-                &[(0, "排位，不，BP".into()), (1, "差距比操作重要".into())],
-                &glossary
-            )
-            .is_ok()
-        );
-        let error = validate_translation_glossary(
-            &source,
-            &[(0, "排位，不，阵容".into()), (1, "压制比操作重要".into())],
-            &glossary,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("跨句术语"));
     }
 
     #[test]
