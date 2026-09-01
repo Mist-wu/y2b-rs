@@ -16,8 +16,8 @@ prediction_cold_poll_minutes = 30
 # 新频道历史不足时固定每 5 分钟轮询。
 prediction_fallback_poll_minutes = 5
 prediction_min_samples = 5
-# 每 24 小时做一次 API 深扫；只有 API 深扫失败才用 yt-dlp 校对兜底。
-reconcile_hours = 24
+# 每 6 小时做一次 API 深扫；只有 API 深扫失败才用 yt-dlp 校对兜底。
+reconcile_hours = 6
 reconcile_limit = 30
 max_attempts = 5
 
@@ -46,7 +46,8 @@ model = "deepseek-v4-flash"
 translation_model = "deepseek-v4-pro"
 # 投稿元数据、分句和翻译统一关闭 thinking，避免成本和流式输出量失控。
 thinking = "off"
-timeout_seconds = 300
+# 单次 Pi 调用超时。长视频翻译批次偶发超过 5 分钟，默认 15 分钟。
+timeout_seconds = 900
 # adaptive: 分句按 token 自适应；翻译同时按 token 和条数上限拆批。
 # whole_video: 只允许整条视频一次处理，超过安全阈值则停止并提示切换模式。
 batch_mode = "adaptive"

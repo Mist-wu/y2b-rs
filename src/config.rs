@@ -182,7 +182,7 @@ impl Default for MonitorConfig {
             prediction_cold_poll_minutes: 30,
             prediction_fallback_poll_minutes: 5,
             prediction_min_samples: 5,
-            reconcile_hours: 24,
+            reconcile_hours: 6,
             reconcile_limit: 30,
             max_attempts: 5,
         }
@@ -222,7 +222,7 @@ impl Default for AiConfig {
             model: AI_MODEL.into(),
             translation_model: AI_TRANSLATION_MODEL.into(),
             thinking: AI_THINKING.into(),
-            timeout_seconds: 300,
+            timeout_seconds: 900,
             batch_mode: BatchMode::Adaptive,
             context_window_tokens: 256_000,
             safe_context_tokens: 200_000,
@@ -756,7 +756,7 @@ mod tests {
         assert_eq!(config.monitor.prediction_cold_poll_minutes, 30);
         assert_eq!(config.monitor.prediction_fallback_poll_minutes, 5);
         assert_eq!(config.monitor.prediction_min_samples, 5);
-        assert_eq!(config.monitor.reconcile_hours, 24);
+        assert_eq!(config.monitor.reconcile_hours, 6);
         assert!(!config.translation.enforce_source_lang);
         config.validate_discovery().unwrap();
 

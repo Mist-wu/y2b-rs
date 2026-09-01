@@ -174,7 +174,7 @@ video_candidates(
 | `monitor.prediction_cold_poll_minutes` | `30` | 热窗外轮询间隔 |
 | `monitor.prediction_fallback_poll_minutes` | `5` | 历史样本不足时的固定间隔 |
 | `monitor.prediction_min_samples` | `5` | 启用预测所需最少历史样本 |
-| `monitor.reconcile_hours` | `24` | 每日 API 深扫周期；API 不可用时也是 yt-dlp 兜底周期 |
+| `monitor.reconcile_hours` | `6` | API 深扫周期；API 不可用时也是 yt-dlp 兜底周期 |
 | `monitor.reconcile_limit` | `30` | 保留的 yt-dlp reconcile 兜底读取上限 |
 | `translation.source_lang` | `en` | 期望源语言；与地区变体按基础标签匹配 |
 | `translation.enforce_source_lang` | `false` | 已知语言不匹配时是否硬拒绝；缺失值仍放行 |
