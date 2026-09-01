@@ -56,11 +56,32 @@ struct Cookie {
     value: String,
 }
 
+/// 风控页面和网关错误返回的是整页 HTML，直接塞进错误链会淹没日志，也看不出
+/// 是哪一类失败。只保留压缩空白后的开头，足够区分「风控 412」和「真的返回了
+/// 坏 JSON」。
+fn body_snippet(body: &[u8]) -> String {
+    const SNIPPET_LIMIT: usize = 120;
+    let text = String::from_utf8_lossy(body);
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "空响应体".to_string();
+    }
+    if compact.chars().count() > SNIPPET_LIMIT {
+        return compact.chars().take(SNIPPET_LIMIT).collect::<String>() + "…";
+    }
+    compact
+}
+
 async fn response_json(response: reqwest::Response) -> Result<serde_json::Value> {
+    let status = response.status();
     let body = read_response_body(response, BILIBILI_API_BODY_LIMIT)
         .await
         .context("读取 Bilibili API 响应失败")?;
-    serde_json::from_slice(&body).context("解析 Bilibili API 响应失败")
+    if !status.is_success() {
+        bail!("Bilibili API 返回 HTTP {status}: {}", body_snippet(&body))
+    }
+    serde_json::from_slice(&body)
+        .with_context(|| format!("解析 Bilibili API 响应失败: {}", body_snippet(&body)))
 }
 
 fn language_matches(actual: &str, requested: &str) -> bool {
@@ -98,12 +119,17 @@ impl BiliSubtitleClient {
     }
 
     /// 查询稿件 aid/cid。
+    ///
+    /// 必须带登录 Cookie：匿名请求这个接口会被风控拦成 HTTP 412 + HTML 页面，
+    /// 于是整条 CC 字幕队列都卡在「解析 Bilibili API 响应失败」上。同一份
+    /// cookies 带上后立即恢复 200/JSON。
     pub async fn view(&self, bvid: &str) -> Result<VideoView> {
         let resp = self
             .http
             .get(VIEW_API)
             .query(&[("bvid", bvid)])
             .header("Referer", "https://www.bilibili.com/")
+            .header("Cookie", &self.cookie_header)
             .send()
             .await?;
         let value = response_json(resp).await?;
@@ -227,6 +253,51 @@ mod tests {
         assert!(!language_matches("zh-Hans", "zh"));
         assert!(!language_matches("en-US", "zh"));
         assert!(!language_matches("zho", "zh"));
+    }
+
+    #[tokio::test]
+    async fn risk_control_html_reports_status_instead_of_json_parse_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let page = "<!DOCTYPE html>\n<html lang=\"zh-cn\">\n<head><title>啥都木有</title></head>\n</html>";
+            let response = format!(
+                "HTTP/1.1 412 Precondition Failed\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                page.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let response = bounded_http_client("y2b-rs-test/0.1")
+            .unwrap()
+            .get(format!("http://{address}/bilibili"))
+            .send()
+            .await
+            .unwrap();
+        let error = response_json(response).await.unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("412"),
+            "风控响应没有报出 HTTP 状态码: {rendered}"
+        );
+        assert!(
+            !rendered.contains("expected value"),
+            "风控响应仍然被当成 JSON 解析错误: {rendered}"
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn body_snippet_compacts_and_truncates_html() {
+        assert_eq!(body_snippet(b""), "空响应体");
+        assert_eq!(body_snippet(b"  {\"code\":0}\n"), "{\"code\":0}");
+        let long = body_snippet("x".repeat(500).as_bytes());
+        assert_eq!(long.chars().count(), 121, "截断后长度不符: {long}");
+        assert!(long.ends_with('…'));
     }
 
     #[tokio::test]
