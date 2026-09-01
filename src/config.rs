@@ -228,7 +228,7 @@ impl Default for AiConfig {
             safe_context_tokens: 200_000,
             segment_overlap_cues: 12,
             segment_max_cues: 400,
-            translation_batch_cues: 25,
+            translation_batch_cues: 40,
             translation_concurrency: 4,
             translation_batch_retries: 2,
             daily_token_limit: None,
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(adaptive.batch_mode, BatchMode::Adaptive);
         assert_eq!(adaptive.context_window_tokens, 256_000);
         assert_eq!(adaptive.safe_context_tokens, 200_000);
-        assert_eq!(adaptive.translation_batch_cues, 25);
+        assert_eq!(adaptive.translation_batch_cues, 40);
         assert_eq!(adaptive.translation_concurrency, 4);
         assert_eq!(adaptive.translation_batch_retries, 2);
         assert_eq!(adaptive.provider, AI_PROVIDER);
