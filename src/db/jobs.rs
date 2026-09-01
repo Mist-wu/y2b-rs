@@ -559,6 +559,41 @@ impl Database {
     }
 
     /// 创作中心已核对到唯一稿件后，连同投稿冷却安全确认不确定态任务。
+    /// 人工核对确认这次投稿从未落地：结算 attempt，并把任务退回可重投状态。
+    ///
+    /// 与 `confirm_uncertain_upload` 相对。`upload_attempts` 里 `uncertain` 的
+    /// 行是 maintenance 的**永久** blocker，而结算它的唯一入口原本是「创作中心
+    /// 存在唯一同名稿件」。投稿真的没落地时（线上那条是 biliup 传封面时 DNS
+    /// 失败），既核对不到稿件，`retry_job` 又不收 `upload_uncertain`，任务就
+    /// 会一直挡住所有部署——错误信息让人工提供 BVID，却没有任何命令能提供。
+    ///
+    /// 调用方必须先拿到「创作中心没有这次投稿」的证据；这里只负责原子结算。
+    pub fn discard_uncertain_upload(&self, id: &str, detail: &str) -> Result<JobStatus> {
+        let now_text = Utc::now().to_rfc3339();
+        let mut connection = self.conn();
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let attempt_changed = tx.execute(
+            "UPDATE upload_attempts SET status='failed',detail=?,finished_at=? \
+             WHERE id=(SELECT id FROM upload_attempts WHERE job_id=? ORDER BY started_at DESC LIMIT 1) \
+               AND status='uncertain'",
+            params![detail, &now_text, id],
+        )?;
+        // 上传计划还在就直接回到 ready_to_upload，和 retry_job 一致；否则从头重跑。
+        let changed = tx.execute(
+            "UPDATE jobs SET status=CASE WHEN prepared_upload_json IS NOT NULL THEN 'ready_to_upload' ELSE 'queued' END,\
+             attempt=0,error=NULL,retry_at=NULL,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
+             WHERE id=? AND status='upload_uncertain'",
+            params![&now_text, id],
+        )?;
+        if attempt_changed != 1 || changed != 1 {
+            anyhow::bail!("任务 {id} 不在有效的投稿结果不确定状态")
+        }
+        let status: String =
+            tx.query_row("SELECT status FROM jobs WHERE id=?", [id], |row| row.get(0))?;
+        tx.commit()?;
+        status.parse()
+    }
+
     pub fn confirm_uncertain_upload(
         &self,
         id: &str,

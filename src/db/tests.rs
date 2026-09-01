@@ -1992,6 +1992,77 @@ fn upload_completion_commit_failure_never_reopens_submission() {
 }
 
 #[test]
+fn discarding_an_unpublished_uncertain_upload_clears_the_maintenance_blocker() {
+    let t = tempfile::tempdir().unwrap();
+    let db = Database::open(&t.path().join("upload-discard.db")).unwrap();
+    let id = db
+        .create_job(NewJob {
+            channel_id: None,
+            video_id: "upload-discard",
+            url: "https://youtu.be/upload-discard",
+            title: None,
+            published: None,
+            updated: None,
+            transfer_mode: TransferMode::Translated,
+        })
+        .unwrap()
+        .unwrap();
+    db.queue_prepared_upload(
+        &id,
+        &PreparedUpload::Submission {
+            video_path: "/tmp/upload-discard.mp4".into(),
+            cover_path: "/tmp/upload-discard.jpg".into(),
+            mode: TransferMode::Translated,
+            completion_status: JobStatus::UploadedOriginalPendingSubtitle,
+        },
+    )
+    .unwrap();
+    let attempt_id = db.begin_prepared_upload(&id).unwrap().unwrap();
+    db.mark_upload_attempt_uncertain(&id, &attempt_id, "biliup 传封面时 DNS 失败")
+        .unwrap();
+    assert_eq!(
+        db.get_job(&id).unwrap().unwrap().status,
+        JobStatus::UploadUncertain
+    );
+    // 不确定的 attempt 会永久挡住维护窗口，核对不到稿件时原本没有任何出口。
+    assert_maintenance_blocker(
+        &db.maintenance_status(None).unwrap(),
+        "upload_attempts",
+        &attempt_id,
+    );
+
+    let status = db
+        .discard_uncertain_upload(&id, "人工核对创作中心确认未落地")
+        .unwrap();
+
+    assert_eq!(status, JobStatus::ReadyToUpload);
+    let job = db.get_job(&id).unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::ReadyToUpload);
+    assert!(job.error.is_none());
+    assert!(job.bvid.is_none());
+    let attempt: (String, Option<String>) = db
+        .conn()
+        .query_row(
+            "SELECT status,finished_at FROM upload_attempts WHERE id=?",
+            [&attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(attempt.0, "failed");
+    assert!(attempt.1.is_some(), "结算后必须写入 finished_at");
+    assert!(db.maintenance_status(None).unwrap().idle, "结算后仍不 idle");
+    // 上传计划还在，重投直接从 ready_to_upload 继续。
+    assert!(db.next_ready_to_upload_job().unwrap().is_some());
+    // 已经结算过的 attempt 不能被重复结算。
+    assert!(
+        db.discard_uncertain_upload(&id, "重复结算")
+            .unwrap_err()
+            .to_string()
+            .contains("不在有效的投稿结果不确定状态")
+    );
+}
+
+#[test]
 fn upload_claim_atomically_observes_deadline_and_maintenance_hold() {
     let t = tempfile::tempdir().unwrap();
     let db = Database::open(&t.path().join("upload-window.db")).unwrap();

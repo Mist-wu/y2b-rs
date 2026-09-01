@@ -166,6 +166,10 @@ enum JobCmd {
     /// 从 Bilibili 创作中心核对 upload_uncertain 任务；只接受唯一同名稿件。
     ReconcileUpload {
         id: String,
+        /// 人工判定这次投稿从未落地：结算 attempt 并把任务退回重投。
+        /// 仍会先查创作中心，存在同名稿件时拒绝执行。
+        #[arg(long)]
+        not_published: bool,
     },
 }
 #[derive(Subcommand)]
@@ -517,10 +521,13 @@ async fn main() -> Result<()> {
                 db.retry_job(&id)?;
                 println!("已重新排队 {id}");
             }
-            JobCmd::ReconcileUpload { id } => {
-                let message = Pipeline::new(config, db)
-                    .reconcile_uncertain_upload(&id)
-                    .await?;
+            JobCmd::ReconcileUpload { id, not_published } => {
+                let pipeline = Pipeline::new(config, db);
+                let message = if not_published {
+                    pipeline.declare_uncertain_upload_not_published(&id).await?
+                } else {
+                    pipeline.reconcile_uncertain_upload(&id).await?
+                };
                 println!("{message}");
             }
         },

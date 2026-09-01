@@ -229,6 +229,64 @@ pub(super) fn ensure_prepared_file(path: &Path, label: &str) -> Result<()> {
 }
 
 impl Pipeline {
+    /// 读取创作中心最近若干页稿件，供投稿核对使用。
+    async fn creator_archives(&self) -> Result<Vec<CreatorArchive>> {
+        let mut command = Command::new(&self.config.bilibili.biliup);
+        command
+            .arg("-u")
+            .arg(&self.config.bilibili.cookies)
+            .arg("list")
+            .arg("--from-page")
+            .arg("1")
+            .arg("--max-pages")
+            .arg("5");
+        let output = run_monitored(command, Duration::from_secs(120)).await?;
+        Ok(parse_creator_archives(&output.stdout))
+    }
+
+    /// 人工判定这次投稿从未落地，把 `upload_uncertain` 任务退回重投。
+    ///
+    /// `reconcile_uncertain_upload` 只能确认「投上去了」；投稿真的失败时它必然
+    /// 报证据不足，而 `upload_attempts` 里那行 `uncertain` 是 maintenance 的永久
+    /// blocker，会一直挡住部署。这条出口仍然先查创作中心：只要存在**任何**同名
+    /// 稿件，就拒绝声明未落地并要求走正常核对，避免把一次成功的投稿重投成重复
+    /// 稿件。
+    pub async fn declare_uncertain_upload_not_published(&self, job_id: &str) -> Result<String> {
+        let job = self
+            .db
+            .get_job(job_id)?
+            .with_context(|| format!("任务不存在: {job_id}"))?;
+        if job.status != JobStatus::UploadUncertain {
+            bail!(
+                "任务 {job_id} 当前状态不是 upload_uncertain: {}",
+                job.status
+            )
+        }
+        let publication = self
+            .db
+            .publication_metadata(job_id)?
+            .with_context(|| format!("不确定投稿任务 {job_id} 缺少投稿元数据"))?;
+        let archives = self.creator_archives().await?;
+        let same_title = archives
+            .iter()
+            .filter(|archive| archive.title == publication.title)
+            .map(|archive| archive.bvid.as_str())
+            .collect::<Vec<_>>();
+        if !same_title.is_empty() {
+            bail!(
+                "创作中心存在同名稿件 {}，不能声明未落地；请改用 jobs reconcile-upload 核对: {}",
+                same_title.join(", "),
+                publication.title
+            )
+        }
+        let detail = format!("人工核对创作中心确认未落地: {}", publication.title);
+        let status = self.db.discard_uncertain_upload(job_id, &detail)?;
+        self.db.event(Some(job_id), "warn", &detail)?;
+        Ok(format!(
+            "已确认 {job_id} 的投稿未落地，任务退回 {status} 等待重投"
+        ))
+    }
+
     /// 对 `upload_uncertain` 任务读取创作中心最近稿件，同时核对标题、投稿
     /// attempt 时间窗、稿件发布时间和 BVID 归属；证据不足时绝不自动确认或重投。
     pub async fn reconcile_uncertain_upload(&self, job_id: &str) -> Result<String> {
@@ -257,17 +315,7 @@ impl Pipeline {
             .db
             .publication_metadata(job_id)?
             .with_context(|| format!("不确定投稿任务 {job_id} 缺少投稿元数据"))?;
-        let mut command = Command::new(&self.config.bilibili.biliup);
-        command
-            .arg("-u")
-            .arg(&self.config.bilibili.cookies)
-            .arg("list")
-            .arg("--from-page")
-            .arg("1")
-            .arg("--max-pages")
-            .arg("5");
-        let output = run_monitored(command, Duration::from_secs(120)).await?;
-        let archives = parse_creator_archives(&output.stdout);
+        let archives = self.creator_archives().await?;
         let mut occupied_bvids = HashSet::new();
         for archive in archives
             .iter()

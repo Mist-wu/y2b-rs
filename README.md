@@ -50,7 +50,7 @@ y2b channels enable <ID> | disable <ID> | sync
 # 任务
 y2b jobs add <URL> --mode direct|translated       # 必须显式指定 --mode
 y2b run <URL> [--mode translated]                 # 单次跑完，默认上传原片并补中文 CC
-y2b jobs list [N] | show <JOB_ID> | retry <JOB_ID> | reconcile-upload <JOB_ID>
+y2b jobs list [N] | show <JOB_ID> | retry <JOB_ID> | reconcile-upload <JOB_ID> [--not-published]
 
 # 字幕 / 模型 / 运维
 y2b subtitle add <BVID>   # 给指定已投稿视频补中文 CC
@@ -112,7 +112,7 @@ TUI 不进入默认生产构建。需要交互界面时使用 `cargo build --rel
 
 - SQLite 持久化频道、任务、阶段、峰值 RSS、Pi token/cost 和认证状态。普通故障连续失败 5 次进 `dead_letter` 并删除大型视频；失败间按 `min(5min × 2^n, 1h)` 退避，首次重试仍是 10 分钟。直播／预约／回放生成中不消耗失败次数。
 - `watch` 使用单个准备 worker + 单个上传 worker + 单个字幕 worker。任务准备完成后持久化为 `ready_to_upload`，投稿冷却期间仍可继续下载和翻译后续任务，实际上传严格串行。最终领取任务的写事务会同时复核投稿冷却和维护锁。CC 字幕补交独立成队列，不占用上传 worker。
-- 每次真正投稿先持久化 attempt；中断且无法确认结果时进入 `upload_uncertain`，禁止自动重投。`jobs reconcile-upload` 查询创作中心后，只有标题匹配、稿件发布时间晚于本次 attempt 开始时间且 BVID 未被其他任务占用时才会确认；缺少任一证据都会保持不确定态并要求人工提供 BVID。数据库同时用部分唯一索引保证一个非空 BVID 只能归属一个任务。
+- 每次真正投稿先持久化 attempt；中断且无法确认结果时进入 `upload_uncertain`，禁止自动重投。`jobs reconcile-upload` 查询创作中心后，只有标题匹配、稿件发布时间晚于本次 attempt 开始时间且 BVID 未被其他任务占用时才会确认；缺少任一证据都会保持不确定态并要求人工提供 BVID。投稿确实没落地时（例如 biliup 传封面时网络中断）创作中心永远查不到同名稿件，而 `upload_attempts` 里的 `uncertain` 行是维护窗口的永久 blocker，会一直挡住部署；此时用 `jobs reconcile-upload <JOB_ID> --not-published` 显式声明未落地，它仍会先查创作中心，只要存在任何同名稿件就拒绝执行，确认没有才结算 attempt 并把任务退回 `ready_to_upload` 重投。数据库同时用部分唯一索引保证一个非空 BVID 只能归属一个任务。
 
 - RSS 轮询／yt-dlp 校对与备份／认证各跑独立任务，长时间 yt-dlp 调用不阻塞队列调度。裸频道 URL 规范化到内容标签页，校对结果中的频道／播放列表条目不会被误当视频。
 - 所有外部命令独占 Unix 进程组；超时或并行分支提前取消都会清理完整后代树，避免 PyInstaller yt-dlp／Node 变成孤儿进程继续写临时分片。
