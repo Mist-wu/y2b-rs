@@ -280,10 +280,28 @@ pub(super) fn load_curated_glossary(path: &Path) -> Result<Vec<(String, String)>
         .collect())
 }
 
+/// 词库里带大写的词条是专有名词（`Max`、`Surge`、`Shade`、`Pearl`…），只有源文
+/// 同样大写时才是游戏内含义；`max out that brawler`、`a surge in damage` 这类普通
+/// 英文用法必须放行。全小写词条（`ranked`、`skill`、`pro`…）本来就是行话，也用来
+/// 纠正 ASR 误听（`cult` => 柯尔特），继续大小写不敏感。
+///
+/// 原来一律 `(?i)` 匹配，比 Pi 提示词里写明的「仅在按 Brawl Stars 含义使用时应用
+/// 词库」更严：模型把 `max out` 正确译成「满级」，校验却要求出现「麦克斯」，
+/// 这个约束无法满足，整条任务重试到 dead_letter（线上 oXJ2y9BsNlU 的 253~256
+/// 四条 cue 都是 `max out`）。
+///
+/// 残留风险是句首大写的普通词（`Max out that brawler.`）仍会被要求译名；相比
+/// 整条任务作废，这个方向的误判代价小得多，且词库仍完整进入提示词。
 fn source_contains_glossary_term(source: &str, term: &str) -> Result<bool> {
+    let term = term.trim();
+    let case_insensitive = if term.chars().any(char::is_uppercase) {
+        ""
+    } else {
+        "(?i)"
+    };
     let pattern = format!(
-        "(?i)(?:^|[^A-Za-z0-9]){}(?:$|[^A-Za-z0-9])",
-        regex::escape(term.trim())
+        "{case_insensitive}(?:^|[^A-Za-z0-9]){}(?:$|[^A-Za-z0-9])",
+        regex::escape(term)
     );
     Ok(Regex::new(&pattern)?.is_match(source))
 }
@@ -1368,6 +1386,51 @@ mod tests {
         assert!(
             validate_translation_glossary(&unrelated, &[(0, "最高速度".into())], &glossary).is_ok()
         );
+    }
+
+    #[test]
+    fn glossary_proper_nouns_only_bind_when_the_source_is_capitalized() {
+        let glossary = vec![
+            ("Max".into(), "麦克斯".into()),
+            ("ranked".into(), "排位".into()),
+        ];
+        // 线上 oXJ2y9BsNlU 的原句：`max out` 是「练满」，不是麦克斯。旧的一律
+        // 忽略大小写会让这条 cue 永远无法通过校验，整条任务重试到 dead_letter。
+        let common_word = vec![cue(
+            0,
+            "And I calculated that out to 4% of the coins you need to max out that",
+        )];
+        assert!(
+            validate_translation_glossary(
+                &common_word,
+                &[(0, "才占你练满所需金币的4%".into())],
+                &glossary
+            )
+            .is_ok()
+        );
+        // 同一个词大写时仍然是英雄名，必须用译名。
+        let brawler = vec![cue(0, "Max is broken in ranked.")];
+        let error = validate_translation_glossary(
+            &brawler,
+            &[(0, "这英雄在排位太强了。".into())],
+            &glossary,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Max => 麦克斯"));
+        assert!(
+            validate_translation_glossary(
+                &brawler,
+                &[(0, "麦克斯在排位太强了。".into())],
+                &glossary
+            )
+            .is_ok()
+        );
+        // 全小写词条是行话和 ASR 纠错，继续大小写不敏感。
+        let shouted = vec![cue(0, "RANKED is different now")];
+        let error =
+            validate_translation_glossary(&shouted, &[(0, "现在的天梯不一样了".into())], &glossary)
+                .unwrap_err();
+        assert!(error.to_string().contains("ranked => 排位"));
     }
 
     #[test]
