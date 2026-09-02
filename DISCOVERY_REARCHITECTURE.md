@@ -98,7 +98,7 @@ video_candidates(
 - 历史样本达到默认 5 条后，每个星期几选择该日出现次数最多的小时桶；默认以桶中点为中心建立 120 分钟热窗：热窗内每 60 秒轮询，窗外每 30 分钟轮询。
 - 冷区调度会在下一个热窗起点前提前唤醒，不能让一次 30/60 分钟睡眠跨过热窗开头。
 - 历史少于 5 条的新频道固定每 5 分钟轮询，避免用不可靠分布制造假精度。
-- 有效 WebSub 租约优先于预测模型：该频道的 Data API 自动变为每 30 分钟纯兜底；租约过期后自动恢复预测调度。
+- 有效 WebSub 租约优先于预测模型，也优先于 `priority` 频道的固定 60 秒调度：该频道的 Data API 和 RSS 探针都变为每 `websub.data_api_poll_minutes` 分钟纯兜底；租约过期后自动恢复原调度。优先频道 60 秒 Data API 曾占日配额八成以上，这正是 WebSub 替代的部分。
 
 `playlistItems.list` 按调用而不是返回条数计费，因此默认 `maxResults=50`。列表响应的 ETag 保存在频道行；后续发送 `If-None-Match`，HTTP 304 跳过 body 解析。配额在请求发出前记 1 单位，**304 同样计费**，预算不把它当成配额节省。
 
@@ -219,6 +219,17 @@ WebSub 是秒级发现的最终通道。程序侧只需配置并运行 `y2b watc
    ```
 
    Cloudflare 的 published application 会把公网主机名映射到本地 HTTP 服务；官方配置说明见 [Configuration file / ingress rules](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/configuration-file/)。
+
+### 用 API 代替 Dashboard（生产环境实际做法）
+
+生产环境的 `push.mistwu.com` 是用账户 API token 通过 REST 完成的，不依赖浏览器；需要账户级 `Cloudflare Tunnel Write` 与 zone 级 `DNS Write`：
+
+1. `POST /accounts/{account}/cfd_tunnel` `{"name":"y2b-websub","config_src":"cloudflare"}`，得到 tunnel id；
+2. `PUT /accounts/{account}/cfd_tunnel/{id}/configurations`，ingress 只放行 `hostname=push.mistwu.com` 且 `path=^/websub/` 到 `http://127.0.0.1:8787`，兜底 `http_status:404`；
+3. `POST /zones/{zone}/dns_records` 写 CNAME `push → {id}.cfargotunnel.com`，`proxied=true`；
+4. `GET /accounts/{account}/cfd_tunnel/{id}/token` 取 connector token，只在目标主机执行 `sudo cloudflared service install <TOKEN>`（Ubuntu 用 `pkg.cloudflare.com` apt 源安装 `cloudflared`）。
+
+若 token 只有账户级权限（没有 zone DNS），可先用 `Account API Tokens Write` 创建一个仅含目标 zone `DNS Write`、带过期时间的临时 token 写 CNAME，用完删除。
 
 ### y2b 配置与验证
 
