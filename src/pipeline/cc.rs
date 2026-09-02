@@ -30,8 +30,7 @@ pub const CC_MISSING_MATERIAL_MAX_ATTEMPTS: i64 = 8;
 
 /// 第 n 次「无字幕轨」失败后的等待秒数：前期密集覆盖 ASR 常见延迟，后期
 /// 拉长到 8 小时以覆盖直播回放次日才出字幕的情况；累计约 16 小时。
-const CC_MISSING_MATERIAL_DELAYS_SECONDS: [i64; 7] =
-    [300, 900, 1800, 3600, 7200, 14400, 28800];
+const CC_MISSING_MATERIAL_DELAYS_SECONDS: [i64; 7] = [300, 900, 1800, 3600, 7200, 14400, 28800];
 
 /// 稿件仍在 B站处理中（-404）时的退避基数：第 n 次等待 `min(30 × 2^n, 1h)`。
 ///
@@ -89,8 +88,7 @@ pub(super) fn cc_retry_delay_seconds(attempt: i64, video_not_ready: bool) -> i64
 /// 上游无字幕轨第 `attempt` 次失败后到下次探测的秒数。
 pub(super) fn cc_missing_material_delay_seconds(attempt: i64) -> i64 {
     let index = usize::try_from(attempt.saturating_sub(1)).unwrap_or(0);
-    CC_MISSING_MATERIAL_DELAYS_SECONDS
-        [index.min(CC_MISSING_MATERIAL_DELAYS_SECONDS.len() - 1)]
+    CC_MISSING_MATERIAL_DELAYS_SECONDS[index.min(CC_MISSING_MATERIAL_DELAYS_SECONDS.len() - 1)]
 }
 
 /// 归类 CC 补交失败原因用的错误前缀（`is_missing_subtitle_material` 依赖它们）。
