@@ -15,8 +15,23 @@ pub const CC_INITIAL_DELAY_SECONDS: i64 = 90;
 ///
 /// 每次都会先检查 B站是否已生成中文字幕；配合下面的退避，`-404` 的覆盖窗口
 /// 约 10 小时、其余失败约 11.5 小时。线上观察到 B站自动字幕曾在投稿约 8 小时
-/// 后才出现，因此窗口必须留出余量。
+/// 后才出现，因此窗口必须留出余量。上游没有英文字幕轨的情况不走这个上限，
+/// 见 `CC_MISSING_MATERIAL_MAX_ATTEMPTS`。
 pub const CC_MAX_ATTEMPTS: i64 = 16;
+
+/// 上游暂无英文字幕轨时的独立探测次数。
+///
+/// 线上 14 天数据：约一半新视频投稿时 YouTube ASR 字幕还没生成，但绝大多数
+/// 在 30～90 分钟内出现；剩下几条（频道关闭自动字幕、非英语口播）按通用
+/// 16 次退避探测了 12 小时以上依然没有，最后只留下一条「需手动补交」的异常
+/// 任务。这类视频本身没有问题——原视频已经投稿，只是没有字幕可补——所以
+/// 探测要稀疏，耗尽后按无字幕完成收尾，而不是留在待补状态报警。
+pub const CC_MISSING_MATERIAL_MAX_ATTEMPTS: i64 = 8;
+
+/// 第 n 次「无字幕轨」失败后的等待秒数：前期密集覆盖 ASR 常见延迟，后期
+/// 拉长到 8 小时以覆盖直播回放次日才出字幕的情况；累计约 16 小时。
+const CC_MISSING_MATERIAL_DELAYS_SECONDS: [i64; 7] =
+    [300, 900, 1800, 3600, 7200, 14400, 28800];
 
 /// 稿件仍在 B站处理中（-404）时的退避基数：第 n 次等待 `min(30 × 2^n, 1h)`。
 ///
@@ -69,6 +84,13 @@ pub(super) fn cc_retry_delay_seconds(attempt: i64, video_not_ready: bool) -> i64
     };
     base.saturating_mul(1i64 << attempt.clamp(0, 16))
         .min(CC_RETRY_CAP_SECONDS)
+}
+
+/// 上游无字幕轨第 `attempt` 次失败后到下次探测的秒数。
+pub(super) fn cc_missing_material_delay_seconds(attempt: i64) -> i64 {
+    let index = usize::try_from(attempt.saturating_sub(1)).unwrap_or(0);
+    CC_MISSING_MATERIAL_DELAYS_SECONDS
+        [index.min(CC_MISSING_MATERIAL_DELAYS_SECONDS.len() - 1)]
 }
 
 /// 归类 CC 补交失败原因用的错误前缀（`is_missing_subtitle_material` 依赖它们）。
@@ -266,17 +288,17 @@ impl Pipeline {
                 }
                 let detail = format!("{error:#}");
                 let attempt = job.subtitle_attempt + 1;
-                let missing_material = is_missing_subtitle_material(&error);
                 let uncertain_submission = is_cc_submission_uncertain(&error);
                 let explicit_rejection = is_explicit_cc_rejection(&error);
+                if is_missing_subtitle_material(&error) {
+                    return self
+                        .defer_or_complete_without_material(&job, attempt, &detail, error)
+                        .await;
+                }
                 if attempt >= CC_MAX_ATTEMPTS {
                     let exhausted = if uncertain_submission {
                         format!(
                             "CC 字幕投稿结果在 {CC_MAX_ATTEMPTS} 次只读核对后仍无法确认，已禁止重投并转人工: {detail}"
-                        )
-                    } else if missing_material {
-                        format!(
-                            "CC 字幕素材在 {CC_MAX_ATTEMPTS} 次检查后仍不可用，需手动补交: {detail}"
                         )
                     } else {
                         format!(
@@ -305,7 +327,6 @@ impl Pipeline {
                     job_id = %job.id,
                     attempt,
                     delay,
-                    missing_material,
                     uncertain_submission,
                     explicit_rejection,
                     error = %error,
@@ -319,6 +340,46 @@ impl Pipeline {
                 Err(error)
             }
         }
+    }
+
+    /// 上游暂无英文字幕轨：按稀疏计划继续探测；探测耗尽说明这条视频就是没有
+    /// 字幕，原视频已经投稿，直接按无字幕完成，不留异常。之后若上游补了字幕，
+    /// `y2b subtitle add` 仍可对已完成任务手动补交。
+    async fn defer_or_complete_without_material(
+        &self,
+        job: &Job,
+        attempt: i64,
+        detail: &str,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        if attempt >= CC_MISSING_MATERIAL_MAX_ATTEMPTS {
+            let bvid = job.bvid.as_deref().unwrap_or_default();
+            let message = format!(
+                "上游在 {attempt} 次检查后仍无英文字幕轨，原视频已投稿，按无字幕完成；若之后出现字幕可手动执行 y2b subtitle add {bvid}"
+            );
+            self.db.finish_subtitle_claim(&job.id, true)?;
+            self.db.event(Some(&job.id), "info", &message)?;
+            tracing::info!(job_id = %job.id, attempt, "{message}");
+            return Ok(());
+        }
+        let delay = cc_missing_material_delay_seconds(attempt);
+        let retry_detail = format!("等待上游英文字幕轨: {detail}");
+        self.db
+            .defer_claimed_pending_subtitle(&job.id, &retry_detail, delay)?;
+        tracing::info!(
+            job_id = %job.id,
+            attempt,
+            delay,
+            "上游暂无英文字幕轨，稍后再探测"
+        );
+        self.db.event(
+            Some(&job.id),
+            "info",
+            &format!(
+                "{retry_detail}（第 {attempt}/{CC_MISSING_MATERIAL_MAX_ATTEMPTS} 次，{delay} 秒后）"
+            ),
+        )?;
+        Err(error)
     }
 
     pub(super) async fn backfill_cc_subtitle_for_job(
@@ -594,6 +655,21 @@ mod tests {
             total >= 10 * 3600,
             "-404 覆盖窗口只有 {total}s，不足 10 小时"
         );
+    }
+
+    #[test]
+    fn missing_material_probes_are_sparse_but_cover_next_day_captions() {
+        // 前期覆盖 ASR 常见的 30～90 分钟延迟，后期拉长到 8 小时。
+        assert_eq!(cc_missing_material_delay_seconds(1), 300);
+        assert_eq!(cc_missing_material_delay_seconds(2), 900);
+        assert_eq!(cc_missing_material_delay_seconds(4), 3600);
+        assert_eq!(cc_missing_material_delay_seconds(7), 28800);
+        assert_eq!(cc_missing_material_delay_seconds(99), 28800);
+        // 比通用 16 次少一半探测，但总覆盖仍超过直播回放次日出字幕所需的 12 小时。
+        let total: i64 = (1..CC_MISSING_MATERIAL_MAX_ATTEMPTS)
+            .map(cc_missing_material_delay_seconds)
+            .sum();
+        assert!(total >= 12 * 3600, "无字幕轨探测窗口只有 {total}s");
     }
 
     #[test]
