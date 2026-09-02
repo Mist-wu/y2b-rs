@@ -212,7 +212,7 @@ WebSub 是秒级发现的最终通道。程序侧只需配置并运行 `y2b watc
    - Service URL：`http://127.0.0.1:8787`；
    - 如界面提供 Path，可限制为 `/websub/*`；否则应用自身对其他路径返回 404。
 4. 不要在该主机名或 `/websub/*` 前加需要浏览器登录的 Cloudflare Access 身份验证，否则 YouTube hub 无法完成 GET challenge 和 POST 通知。
-5. 等 DNS 与 Tunnel 生效，并完成下一节配置、启动 `y2b watch` 后，用不存在的随机路径验证转发；预期是应用返回 404，而不是 Cloudflare 502：
+5. 等 DNS 与 Tunnel 生效，并完成下一节配置、启动 `y2b watch` 后，用不存在的随机路径验证转发；预期是应用返回 4xx（不带 `hub.*` 参数时为 400，带参数但回调未知时为 404），而不是 Cloudflare 502/530：
 
    ```bash
    curl -i https://push.example.com/websub/not-a-real-callback
