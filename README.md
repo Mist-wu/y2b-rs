@@ -81,6 +81,7 @@ TUI 不进入默认生产构建。需要交互界面时使用 `cargo build --rel
 <summary><b>发现与筛选</b></summary>
 
 - 优先频道每 60 秒分别检查 RSS 和 Data API；独立 RSS 循环每秒检查到期时间，不与普通频道争抢探测名额。普通频道继续使用预测 Data API 与限额 RSS 探针。此保证从视频出现在 YouTube RSS/API 时开始计算，YouTube 自身的数据传播延迟不在服务控制范围内。
+- 启用 WebSub 后（见 `DISCOVERY_REARCHITECTURE.md`），新视频由 YouTube hub 主动推送到 `callback_base_url`；租约有效的频道（含优先频道）Data API 与 RSS 都退到每 `websub.data_api_poll_minutes`（默认 30 分钟）兜底一次，租约过期自动恢复原调度。
 - RSS 失败先短退避重试 3 次；yt-dlp 回退受单频道冷却和「全局 10 分钟最多 3 次」熔断限制，避免暂态故障演变成请求风暴。回退名额优先给从未尝试或最久未尝试的普通频道，RSS 全面异常时排在后面的频道不会被饿死。
 - 直播回放（`was_live`）按普通视频搬运。直播中（`is_live`）、预约（`is_upcoming`）、回放生成中（`post_live`）不入队，每 30 分钟复查，回放就绪后自动搬运。
 - 超过 `youtube.max_duration_seconds`（默认 2 小时）直接跳过并持久化判定，不重复请求；放宽上限后自动重查。已入队任务若发现超时长直接进 `dead_letter`，不消耗重试次数。
