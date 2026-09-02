@@ -209,6 +209,24 @@ struct DataApiPollDecision {
     mode: DataApiPollMode,
 }
 
+fn websub_lease_active(config: &Config, channel: &Channel, now: DateTime<Utc>) -> bool {
+    config.websub.enabled
+        && channel
+            .websub_lease_expires_at
+            .is_some_and(|expires_at| expires_at > now)
+}
+
+/// RSS 探针成功后的下一次间隔。WebSub 租约有效时 RSS 与 Data API 一样退到
+/// `websub.data_api_poll_minutes` 兜底：优先频道每分钟一次的 RSS 本来只是为了
+/// 补 Data API 的发现延迟，推送到位后继续每分钟请求 YouTube 只会增加 429 风险。
+fn rss_poll_interval(config: &Config, channel: &Channel, now: DateTime<Utc>) -> Duration {
+    if websub_lease_active(config, channel, now) {
+        Duration::from_secs(config.websub.data_api_poll_minutes.saturating_mul(60))
+    } else {
+        Duration::from_secs(config.monitor.poll_seconds.max(1))
+    }
+}
+
 fn prediction_poll_decision(
     config: &Config,
     history: &[DateTime<Utc>],
@@ -688,13 +706,21 @@ impl Monitor {
         Ok(api.quota_policy()?.degradation != QuotaDegradation::FallbackOnly)
     }
 
+    /// 有效 WebSub 租约意味着新视频由 hub 秒级推送到本地回调，Data API 与 RSS
+    /// 都只剩兜底职责。优先频道也不例外：它们原本每分钟一次的 Data API 轮询占
+    /// 日配额八成以上，正是 WebSub 要替代的部分。
+    fn websub_lease_active(&self, channel: &Channel, now: DateTime<Utc>) -> bool {
+        websub_lease_active(&self.config, channel, now)
+    }
+
     fn data_api_poll_decision(
         &self,
         channel: &Channel,
         now: DateTime<Utc>,
         degradation: QuotaDegradation,
     ) -> Result<DataApiPollDecision> {
-        if channel.priority == ChannelPriority::Priority {
+        let websub_active = self.websub_lease_active(channel, now);
+        if channel.priority == ChannelPriority::Priority && !websub_active {
             return Ok(DataApiPollDecision {
                 interval: Duration::from_secs(self.config.monitor.poll_seconds.max(1)),
                 mode: DataApiPollMode::Priority,
@@ -712,10 +738,6 @@ impl Monitor {
                 )
             })?;
         let history = self.db.channel_publication_history(channel.id)?;
-        let websub_active = self.config.websub.enabled
-            && channel
-                .websub_lease_expires_at
-                .is_some_and(|expires_at| expires_at > now);
         Ok(prediction_poll_decision(
             &self.config,
             &history,
@@ -1349,9 +1371,8 @@ impl Monitor {
                 .min(CHANNEL_FAILURE_BACKOFF_CAP);
             now + chrono::Duration::from_std(delay)?
         } else {
-            now + chrono::Duration::seconds(
-                i64::try_from(self.config.monitor.poll_seconds).unwrap_or(i64::MAX),
-            )
+            let channel = self.db.channel(id)?;
+            now + chrono::Duration::from_std(rss_poll_interval(&self.config, &channel, now))?
         };
         self.db
             .finish_channel_poll(id, detail.as_deref(), failed, next_poll_at)?;
@@ -3122,5 +3143,69 @@ esac
             .unwrap();
         assert_eq!(decision.mode, DataApiPollMode::WebSubFallback);
         assert_eq!(decision.interval, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn active_websub_lease_overrides_priority_polling_for_data_api_and_rss() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("websub-priority.db")).unwrap();
+        let channel_id = add_test_channel(&db, "https://example.invalid/feed", "priority");
+        db.set_channel_priority(channel_id, ChannelPriority::Priority)
+            .unwrap();
+        let now = Utc::now();
+        let mut config = Config::default();
+        config.monitor.poll_seconds = 60;
+        config.websub.enabled = true;
+        config.websub.callback_base_url = "https://push.example.com".into();
+        config.websub.data_api_poll_minutes = 20;
+        let monitor = Monitor::new_with_data_api(
+            config.clone(),
+            db.clone(),
+            None,
+            "http://127.0.0.1:9/youtube/v3",
+        )
+        .unwrap();
+
+        // 未订阅成功前优先频道保持每分钟 Data API + RSS。
+        let channel = db.channel(channel_id).unwrap();
+        let decision = monitor
+            .data_api_poll_decision(&channel, now, QuotaDegradation::Normal)
+            .unwrap();
+        assert_eq!(decision.mode, DataApiPollMode::Priority);
+        assert_eq!(
+            rss_poll_interval(&config, &channel, now),
+            Duration::from_secs(60)
+        );
+
+        // 租约生效后两条通道都退到 data_api_poll_minutes 兜底。
+        db.mark_websub_lease(channel_id, now + chrono::Duration::days(1))
+            .unwrap();
+        let channel = db.channel(channel_id).unwrap();
+        let decision = monitor
+            .data_api_poll_decision(&channel, now, QuotaDegradation::Normal)
+            .unwrap();
+        assert_eq!(decision.mode, DataApiPollMode::WebSubFallback);
+        assert_eq!(decision.interval, Duration::from_secs(20 * 60));
+        assert_eq!(
+            rss_poll_interval(&config, &channel, now),
+            Duration::from_secs(20 * 60)
+        );
+
+        // 租约过期或 WebSub 关闭时立即恢复优先频道的高频轮询。
+        let expired = now + chrono::Duration::days(2);
+        let decision = monitor
+            .data_api_poll_decision(&channel, expired, QuotaDegradation::Normal)
+            .unwrap();
+        assert_eq!(decision.mode, DataApiPollMode::Priority);
+        assert_eq!(
+            rss_poll_interval(&config, &channel, expired),
+            Duration::from_secs(60)
+        );
+        let mut disabled = config.clone();
+        disabled.websub.enabled = false;
+        assert_eq!(
+            rss_poll_interval(&disabled, &channel, now),
+            Duration::from_secs(60)
+        );
     }
 }
