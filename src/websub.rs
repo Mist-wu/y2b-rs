@@ -82,10 +82,12 @@ impl WebSubService {
             let channel_name = channel.name.clone();
             match self.subscribe_channel(channel).await {
                 Ok(()) => accepted += 1,
+                // reqwest 的顶层信息只有 "error sending request"，根因（连接/读超时、
+                // DNS）在 source 链里；hub 偶发 15 秒无响应时需要看到它。
                 Err(error) => tracing::warn!(
                     channel_id,
                     channel = %channel_name,
-                    error = %error,
+                    error = %format!("{error:#}"),
                     "WebSub 订阅或续订失败"
                 ),
             }
@@ -112,7 +114,7 @@ impl WebSubService {
                     tracing::warn!(
                         channel_id,
                         channel = %channel_name,
-                        error = %error,
+                        error = %format!("{error:#}"),
                         "手动 WebSub 订阅失败"
                     );
                 }
