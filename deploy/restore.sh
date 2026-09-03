@@ -41,7 +41,7 @@ rollback_on_error() {
   trap - EXIT INT TERM
   if (( status == 0 )); then
     cleanup_temporary_files
-    return
+    return 0
   fi
 
   set +e
