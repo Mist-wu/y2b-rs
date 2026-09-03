@@ -34,7 +34,7 @@ class DocumentationTests(unittest.TestCase):
             "只有标题匹配、稿件发布时间晚于本次 attempt 开始时间且 BVID 未被其他任务占用时才会确认",
             "不是“翻译压制”",
             "npm audit --audit-level=high",
-            "cargo audit --no-yanked",
+            "cargo audit",
             "unmaintained、yanked、unsound 等 warning",
         )
         for phrase in required:
