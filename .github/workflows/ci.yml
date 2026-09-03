@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: 安装 rustfmt 与 clippy
+        run: |
+          rustup default stable
+          rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+
+  scripts:
+    name: 脚本与配置
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: TypeScript 类型检查与 Pi extension 解析
+        run: |
+          npm ci
+          npm run check
+      - name: Python 测试与仓库约束
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 -m unittest discover -s deploy/tests -p 'test_*.py'
+          python3 -m unittest discover -s .github/workflows/tests -p 'test_*.py'
+          python3 -m compileall -q scripts deploy
+      - name: Shell 脚本检查
+        run: |
+          shellcheck deploy/*.sh
+          bash -n deploy/*.sh
+
+  audit:
+    name: 依赖审计
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: npm audit（high/critical 阻断）
+        run: |
+          npm ci
+          npm audit --audit-level=high
+      - name: 缓存 cargo-audit
+        id: cargo-audit
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-audit-0.22.2
+      - name: 安装 cargo-audit
+        if: steps.cargo-audit.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: cargo audit（vulnerability 阻断，warning 仅提示）
+        run: cargo audit
+
+  secrets:
+    name: Gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+      - run: cp .github/workflows/gitleaksignore .gitleaksignore
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
