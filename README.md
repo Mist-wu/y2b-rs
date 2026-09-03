@@ -176,13 +176,13 @@ python3 -m compileall -q scripts deploy
 shellcheck deploy/*.sh
 bash -n deploy/*.sh
 npm audit --audit-level=high
-cargo audit --no-yanked
+cargo audit
 gitleaks git --gitleaks-ignore-path .github/workflows/gitleaksignore .
 ```
 
-格式、类型、测试、脚本语法、Gitleaks 以及真正的 RustSec vulnerability 都是**强失败门禁**：任一命令非零退出就阻断合并和发布，不得用 `|| true`、跳过测试或宽泛 allowlist 降级。Gitleaks 扫描完整历史，仓库中的测试假 Key 只按唯一 fingerprint 精确放行。
+CI 只有一个工作流 `.github/workflows/ci.yml`，四个并行 job：Rust、脚本与配置、依赖审计、Gitleaks。格式、类型、测试、脚本语法、Gitleaks 以及真正的 RustSec vulnerability 都是**强失败门禁**：任一命令非零退出就阻断合并和发布，不得用 `|| true`、`continue-on-error`、跳过测试或宽泛 allowlist 降级。Gitleaks 扫描完整历史，仓库中的测试假 Key 只按唯一 fingerprint 精确放行。
 
-依赖审计刻意采用不同阈值，因为 advisory 会在上游发布后异步改变，与当前提交未必相关：npm 只让 high／critical 发现阻断，low／moderate 仍显示在报告中；RustSec 的 vulnerability 全部阻断，而 unmaintained、yanked、unsound 等 warning 由 CI 另跑 `cargo audit --deny warnings` 并标为非阻断。这样既不隐藏漏洞和维护风险，也不会因低级噪音让主门禁长期失去可信度。
+依赖审计刻意采用不同阈值，因为 advisory 会在上游发布后异步改变，与当前提交未必相关：npm 只让 high／critical 发现阻断，low／moderate 仍显示在报告中；`cargo audit` 默认只对 vulnerability 非零退出，unmaintained、yanked、unsound 等 warning 会打印在日志里但不阻断。这样既不隐藏漏洞和维护风险，也不会因低级噪音让主门禁长期失去可信度。
 
 ## 部署
 
