@@ -263,7 +263,7 @@ install_release_alias() {
   local quarantine="${path}.before-release-${owner_tag}"
 
   if [[ -L "$path" && $(readlink "$path") == "$target" ]]; then
-    return
+    return 0
   fi
   alias_temporaries+=("$temporary")
   rm -f -- "$temporary"
@@ -381,7 +381,8 @@ release_hold() {
     seen+="$candidate:"
     if "$candidate" maintenance release --database "$database" --owner "$owner"; then
       hold_acquired=false
-      return
+      # 该函数会在 EXIT trap 里运行；bash 5.2 起裸 return 会带回触发 trap 的失败状态。
+      return 0
     fi
   done
   echo "maintenance hold 释放失败: owner=$owner" >&2
@@ -402,7 +403,7 @@ rollback_on_error() {
   trap - EXIT INT TERM
   if [[ "$deployment_complete" == true ]]; then
     cleanup_temporary_files
-    return
+    return 0
   fi
   if (( status == 0 )); then
     status=1
@@ -522,7 +523,7 @@ wait_for_two_idle_checks() {
       ((consecutive += 1))
       echo "maintenance idle 连续检查: $consecutive/2"
       if (( consecutive == 2 )); then
-        return
+        return 0
       fi
     else
       consecutive=0
