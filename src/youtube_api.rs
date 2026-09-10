@@ -37,7 +37,7 @@ pub(crate) fn bounded_http_client(user_agent: &str) -> Result<reqwest::Client, r
     )
 }
 
-fn bounded_http_client_with_timeouts(
+pub(crate) fn bounded_http_client_with_timeouts(
     user_agent: &str,
     connect_timeout: Duration,
     request_timeout: Duration,
