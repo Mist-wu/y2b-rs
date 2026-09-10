@@ -42,8 +42,8 @@ pi = "/usr/local/bin/pi"
 extension = "/opt/y2b/pi/y2b-extension.ts"
 policy = "/opt/y2b/pi/policy.json"
 provider = "deepseek"
-model = "deepseek-v4-flash"
-translation_model = "deepseek-v4-pro"
+model = "deepseek-flash"
+translation_model = "deepseek-flash"
 # 投稿元数据、分句和翻译统一关闭 thinking，避免成本和流式输出量失控。
 thinking = "off"
 # 单次 Pi 调用超时。长视频翻译批次偶发超过 5 分钟，默认 15 分钟。
@@ -56,7 +56,7 @@ safe_context_tokens = 200000
 segment_overlap_cues = 12
 # 单次分句调用的最大 cue 数，防止超大调用超时/失败重来代价大。
 segment_max_cues = 400
-# 每批 cue 数。40 比 25 少约 40% 调用，固定 prompt 开销跟着摊薄；翻译走 v4-pro，对齐比小批次更稳。
+# 每批 cue 数。40 比 25 少约 40% 调用，固定 prompt 开销跟着摊薄；对齐比小批次更稳。
 translation_batch_cues = 40
 # Pi 翻译批次并发。2 GiB 服务器实测 3 路仅约 320–380 MiB，默认提高到 4；继续受 systemd 内存上限保护。
 translation_concurrency = 4

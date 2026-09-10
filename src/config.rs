@@ -5,8 +5,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 pub const AI_PROVIDER: &str = "deepseek";
-pub const AI_MODEL: &str = "deepseek-v4-flash";
-pub const AI_TRANSLATION_MODEL: &str = "deepseek-v4-pro";
+pub const AI_MODEL: &str = "deepseek-flash";
+/// V4.1 Flash 在性能、成本、速度上取代了 V4 Pro，2026-09-14 12:00 起 `deepseek-v4-pro`
+/// 也会被路由到它；等 V4.1 Pro 上线后再决定翻译是否换回更强的模型。
+pub const AI_TRANSLATION_MODEL: &str = "deepseek-flash";
 pub const AI_THINKING: &str = "off";
 const MAX_TRANSLATION_BATCH_RETRIES: usize = 10;
 
@@ -89,7 +91,8 @@ pub struct AiConfig {
     pub policy: PathBuf,
     pub provider: String,
     pub model: String,
-    /// 长列表翻译需要更强的逐条对齐能力，与分句/元数据模型分开固定。
+    /// 翻译模型单独留一个字段：当前与 `model` 同为 V4.1 Flash，等 V4.1 Pro 上线后
+    /// 可以只把长列表翻译换成对齐更稳的模型，不动分句/元数据。
     pub translation_model: String,
     /// 所有 AI 阶段共用同一个思考级别，避免任务间配置漂移。
     pub thinking: String,
@@ -717,6 +720,8 @@ mod tests {
 
     #[test]
     fn rejects_ai_profile_drift() {
+        // 含已下线的 deepseek-v4-flash / deepseek-v4-pro：别名仍能路由到 V4.1 Flash，
+        // 但配置里不接受，避免生产和审计脚本各写一个名字。
         for (provider, model, translation_model, thinking) in [
             ("openai-codex", AI_MODEL, AI_TRANSLATION_MODEL, AI_THINKING),
             (

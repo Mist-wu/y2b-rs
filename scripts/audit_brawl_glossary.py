@@ -22,7 +22,7 @@ from typing import Any
 API_ROOT = "https://api.brawlapi.com"
 USER_AGENT = "y2b-rs-glossary-audit/2.0"
 PI_PROVIDER = "deepseek"
-PI_MODEL = "deepseek-v4-flash"
+PI_MODEL = "deepseek-flash"
 PI_THINKING = "off"
 PI_AUTH_DIR = "/var/lib/y2b/pi-agent"
 PATTERN_RULES = [
