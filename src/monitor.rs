@@ -100,6 +100,22 @@ const LIVE_CONTENT_PENDING_PREFIX: &str = "直播内容尚未就绪，暂不处�
 /// 间隔取 30 分钟，兼顾及时性和 yt-dlp 调用成本。
 const RECHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
+/// 候选复查的总期限，超过就永久拒绝。
+///
+/// 没有上限时，一个永远不会就绪的候选会每 30 分钟复查一次直到天荒地老：线上
+/// 攒下 6 条这样的僵尸，最久的已经复查 1239 次（约 26 天），每次都真的打一发
+/// videos.list，合计每天白烧约 300 点配额。直播从预告到回放就绪最多几天，
+/// 两周足够覆盖所有正常情况。
+const GATE_MAX_AGE: chrono::Duration = chrono::Duration::days(14);
+
+/// `videos.list` 查不到的候选的复查期限。
+///
+/// 视频被删、转私享或触发地区限制时 API 就是不返回它，这类候选不会自己回来，
+/// 给一天冷静期（覆盖 API 抖动和配额降级）之后就该放弃，不必等满两周。
+const GATE_MISSING_MAX_AGE: chrono::Duration = chrono::Duration::days(1);
+
+const GATE_MISSING_FROM_API: &str = "videos.list 未返回该视频，稍后复查";
+
 /// 尚未就绪、需要稍后复查的 `live_status`。
 ///
 /// - `is_live`：直播进行中，还没有完整回放
@@ -111,7 +127,20 @@ const LIVE_STATUS_NOT_READY: &[&str] = &["is_live", "is_upcoming", "post_live"];
 
 const DURATION_LIMIT_PREFIX: &str = "视频时长超过上限";
 
-const RSS_MAX_RETRIES: usize = 2;
+/// RSS 拉取专用 UA。
+///
+/// 2026-09-08 起线上 RSS 大面积 404：同一个 feed 连续请求会随机返回 200/404/500，
+/// 而频道页 (`/channel/<id>`) 始终 200，其他频道的 feed 也能拿到 200——说明频道没失效，
+/// 是 YouTube 边缘节点在按 UA 对本机限流。实测同一 feed 交替重放 10 次，
+/// `y2b-rs/0.1` 成功 4 次，浏览器 UA 成功 8 次。
+///
+/// Data API 走 googleapis.com，按 key 计费和限流，不受此影响，仍用项目自己的 UA。
+const RSS_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const API_USER_AGENT: &str = "y2b-rs/0.1";
+
+/// RSS 重试次数。限流是随机的，单次成功率约五到八成，多给一次重试才能把
+/// 「整轮轮询全灭」压回「偶尔失败」。
+const RSS_MAX_RETRIES: usize = 3;
 const RSS_RETRY_BASE: Duration = Duration::from_secs(1);
 const RSS_BODY_LIMIT: usize = 1024 * 1024;
 const FALLBACK_CHANNEL_COOLDOWN: Duration = Duration::from_secs(10 * 60);
@@ -356,7 +385,12 @@ fn source_language_matches(expected: &str, actual: &str) -> bool {
 impl FeedFetchError {
     fn retryable(&self) -> bool {
         match self {
-            Self::Http { status, .. } => status.is_server_error(),
+            // 404 在 feeds 端点上不代表频道不存在：被限流时 YouTube 会对同一个
+            // feed 随机返回 404/500，几秒后重放就能拿到 200。频道真的没了会稳定
+            // 404，重试耗尽后照样上报失败，代价只是每轮多几次请求。
+            Self::Http { status, .. } => {
+                status.is_server_error() || *status == StatusCode::NOT_FOUND
+            }
             Self::Request { source } => source.is_timeout() || source.is_connect(),
             Self::BodyTooLarge { .. } => false,
         }
@@ -647,6 +681,19 @@ fn reconcile_after_baseline(
     Some(published > baseline)
 }
 
+/// 候选停止复查的时刻。
+///
+/// 基准取「发现时间」和「发布时间」里更晚的那个：预约直播的 `published_at` 是排定
+/// 的开播时间，可能比发现时间晚很多，从发现时间起算会把一个还没开播的预告提前判死。
+/// 反过来补录到的历史视频 `published_at` 在过去，此时按发现时间起算才合理。
+fn gate_deadline(candidate: &VideoCandidate, max_age: chrono::Duration) -> DateTime<Utc> {
+    let anchor = candidate
+        .published_at
+        .filter(|published_at| *published_at > candidate.discovered_at)
+        .unwrap_or(candidate.discovered_at);
+    anchor + max_age
+}
+
 impl Monitor {
     pub fn new(config: Config, db: Database) -> Result<Self> {
         let api_key = std::env::var("YOUTUBE_API_KEY")
@@ -667,12 +714,13 @@ impl Monitor {
         api_key: Option<String>,
         api_base_url: Option<&str>,
     ) -> Result<Self> {
-        let client = bounded_http_client("y2b-rs/0.1")?;
+        let client = bounded_http_client(RSS_USER_AGENT)?;
+        let api_client = bounded_http_client(API_USER_AGENT)?;
         let data_api = api_key.map(|api_key| match api_base_url {
             Some(base_url) => {
-                YoutubeDataApi::with_base_url(client.clone(), db.clone(), api_key, base_url)
+                YoutubeDataApi::with_base_url(api_client, db.clone(), api_key, base_url)
             }
-            None => YoutubeDataApi::new(client.clone(), db.clone(), api_key),
+            None => YoutubeDataApi::new(api_client, db.clone(), api_key),
         });
         Ok(Self {
             config,
@@ -1551,7 +1599,8 @@ impl Monitor {
                         } else {
                             self.defer_gate_error(
                                 &candidate,
-                                "videos.list 未返回该视频，稍后复查",
+                                GATE_MISSING_FROM_API,
+                                GATE_MISSING_MAX_AGE,
                             )?;
                         }
                     }
@@ -1585,7 +1634,7 @@ impl Monitor {
         let metadata = match self.fetch_metadata(&candidate.url).await {
             Ok((metadata, _, _)) => metadata,
             Err(error) if is_live_content_pending(&error) => {
-                self.defer_gate_error(candidate, &error.to_string())?;
+                self.defer_gate_error(candidate, &error.to_string(), GATE_MAX_AGE)?;
                 return Ok(false);
             }
             Err(error) if exceeds_duration_limit(&error) => {
@@ -1593,7 +1642,11 @@ impl Monitor {
                 return Ok(false);
             }
             Err(error) => {
-                self.defer_gate_error(candidate, &format!("元数据获取失败: {error:#}"))?;
+                self.defer_gate_error(
+                    candidate,
+                    &format!("元数据获取失败: {error:#}"),
+                    GATE_MAX_AGE,
+                )?;
                 tracing::warn!(video_id = %candidate.video_id, error = %error, "候选元数据获取失败，延后重试");
                 return Ok(false);
             }
@@ -1623,7 +1676,7 @@ impl Monitor {
             .as_deref()
             .is_some_and(|status| LIVE_STATUS_NOT_READY.contains(&status))
         {
-            self.defer_gate_error(candidate, LIVE_CONTENT_PENDING_PREFIX)?;
+            self.defer_gate_error(candidate, LIVE_CONTENT_PENDING_PREFIX, GATE_MAX_AGE)?;
             return Ok(false);
         }
         if let Err(error) =
@@ -1698,8 +1751,29 @@ impl Monitor {
             .promote_video_candidate(candidate, Some(&metadata.title), published_at)
     }
 
-    fn defer_gate_error(&self, candidate: &VideoCandidate, error: &str) -> Result<()> {
-        let next_gate_at = Utc::now() + chrono::Duration::from_std(RECHECK_INTERVAL)?;
+    fn defer_gate_error(
+        &self,
+        candidate: &VideoCandidate,
+        error: &str,
+        max_age: chrono::Duration,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let deadline = gate_deadline(candidate, max_age);
+        if now >= deadline {
+            let attempts = candidate.gate_attempts + 1;
+            let reason = format!("{error}（已复查 {attempts} 次并超过 {deadline} 期限，停止复查）");
+            self.db
+                .reject_video_candidate(&candidate.video_id, &reason)?;
+            tracing::info!(
+                video_id = %candidate.video_id,
+                attempts,
+                %deadline,
+                last_error = error,
+                "候选超过复查期限，永久拒绝"
+            );
+            return Ok(());
+        }
+        let next_gate_at = now + chrono::Duration::from_std(RECHECK_INTERVAL)?;
         self.db
             .defer_video_candidate(&candidate.video_id, next_gate_at, error)?;
         tracing::info!(video_id = %candidate.video_id, %next_gate_at, "候选延后复查");
@@ -1863,6 +1937,29 @@ mod tests {
                 body.len()
             );
             socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}/feed"), server)
+    }
+
+    /// 按顺序返回多个响应，用于验证重试路径。
+    async fn mock_response_sequence(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
         });
         (format!("http://{address}/feed"), server)
     }
@@ -2355,21 +2452,31 @@ esac
         server.await.unwrap();
     }
 
+    /// 限流期间 YouTube 会对同一个 feed 随机返回 404，重放就能拿到 200；
+    /// 把 404 当硬失败会让整轮轮询直接进熔断。
     #[tokio::test]
-    async fn rss_404_is_not_retried() {
-        let (url, server) = mock_response(404, "", "missing").await;
+    async fn rss_404_is_retried_and_recovers() {
+        const FEED: &str = r#"<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>"#;
+        let (url, server) = mock_response_sequence(vec![(404, "missing"), (200, FEED)]).await;
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("rss.db")).unwrap();
         let monitor = Monitor::new(Config::default(), db).unwrap();
-        let error = monitor.fetch_feed_bytes(&url).await.unwrap_err();
-        assert!(matches!(
-            error,
-            FeedFetchError::Http {
-                status: StatusCode::NOT_FOUND,
-                ..
-            }
-        ));
+        let bytes = monitor.fetch_feed_bytes(&url).await.unwrap();
+        assert_eq!(bytes, FEED.as_bytes());
         server.await.unwrap();
+    }
+
+    #[test]
+    fn rss_retry_policy_covers_404_but_not_other_client_errors() {
+        let http = |status| FeedFetchError::Http {
+            status,
+            retry_at: None,
+        };
+        assert!(http(StatusCode::NOT_FOUND).retryable());
+        assert!(http(StatusCode::INTERNAL_SERVER_ERROR).retryable());
+        // 429 有 Retry-After，按频道退避处理，不在这里空转重试。
+        assert!(!http(StatusCode::TOO_MANY_REQUESTS).retryable());
+        assert!(!http(StatusCode::FORBIDDEN).retryable());
     }
 
     #[tokio::test]
@@ -2789,6 +2896,83 @@ esac
         }
         assert_eq!(state("deferred001").gate_attempts, 2);
         assert!(db.due_video_candidates(Utc::now(), 20).unwrap().is_empty());
+    }
+
+    /// 复制一条已入库的候选，把它「做旧」到指定年龄，用来驱动期限分支。
+    fn aged_candidate(
+        db: &Database,
+        video_id: &str,
+        age: chrono::Duration,
+        published_at: Option<DateTime<Utc>>,
+    ) -> VideoCandidate {
+        let mut candidate = db.get_video_candidate(video_id).unwrap().unwrap();
+        candidate.discovered_at = Utc::now() - age;
+        candidate.published_at = published_at;
+        candidate
+    }
+
+    #[test]
+    fn gate_gives_up_on_candidates_past_the_recheck_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("gate-deadline.db")).unwrap();
+        let channel_id = add_test_channel(&db, "https://example.invalid/feed", "deadline");
+        for video_id in ["zombievid01", "goneforever1", "freshlive01", "upcoming001"] {
+            db.insert_video_candidate(NewVideoCandidate {
+                channel_id: Some(channel_id),
+                video_id,
+                url: &format!("https://www.youtube.com/watch?v={video_id}"),
+                title: None,
+                published_at: None,
+                source: CandidateSource::Rss,
+            })
+            .unwrap();
+        }
+        let monitor = Monitor::new(Config::default(), db.clone()).unwrap();
+        let state = |video_id| db.get_video_candidate(video_id).unwrap().unwrap();
+
+        // 发现两周以上仍未就绪：永久拒绝，并且不再排下一次复查。
+        let zombie = aged_candidate(&db, "zombievid01", chrono::Duration::days(15), None);
+        monitor
+            .defer_gate_error(&zombie, LIVE_CONTENT_PENDING_PREFIX, GATE_MAX_AGE)
+            .unwrap();
+        let zombie = state("zombievid01");
+        assert_eq!(zombie.gate_state, crate::model::GateState::Rejected);
+        assert!(zombie.next_gate_at.is_none());
+        assert!(zombie.last_error.unwrap().contains("停止复查"));
+
+        // videos.list 查不到的候选期限只有一天，不必陪跑两周。
+        let gone = aged_candidate(&db, "goneforever1", chrono::Duration::days(2), None);
+        monitor
+            .defer_gate_error(&gone, GATE_MISSING_FROM_API, GATE_MISSING_MAX_AGE)
+            .unwrap();
+        assert_eq!(
+            state("goneforever1").gate_state,
+            crate::model::GateState::Rejected
+        );
+
+        // 期限内的直播照常复查，别把今天开播的流误杀。
+        let fresh = aged_candidate(&db, "freshlive01", chrono::Duration::days(2), None);
+        monitor
+            .defer_gate_error(&fresh, LIVE_CONTENT_PENDING_PREFIX, GATE_MAX_AGE)
+            .unwrap();
+        let fresh = state("freshlive01");
+        assert_eq!(fresh.gate_state, crate::model::GateState::Deferred);
+        assert!(fresh.next_gate_at.is_some());
+
+        // 排在未来的预约直播：即使很久以前就发现了，也要等到开播时间之后再计时。
+        let upcoming = aged_candidate(
+            &db,
+            "upcoming001",
+            chrono::Duration::days(30),
+            Some(Utc::now() + chrono::Duration::days(3)),
+        );
+        monitor
+            .defer_gate_error(&upcoming, LIVE_CONTENT_PENDING_PREFIX, GATE_MAX_AGE)
+            .unwrap();
+        assert_eq!(
+            state("upcoming001").gate_state,
+            crate::model::GateState::Deferred
+        );
     }
 
     #[tokio::test]
