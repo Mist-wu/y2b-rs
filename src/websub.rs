@@ -2,7 +2,7 @@ use crate::{
     config::WebSubConfig,
     db::{Database, NewVideoCandidate, WebSubChannel},
     model::CandidateSource,
-    youtube_api::bounded_http_client,
+    youtube_api::bounded_http_client_with_timeouts,
 };
 use anyhow::{Context, Result};
 use axum::{
@@ -27,6 +27,19 @@ pub const WEBSUB_BODY_LIMIT: usize = 128 * 1024;
 const WEBSUB_RENEWAL_PERCENT: u64 = 80;
 const WEBSUB_HUB_URL: &str = "https://pubsubhubbub.appspot.com/subscribe";
 
+/// hub 专用超时，比其余 HTTP 调用宽。
+///
+/// pubsubhubbub 处理一次 subscribe 要 20 秒才给答案（故障时固定 20.2 秒返回
+/// 503 "Transient error"）。共用的 15 秒读超时会在 hub 开口之前就把连接掐掉，
+/// 于是日志里只剩下 "operation timed out"，看不出到底是网络不通、我们的回调有
+/// 问题，还是 hub 自己在报错——2026-09-07 全站租约失效就是这样被误判了三天。
+const WEBSUB_HUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const WEBSUB_HUB_READ_TIMEOUT: Duration = Duration::from_secs(45);
+const WEBSUB_HUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// hub 返回体只用来给日志补一句人话，截断即可。
+const WEBSUB_HUB_ERROR_BODY_LIMIT: usize = 200;
+
 #[derive(Clone)]
 struct WebSubState {
     db: Database,
@@ -47,7 +60,12 @@ impl WebSubService {
         Ok(Self {
             config,
             db,
-            client: bounded_http_client("y2b-rs/0.1")?,
+            client: bounded_http_client_with_timeouts(
+                "y2b-rs/0.1",
+                WEBSUB_HUB_CONNECT_TIMEOUT,
+                WEBSUB_HUB_REQUEST_TIMEOUT,
+                WEBSUB_HUB_READ_TIMEOUT,
+            )?,
             hub_url: WEBSUB_HUB_URL.to_string(),
         })
     }
@@ -77,19 +95,65 @@ impl WebSubService {
         let renew_before = now + chrono::Duration::seconds(renewal_lead_seconds() as i64);
         let channels = self.db.due_websub_channels(renew_before)?;
         let mut accepted = 0;
+        let mut failures: Vec<(i64, String, String)> = Vec::new();
+        // 租约已经过期（而不是「快到期」）的频道数：这批频道此刻收不到任何推送，
+        // 发现只能回落到 Data API 轮询，配额会被烧穿，所以它决定这次扫描的日志级别。
+        let mut lapsed = 0;
         for channel in channels {
             let channel_id = channel.id;
             let channel_name = channel.name.clone();
+            if channel
+                .lease_expires_at
+                .is_none_or(|expires_at| expires_at <= now)
+            {
+                lapsed += 1;
+            }
             match self.subscribe_channel(channel).await {
                 Ok(()) => accepted += 1,
-                // reqwest 的顶层信息只有 "error sending request"，根因（连接/读超时、
-                // DNS）在 source 链里；hub 偶发 15 秒无响应时需要看到它。
-                Err(error) => tracing::warn!(
-                    channel_id,
-                    channel = %channel_name,
-                    error = %format!("{error:#}"),
-                    "WebSub 订阅或续订失败"
-                ),
+                Err(error) => {
+                    // reqwest 的顶层信息只有 "error sending request"，根因（连接/读超时、
+                    // DNS）在 source 链里；hub 返回 5xx 时根因是它自己的回答。
+                    let detail = format!("{error:#}");
+                    tracing::debug!(
+                        channel_id,
+                        channel = %channel_name,
+                        error = %detail,
+                        "WebSub 订阅或续订失败"
+                    );
+                    failures.push((channel_id, channel_name, detail));
+                }
+            }
+        }
+        // hub 挂掉时每个频道都会失败，逐条 WARN 会在日志里刷出几十行一模一样的
+        // 内容，反而盖住真问题。整轮汇总一条，附上第一条根因和受影响的频道。
+        if let Some((channel_id, channel_name, detail)) = failures.first() {
+            let failed = failures.len();
+            let channels = failures
+                .iter()
+                .map(|(id, _, _)| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            if lapsed > 0 {
+                tracing::error!(
+                    failed,
+                    accepted,
+                    lapsed,
+                    channels = %channels,
+                    first_channel_id = channel_id,
+                    first_channel = %channel_name,
+                    error = %detail,
+                    "WebSub 续订失败且已有租约过期，这些频道收不到推送，发现将回落到 Data API 轮询"
+                );
+            } else {
+                tracing::warn!(
+                    failed,
+                    accepted,
+                    channels = %channels,
+                    first_channel_id = channel_id,
+                    first_channel = %channel_name,
+                    error = %detail,
+                    "WebSub 续订失败，租约尚未过期"
+                );
             }
         }
         Ok(accepted)
@@ -169,11 +233,22 @@ impl WebSubService {
             ])
             .send()
             .await?;
-        anyhow::ensure!(
-            response.status().is_success(),
-            "WebSub hub 返回 HTTP {}",
-            response.status()
-        );
+        let status = response.status();
+        if !status.is_success() {
+            // hub 的 503 正文是 "Transient error; please try again later"，
+            // 只有把它带出来才能区分「hub 自己挂了」和「我们的回调有问题」。
+            let body = response.text().await.unwrap_or_default();
+            let body = body.trim();
+            let detail: String = body.chars().take(WEBSUB_HUB_ERROR_BODY_LIMIT).collect();
+            anyhow::bail!(
+                "WebSub hub 返回 HTTP {status}{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            );
+        }
         tracing::info!(
             channel_id = channel.id,
             channel = %channel.name,
@@ -617,6 +692,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// hub 故障时返回 503 + 一行说明；日志只写「操作超时」会把三天的排障引到
+    /// 网络和回调上，必须把 hub 自己的回答带出来。
+    #[tokio::test]
+    async fn hub_error_response_body_reaches_the_caller() {
+        const HUB_BODY: &str = "Transient error; please try again later";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0_u8; 16 * 1024];
+            let _ = socket.read(&mut bytes).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{HUB_BODY}",
+                HUB_BODY.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("hub-error.db")).unwrap();
+        db.add_channel(
+            "UC-hub-error",
+            "hub-error",
+            "https://www.youtube.com/@hub-error",
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UC-hub-error",
+            crate::model::TransferMode::Direct,
+        )
+        .unwrap();
+        let service = WebSubService::with_hub_url(
+            config(),
+            db.clone(),
+            &format!("http://{address}/subscribe"),
+        )
+        .unwrap();
+
+        let error = service
+            .subscribe_identifier("UC-hub-error")
+            .await
+            .unwrap_err();
+        let detail = format!("{error:#}");
+        server.await.unwrap();
+        assert!(detail.contains("503"), "缺少状态码: {detail}");
+        assert!(detail.contains(HUB_BODY), "缺少 hub 正文: {detail}");
     }
 
     #[tokio::test]
