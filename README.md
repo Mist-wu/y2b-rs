@@ -55,7 +55,7 @@ y2b jobs list [N] | show <JOB_ID> | retry <JOB_ID> | reconcile-upload <JOB_ID> [
 # 字幕 / 模型 / 运维
 y2b subtitle add <BVID>   # 给指定已投稿视频补中文 CC
 y2b subtitle all          # 遍历所有已投稿视频，已有中文字幕自动跳过
-y2b model list | set deepseek-v4-flash
+y2b model list | set deepseek-flash
 y2b backup | auth-check | check --write-baseline
 ```
 
@@ -123,7 +123,7 @@ TUI 不进入默认生产构建。需要交互界面时使用 `cargo build --rel
 
 ## Pi 集成
 
-Pi 调用固定为 `deepseek` + `thinking=off`：分句、投稿元数据和词库审计使用 `deepseek-v4-flash`，长列表逐条翻译使用对齐更稳定的 `deepseek-v4-pro`。每次调用 `--no-session --no-tools`，只加载 `pi/y2b-extension.ts`。配置加载和部署预检会拒绝其他 provider／model／thinking，避免任务间漂移和大 thinking 流式输出带来的成本与 OOM。
+Pi 调用固定为 `deepseek` + `thinking=off`：分句、投稿元数据、长列表翻译和词库审计统一使用 `deepseek-flash`（V4.1 Flash）；旧的 `deepseek-v4-flash` 已下线，`deepseek-v4-pro` 自 2026-09-14 12:00 起也会被路由到 V4.1 Flash，`translation_model` 字段保留以便 V4.1 Pro 上线后单独切换翻译模型。每次调用 `--no-session --no-tools`，只加载 `pi/y2b-extension.ts`。配置加载和部署预检会拒绝其他 provider／model／thinking，避免任务间漂移和大 thinking 流式输出带来的成本与 OOM。
 
 批处理支持 `adaptive` 和 `whole_video`：按 256k 上下文、200k 安全阈值估算输入输出，阈值内整条视频只调用一次分句和一次翻译，超限按 token 拆批。自适应分句携带前后 12 条上下文，并在 Pi 返回的自然分句边界衔接批次。
 
@@ -144,7 +144,7 @@ Pi 调用固定为 `deepseek` + `thinking=off`：分句、投稿元数据和词�
 # 审计模型能力
 python3 scripts/audit_brawl_glossary.py \
   --server azureuser@20.89.60.23 \
-  --models deepseek-v4-flash \
+  --models deepseek-flash \
   --output /tmp/y2b-brawl-glossary-audit.json
 
 # 用已有模型错误并集重建分层生产词库
@@ -155,7 +155,7 @@ python3 scripts/audit_brawl_glossary.py \
   --production-output pi/brawl-stars-glossary.json
 ```
 
-脚本固定 `deepseek/deepseek-v4-flash` + `thinking=off`，与生产服务一样只从服务器 `/var/lib/y2b/pi-agent/auth.json` 读取 DeepSeek 凭据，默认使用不含答案的 `pi/audit-policy.json`；`--server` 不是 `root@` 时远程命令自动加 `sudo -n`。审计模式下 extension 不加载生产词库，避免污染能力测试。支持 `--terms-file` 复用提取结果、`--resume` 断点续跑、`--shard-index/--shard-count` 分片；单词超时或失败计入错误并继续。
+脚本固定 `deepseek/deepseek-flash` + `thinking=off`，与生产服务一样只从服务器 `/var/lib/y2b/pi-agent/auth.json` 读取 DeepSeek 凭据，默认使用不含答案的 `pi/audit-policy.json`；`--server` 不是 `root@` 时远程命令自动加 `sudo -n`。审计模式下 extension 不加载生产词库，避免污染能力测试。支持 `--terms-file` 复用提取结果、`--resume` 断点续跑、`--shard-index/--shard-count` 分片；单词超时或失败计入错误并继续。
 
 </details>
 

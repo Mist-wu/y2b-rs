@@ -1071,7 +1071,7 @@ fn ai_call_audit_tracks_failures_and_interruptions() {
             &job_id,
             "translation",
             Some("deepseek"),
-            Some("deepseek-v4-pro"),
+            Some("deepseek-flash"),
             Some("off"),
         )
         .unwrap();
@@ -1082,7 +1082,7 @@ fn ai_call_audit_tracks_failures_and_interruptions() {
             stage_id,
             "translate",
             "deepseek",
-            "deepseek-v4-pro",
+            "deepseek-flash",
             "off",
             r#"{"task":"translate"}"#,
         )
@@ -1150,7 +1150,7 @@ fn ai_call_audit_tracks_failures_and_interruptions() {
             stage_id,
             "segment",
             "deepseek",
-            "deepseek-v4-flash",
+            "deepseek-flash",
             "off",
             r#"{"task":"segment"}"#,
         )
