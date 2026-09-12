@@ -96,21 +96,22 @@ impl WebSubService {
         let channels = self.db.due_websub_channels(renew_before)?;
         let mut accepted = 0;
         let mut failures: Vec<(i64, String, String)> = Vec::new();
-        // 租约已经过期（而不是「快到期」）的频道数：这批频道此刻收不到任何推送，
-        // 发现只能回落到 Data API 轮询，配额会被烧穿，所以它决定这次扫描的日志级别。
+        // 续订失败且租约已经过期（而不是「快到期」）的频道数：这批频道此刻收不到
+        // 任何推送，发现只能回落到 Data API 轮询，配额会被烧穿，所以它决定这次扫描的
+        // 日志级别。本轮续订成功的频道不算，它们已经重新收到推送了。
         let mut lapsed = 0;
         for channel in channels {
             let channel_id = channel.id;
             let channel_name = channel.name.clone();
-            if channel
+            let lease_lapsed = channel
                 .lease_expires_at
-                .is_none_or(|expires_at| expires_at <= now)
-            {
-                lapsed += 1;
-            }
+                .is_none_or(|expires_at| expires_at <= now);
             match self.subscribe_channel(channel).await {
                 Ok(()) => accepted += 1,
                 Err(error) => {
+                    if lease_lapsed {
+                        lapsed += 1;
+                    }
                     // reqwest 的顶层信息只有 "error sending request"，根因（连接/读超时、
                     // DNS）在 source 链里；hub 返回 5xx 时根因是它自己的回答。
                     let detail = format!("{error:#}");
