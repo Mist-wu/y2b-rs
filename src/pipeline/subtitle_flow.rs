@@ -246,12 +246,19 @@ pub(super) fn load_segmented_cache(path: &Path) -> Result<Option<Vec<Cue>>> {
     Ok(Some(cues))
 }
 
-pub(super) fn load_translation_checkpoint(path: &Path, source: &[Cue]) -> Result<Option<Vec<Cue>>> {
+fn load_validated_translation_checkpoint(path: &Path) -> Result<Option<Vec<Cue>>> {
     if !path.exists() {
         return Ok(None);
     }
     let cues = subtitle::load_json(path).with_context(|| format!("读取 {}", path.display()))?;
     validate_cached_cues(&cues)?;
+    Ok(Some(cues))
+}
+
+pub(super) fn load_translation_checkpoint(path: &Path, source: &[Cue]) -> Result<Option<Vec<Cue>>> {
+    let Some(cues) = load_validated_translation_checkpoint(path)? else {
+        return Ok(None);
+    };
     if cues.len() != source.len() {
         bail!("翻译缓存数量不匹配: {}/{}", cues.len(), source.len())
     }
@@ -510,6 +517,18 @@ impl Pipeline {
         meta: &VideoMetadata,
         work: &Path,
     ) -> Result<Option<PreparedSubtitle>> {
+        self.prepare_translated_subtitle_with_download(job, meta, work, true)
+            .await
+    }
+
+    /// 完整缓存可直接复用；只有允许补齐时才下载字幕或续传缺失的翻译批次。
+    pub(super) async fn prepare_translated_subtitle_with_download(
+        &self,
+        job: &Job,
+        meta: &VideoMetadata,
+        work: &Path,
+        redownload_if_missing: bool,
+    ) -> Result<Option<PreparedSubtitle>> {
         let segmented = work.join(format!("{}.en.segmented.json", meta.id));
         let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
 
@@ -529,50 +548,57 @@ impl Pipeline {
                 None
             }
         };
-        let mut cues = match cached {
-            Some(cues) => cues,
-            None => {
-                let Some(fresh) = self.segment_uncached(job, meta, work, &segmented).await? else {
-                    return Ok(None);
-                };
-                fresh
-            }
+        let checkpoint = match cached.as_deref() {
+            Some(source) => load_translation_checkpoint(&translated, source),
+            // 早期已投稿任务可能只剩翻译文件；其中的原文和时间线仍须通过校验。
+            None => load_validated_translation_checkpoint(&translated),
         };
-
-        match load_translation_checkpoint(&translated, &cues) {
+        let cues = match checkpoint {
             Ok(Some(cached)) if translation_checkpoint_complete(&cached) => {
                 self.db.event(
                     Some(&job.id),
                     "info",
                     &format!("复用翻译缓存: {} cues", cached.len()),
                 )?;
-                cues = cached;
+                return Ok(Some(PreparedSubtitle { cues: cached }));
             }
-            Ok(Some(cached)) => {
-                let completed = cached
+            Ok(Some(partial)) => {
+                if !redownload_if_missing {
+                    return Ok(None);
+                }
+                let completed = partial
                     .iter()
                     .filter(|cue| cue.translation.is_some())
                     .count();
                 self.db.event(
                     Some(&job.id),
                     "info",
-                    &format!("续传翻译检查点: {completed}/{} cues", cached.len()),
+                    &format!("续传翻译检查点: {completed}/{} cues", partial.len()),
                 )?;
-                cues = cached;
-                self.translate_and_save(&job.id, &mut cues, &translated)
-                    .await?;
+                Some(partial)
             }
-            Ok(None) => {
-                self.translate_and_save(&job.id, &mut cues, &translated)
-                    .await?
-            }
+            Ok(None) => cached,
             Err(error) => {
                 self.db
                     .event(Some(&job.id), "warn", &format!("忽略无效翻译缓存: {error}"))?;
-                self.translate_and_save(&job.id, &mut cues, &translated)
-                    .await?;
+                cached
             }
+        };
+        if !redownload_if_missing {
+            return Ok(None);
         }
+        let mut cues = match cues {
+            Some(cues) => cues,
+            None => {
+                fs::create_dir_all(work)?;
+                let Some(fresh) = self.segment_uncached(job, meta, work, &segmented).await? else {
+                    return Ok(None);
+                };
+                fresh
+            }
+        };
+        self.translate_and_save(&job.id, &mut cues, &translated)
+            .await?;
         Ok(Some(PreparedSubtitle { cues }))
     }
 

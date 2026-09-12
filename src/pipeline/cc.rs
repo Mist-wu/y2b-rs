@@ -1,11 +1,10 @@
 //! B站中文 CC 字幕补交（软字幕，提交后走平台审核）。
-use super::{Pipeline, subtitle_flow::load_segmented_cache};
+use super::Pipeline;
 use crate::bilibili_api::{self, CcCue};
 use crate::db::{SUBTITLE_CLAIM_KIND, SubtitleAttempt, SubtitleAttemptDecision};
 use crate::model::{Job, JobStatus, VideoMetadata};
 use crate::subtitle::{self, Cue};
 use anyhow::{Context, Result, bail};
-use std::fs;
 use thiserror::Error;
 
 /// 投稿后到首次尝试补 CC 字幕的等待：B站稿件刚上传时查询 bvid 会返回 -404。
@@ -380,6 +379,28 @@ impl Pipeline {
         Err(error)
     }
 
+    async fn prepare_cc_cues(
+        &self,
+        job: &Job,
+        meta: &VideoMetadata,
+        duration: f64,
+        redownload_if_missing: bool,
+    ) -> Result<Vec<CcCue>> {
+        let work = self.config.runtime.download_dir.join(&meta.id);
+        let Some(subtitle) = self
+            .prepare_translated_subtitle_with_download(job, meta, &work, redownload_if_missing)
+            .await?
+        else {
+            let bvid = job.bvid.as_deref().unwrap_or_default();
+            bail!("{MISSING_SUBTITLE_MATERIAL_PREFIX}（可手动执行 y2b subtitle add {bvid}）")
+        };
+        let cc_cues = cc_cues_from(&subtitle.cues, Some(duration));
+        if cc_cues.is_empty() {
+            bail!("{EMPTY_TRANSLATION_PREFIX}，没有可提交的中文字幕")
+        }
+        Ok(cc_cues)
+    }
+
     pub(super) async fn backfill_cc_subtitle_for_job(
         &self,
         job: &Job,
@@ -456,59 +477,9 @@ impl Pipeline {
         if let Some(attempt) = blocking_attempt {
             return Err(uncertain_attempt_error(&attempt, "平台当前未返回 zh 字幕"));
         }
-        let work = self.config.runtime.download_dir.join(&meta.id);
-        let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
-        let cues = if let Ok(cached) = subtitle::load_json(&translated) {
-            self.db.event(
-                Some(&job.id),
-                "info",
-                &format!("复用翻译缓存: {} cues", cached.len()),
-            )?;
-            cached
-        } else if redownload_if_missing {
-            fs::create_dir_all(&work)?;
-            let segmented = work.join(format!("{}.en.segmented.json", meta.id));
-            let cached = match load_segmented_cache(&segmented) {
-                Ok(Some(cues)) => {
-                    self.db.event(
-                        Some(&job.id),
-                        "info",
-                        &format!("复用分句缓存: {} cues", cues.len()),
-                    )?;
-                    Some(cues)
-                }
-                Ok(None) => None,
-                Err(error) => {
-                    self.db
-                        .event(Some(&job.id), "warn", &format!("忽略无效分句缓存: {error}"))?;
-                    None
-                }
-            };
-            let mut cues = match cached {
-                Some(cues) => cues,
-                None => {
-                    let Some(cues) = self.segment_uncached(job, &meta, &work, &segmented).await?
-                    else {
-                        // 必须复用 MISSING_SUBTITLE_MATERIAL_PREFIX：自动重试现在也会走到
-                        // 这里，分类错了会让退避和「达到上限」的提示都变成不可操作的泛化
-                        // 文案，看不出该手动补交。
-                        bail!(
-                            "{MISSING_SUBTITLE_MATERIAL_PREFIX}：上游暂无英文字幕轨（可手动执行 y2b subtitle add {bvid}）"
-                        )
-                    };
-                    cues
-                }
-            };
-            self.translate_and_save(&job.id, &mut cues, &translated)
-                .await?;
-            cues
-        } else {
-            bail!("{MISSING_SUBTITLE_MATERIAL_PREFIX}（可手动执行 y2b subtitle add {bvid}）")
-        };
-        let cc_cues = cc_cues_from(&cues, Some(view.duration));
-        if cc_cues.is_empty() {
-            bail!("{EMPTY_TRANSLATION_PREFIX}，没有可提交的中文字幕")
-        }
+        let cc_cues = self
+            .prepare_cc_cues(job, &meta, view.duration, redownload_if_missing)
+            .await?;
         let attempt_id = match self.db.begin_subtitle_attempt(&job.id, bvid)? {
             SubtitleAttemptDecision::Submit(attempt_id) => attempt_id,
             SubtitleAttemptDecision::QueryOnly(attempt) => {
@@ -579,6 +550,208 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{BatchMode, Config};
+    use crate::db::{Database, NewJob};
+    use crate::model::TransferMode;
+    use crate::pipeline::testing::{cue, metadata};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn cache_test_pipeline(directory: &Path) -> (Pipeline, Job, VideoMetadata) {
+        let meta = metadata();
+        let db = Database::open(&directory.join("state.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: &meta.id,
+                url: &meta.url,
+                title: Some(&meta.title),
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        let job = db.get_job(&id).unwrap().unwrap();
+        let response = |text: &str| {
+            serde_json::json!({
+                "type": "agent_end",
+                "messages": [{
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": serde_json::json!({
+                        "translations": [{"i": 0, "text": text}]
+                    }).to_string()}]
+                }]
+            })
+            .to_string()
+        };
+        let pi = directory.join("fake-pi");
+        fs::write(
+            &pi,
+            format!(
+                r#"#!/bin/sh
+script_dir=$(dirname "$0")
+for argument do payload="$argument"; done
+printf '%s\n' "$payload" >> "$script_dir/calls"
+case "$payload" in
+    *First*) printf '%s\n' '{}' ;;
+    *Second*)
+        if [ -f "$script_dir/fail-second" ]; then exit 1; fi
+        printf '%s\n' '{}'
+        ;;
+    *) exit 2 ;;
+esac
+"#,
+                response("第一句"),
+                response("第二句")
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = Config::default();
+        config.runtime.download_dir = directory.join("downloads");
+        config.ai.pi = pi.to_string_lossy().into_owned();
+        config.ai.batch_mode = BatchMode::Adaptive;
+        config.ai.translation_batch_cues = 1;
+        config.ai.translation_concurrency = 1;
+        config.ai.translation_batch_retries = 0;
+        config.youtube.yt_dlp = directory
+            .join("unexpected-ytdlp")
+            .to_string_lossy()
+            .into_owned();
+        (Pipeline::new(config, db), job, meta)
+    }
+
+    #[tokio::test]
+    async fn cc_cache_retries_interrupted_translation_before_producing_submission_cues() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, job, meta) = cache_test_pipeline(directory.path());
+        let work = pipeline.config.runtime.download_dir.join(&meta.id);
+        let segmented = work.join(format!("{}.en.segmented.json", meta.id));
+        let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
+        subtitle::save_json(&[cue(0, "First"), cue(1, "Second")], &segmented).unwrap();
+        fs::write(directory.path().join("fail-second"), "").unwrap();
+
+        assert!(
+            pipeline
+                .prepare_cc_cues(&job, &meta, 10.0, true)
+                .await
+                .is_err()
+        );
+        let partial = subtitle::load_json(&translated).unwrap();
+        assert_eq!(partial[0].translation.as_deref(), Some("第一句"));
+        assert_eq!(partial[1].translation, None);
+        // 缓存模式不能把第一批的子集交给投稿路径，也不能继续调用 Pi。
+        let missing = pipeline
+            .prepare_cc_cues(&job, &meta, 10.0, false)
+            .await
+            .unwrap_err();
+        assert!(is_missing_subtitle_material(&missing));
+
+        fs::remove_file(directory.path().join("fail-second")).unwrap();
+        let ready = pipeline
+            .prepare_cc_cues(&job, &meta, 10.0, true)
+            .await
+            .unwrap();
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].content, "第一句");
+        assert_eq!(ready[1].content, "第二句");
+        // 主准备入口也应复用同一份完整结果，不再次翻译。
+        let prepared = pipeline
+            .prepare_translated_subtitle(&job, &meta, &work)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prepared.cues.iter().all(|cue| cue.translation.is_some()));
+        let calls = fs::read_to_string(directory.path().join("calls")).unwrap();
+        let inputs = calls
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["items"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inputs, ["First", "Second", "Second"]);
+    }
+
+    #[tokio::test]
+    async fn cc_cache_rebuilds_corrupt_or_mismatched_translation_from_segmented_source() {
+        for invalid in ["corrupt", "mismatch", "invalid-timeline"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (pipeline, job, meta) = cache_test_pipeline(directory.path());
+            let work = pipeline.config.runtime.download_dir.join(&meta.id);
+            let segmented = work.join(format!("{}.en.segmented.json", meta.id));
+            let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
+            let source = vec![cue(0, "First"), cue(1, "Second")];
+            subtitle::save_json(&source, &segmented).unwrap();
+            if invalid == "corrupt" {
+                fs::write(&translated, "invalid JSON").unwrap();
+            } else {
+                let mut stale = source.clone();
+                stale[0].translation = Some("过期译文".into());
+                stale[1].translation = Some("过期译文".into());
+                if invalid == "mismatch" {
+                    stale[0].source = "Different source".into();
+                } else {
+                    stale[0].start = -1.0;
+                }
+                subtitle::save_json(&stale, &translated).unwrap();
+            }
+            let missing = pipeline
+                .prepare_cc_cues(&job, &meta, 10.0, false)
+                .await
+                .unwrap_err();
+            assert!(is_missing_subtitle_material(&missing), "{invalid}");
+            assert!(!directory.path().join("calls").exists());
+            let ready = pipeline
+                .prepare_cc_cues(&job, &meta, 10.0, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                ready
+                    .iter()
+                    .map(|cue| cue.content.as_str())
+                    .collect::<Vec<_>>(),
+                ["第一句", "第二句"],
+                "{invalid}"
+            );
+            let repaired = subtitle::load_json(&translated).unwrap();
+            assert_eq!(repaired[0].source, source[0].source);
+            assert_eq!(repaired[0].start, source[0].start);
+        }
+    }
+
+    #[tokio::test]
+    async fn cc_cache_supports_legacy_translation_without_segmented_file() {
+        for partial in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (pipeline, job, meta) = cache_test_pipeline(directory.path());
+            let work = pipeline.config.runtime.download_dir.join(&meta.id);
+            let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
+            let mut cached = vec![cue(0, "First"), cue(1, "Second")];
+            cached[0].translation = Some("第一句".into());
+            // Some("") 是有意留白的已完成翻译，不应当作缺失而反复补译。
+            cached[1].translation = if partial { None } else { Some(String::new()) };
+            subtitle::save_json(&cached, &translated).unwrap();
+
+            let ready = pipeline
+                .prepare_cc_cues(&job, &meta, 10.0, partial)
+                .await
+                .unwrap();
+            assert_eq!(ready.len(), if partial { 2 } else { 1 });
+            let calls = directory.path().join("calls");
+            if partial {
+                let calls = fs::read_to_string(calls).unwrap();
+                assert_eq!(calls.lines().count(), 1);
+                assert!(calls.contains("Second"));
+            } else {
+                assert!(!calls.exists());
+            }
+        }
+    }
 
     #[test]
     fn cc_submission_errors_only_treat_platform_code_as_explicit_rejection() {
