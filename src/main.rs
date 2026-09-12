@@ -1847,6 +1847,93 @@ PY
     }
 
     #[test]
+    fn service_health_samples_cover_decimal_and_nondivisible_windows() {
+        // Observe the shared sampler's probes and sleeps without wall-clock waits.
+        let probe = r#"set -euo pipefail
+source "$1"
+prepare_service_health_check
+systemctl_stub() {
+  case "$1" in
+    is-active) return 0 ;;
+    show) printf '123\n0\n'; printf 'sample\n' >&2 ;;
+    *) return 2 ;;
+  esac
+}
+sleep() { printf 'sleep:%s\n' "$1"; }
+wait_for_stable_service systemctl_stub test.service
+"#;
+        for (interval, window, samples) in [
+            ("0.5", "10", 21),
+            ("3", "10", 5),
+            ("1", "0.5", 2),
+            ("0.1", "0.3", 4),
+            ("0", "0", 2),
+        ] {
+            let output = std::process::Command::new("bash")
+                .args(["-c", probe, "service-health-test"])
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/deploy/service-health.sh"
+                ))
+                .env("Y2B_HEALTH_INTERVAL_SECONDS", interval)
+                .env("Y2B_HEALTH_WINDOW_SECONDS", window)
+                .env("Y2B_HEALTH_MAX_CHECKS", "2")
+                .output()
+                .unwrap();
+            let detail = output_detail(&output);
+            assert!(output.status.success(), "{interval}/{window}: {detail}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .filter(|line| *line == "sample")
+                    .count(),
+                samples,
+                "{interval}/{window}: {detail}"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .collect::<Vec<_>>(),
+                vec![format!("sleep:{interval}"); samples - 1],
+                "{interval}/{window}: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_scripts_reject_invalid_health_parameters_before_runtime_changes() {
+        let deploy = deploy_fixture("success");
+        let restore = restore_fixture(true);
+        for (interval, window, max_checks) in [
+            ("invalid", "10", "2"),
+            ("1", "-1", "2"),
+            ("1", "10", "0"),
+            ("1", "10", "0.5"),
+            ("0", "10", "2"),
+        ] {
+            for mut command in [
+                deploy.command(3),
+                restore.command_with_sqlite(&restore.sqlite3),
+            ] {
+                let output = command
+                    .env("Y2B_HEALTH_INTERVAL_SECONDS", interval)
+                    .env("Y2B_HEALTH_WINDOW_SECONDS", window)
+                    .env("Y2B_HEALTH_MAX_CHECKS", max_checks)
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(2), "{}", output_detail(&output));
+                assert!(!deploy.hold.exists());
+                assert!(!deploy.systemctl_log.exists());
+                assert!(!restore.systemctl_log.exists());
+                assert_eq!(
+                    fs::read_to_string(&restore.service_state).unwrap(),
+                    "active\n"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn deploy_hold_blocks_claim_between_two_idle_checks() {
         let fixture = deploy_fixture("race");
         let output = fixture.run(3);
@@ -2231,6 +2318,7 @@ PY
         let output = fixture.run(3);
         assert!(output.status.success(), "{}", output_detail(&output));
         assert!(!fixture.hold.exists());
+        assert!(fixture.current.join("deploy/service-health.sh").is_file());
         let events = fs::read_to_string(&fixture.events).unwrap();
         let start = events
             .find(&format!(
@@ -2436,8 +2524,9 @@ esac
             self
         }
 
-        fn run_with_sqlite(&self, sqlite3: &Path) -> Output {
-            std::process::Command::new("bash")
+        fn command_with_sqlite(&self, sqlite3: &Path) -> std::process::Command {
+            let mut command = std::process::Command::new("bash");
+            command
                 .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/deploy/restore.sh"))
                 .arg(&self.backup)
                 .env("Y2B_STATE_DIR", &self.state_dir)
@@ -2452,9 +2541,12 @@ esac
                 .env("RESTORE_TEST_SERVICE_STATE", &self.service_state)
                 .env("RESTORE_TEST_SYSTEMCTL_LOG", &self.systemctl_log)
                 .env("RESTORE_TEST_Y2B_LOG", &self.y2b_log)
-                .env("RESTORE_TEST_FAIL_START_ONCE", &self.fail_start_once)
-                .output()
-                .unwrap()
+                .env("RESTORE_TEST_FAIL_START_ONCE", &self.fail_start_once);
+            command
+        }
+
+        fn run_with_sqlite(&self, sqlite3: &Path) -> Output {
+            self.command_with_sqlite(sqlite3).output().unwrap()
         }
 
         fn run(&self) -> Output {
