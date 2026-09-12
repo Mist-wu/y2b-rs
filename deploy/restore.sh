@@ -13,11 +13,13 @@ service=${Y2B_SERVICE:-y2b-watch.service}
 sqlite3_cmd=${Y2B_SQLITE3:-sqlite3}
 systemctl_cmd=${Y2B_SYSTEMCTL:-systemctl}
 y2b_cmd=${Y2B_BIN:-y2b}
-health_interval=${Y2B_HEALTH_INTERVAL_SECONDS:-1}
-health_window_seconds=${Y2B_HEALTH_WINDOW_SECONDS:-10}
-health_max_checks=${Y2B_HEALTH_MAX_CHECKS:-30}
 schema_override=${Y2B_SCHEMA_VERSION:-}
 expected_schema=
+
+script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=deploy/service-health.sh
+source "$script_dir/service-health.sh"
+prepare_service_health_check
 
 temp_db=
 check_output=
@@ -102,65 +104,8 @@ read_schema() {
   "$sqlite3_cmd" "$1" 'SELECT MAX(version) FROM schema_migrations;'
 }
 
-wait_for_stable_service() {
-  local attempt
-  local active_seen=false
-  local stable_samples
-  local required_stable_samples=2
-  local window_samples
-  local first_pid=
-  local current_pid=
-  local current_restarts=
-  local health_output
-
-  if (( health_interval > 0 )); then
-    window_samples=$(( health_window_seconds / health_interval + 1 ))
-    (( window_samples > required_stable_samples )) && required_stable_samples=$window_samples
-  fi
-
-  for ((attempt = 1; attempt <= health_max_checks; attempt++)); do
-    if "$systemctl_cmd" is-active --quiet "$service"; then
-      active_seen=true
-      break
-    fi
-    if (( attempt < health_max_checks )); then
-      sleep "$health_interval"
-    fi
-  done
-  if [[ "$active_seen" != true ]]; then
-    echo "$service 恢复后健康检查失败" >&2
-    return 1
-  fi
-
-  for ((stable_samples = 1; stable_samples <= required_stable_samples; stable_samples++)); do
-    if ! "$systemctl_cmd" is-active --quiet "$service"; then
-      echo "$service 在稳定窗口内不再 active（第 $stable_samples/$required_stable_samples 次采样）" >&2
-      return 1
-    fi
-    if ! health_output=$("$systemctl_cmd" show -p MainPID -p NRestarts --value "$service"); then
-      echo "无法读取 $service 的 MainPID/NRestarts" >&2
-      return 1
-    fi
-    current_pid=${health_output%%$'\n'*}
-    current_restarts=${health_output#*$'\n'}
-    if [[ ! "$current_pid" =~ ^[1-9][0-9]*$ ]]; then
-      echo "无法读取 $service 的有效 MainPID: $current_pid" >&2
-      return 1
-    fi
-    if [[ "$stable_samples" == 1 ]]; then
-      first_pid=$current_pid
-    elif [[ "$current_pid" != "$first_pid" ]]; then
-      echo "$service 的 MainPID 在稳定窗口内变化: $first_pid -> $current_pid" >&2
-      return 1
-    fi
-    if [[ ! "$current_restarts" =~ ^[0-9]+$ ]] || (( current_restarts != 0 )); then
-      echo "$service 在稳定窗口内发生重启: NRestarts=$current_restarts" >&2
-      return 1
-    fi
-    if (( stable_samples < required_stable_samples )); then
-      sleep "$health_interval"
-    fi
-  done
+wait_for_restored_service() {
+  wait_for_stable_service "$systemctl_cmd" "$service" || return 1
 
   if ! "$y2b_cmd" maintenance status --database "$database" --json >/dev/null; then
     echo "$service 应用级探针失败: maintenance status 无法正常返回" >&2
@@ -288,7 +233,7 @@ done
 check_integrity "$database"
 
 if [[ "$was_active" == true ]]; then
-  wait_for_stable_service
+  wait_for_restored_service
 else
   set +e
   "$systemctl_cmd" is-active --quiet "$service"
