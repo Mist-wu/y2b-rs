@@ -161,28 +161,22 @@ python3 scripts/audit_brawl_glossary.py \
 
 ## 强失败质量门禁
 
-提交前统一运行 `npm run check`；它同时执行 TypeScript 类型检查和 `pi/y2b-extension.ts` 的真实 import 解析。完整的本地门禁与 CI 一致：
+本地按改动范围跑对应的那几条就行，剩下的交给 CI：
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-npm ci
-npm run check
+# 改 Rust
+cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test
+# 改 pi/ 下的 extension 或 policy
+npm ci && npm run check   # TypeScript 类型检查 + y2b-extension.ts 的真实 import 解析
+# 改 scripts/
 python3 -m unittest discover -s scripts -p 'test_*.py'
-python3 -m unittest discover -s deploy/tests -p 'test_*.py'
-python3 -m unittest discover -s .github/workflows/tests -p 'test_*.py'
-python3 -m compileall -q scripts deploy
-shellcheck deploy/*.sh
-bash -n deploy/*.sh
-npm audit --audit-level=high
-cargo audit
-gitleaks git --gitleaks-ignore-path .github/workflows/gitleaksignore .
+# 改 deploy/
+python3 -m unittest discover -s deploy/tests -p 'test_*.py' && shellcheck deploy/*.sh
 ```
 
-CI 只有一个工作流 `.github/workflows/ci.yml`，四个并行 job：Rust、脚本与配置、依赖审计、Gitleaks。格式、类型、测试、脚本语法、Gitleaks 以及真正的 RustSec vulnerability 都是**强失败门禁**：任一命令非零退出就阻断合并和发布，不得用 `|| true`、`continue-on-error`、跳过测试或宽泛 allowlist 降级。Gitleaks 扫描完整历史，仓库中的测试假 Key 只按唯一 fingerprint 精确放行。
+CI 只有一个工作流 `.github/workflows/ci.yml`，四个并行 job：Rust、脚本与配置、依赖审计、Gitleaks。格式、类型、测试、脚本语法、Gitleaks 以及真正的 RustSec vulnerability 都是**强失败门禁**：任一命令非零退出就阻断合并和发布。Gitleaks 扫描完整历史，仓库中的测试假 Key 只按唯一 fingerprint 精确放行。
 
-依赖审计刻意采用不同阈值，因为 advisory 会在上游发布后异步改变，与当前提交未必相关：npm 只让 high／critical 发现阻断，low／moderate 仍显示在报告中；`cargo audit` 默认只对 vulnerability 非零退出，unmaintained、yanked、unsound 等 warning 会打印在日志里但不阻断。这样既不隐藏漏洞和维护风险，也不会因低级噪音让主门禁长期失去可信度。
+依赖审计刻意采用不同阈值，因为 advisory 会在上游发布后异步改变，与当前提交未必相关：npm 只让 high／critical 发现阻断（`npm audit --audit-level=high`），low／moderate 仍显示在报告中；`cargo audit` 默认只对 vulnerability 非零退出，unmaintained、yanked、unsound 等 warning 会打印在日志里但不阻断。这样既不隐藏漏洞和维护风险，也不会因低级噪音让主门禁长期失去可信度。
 
 ## 部署
 
@@ -218,14 +212,11 @@ ssh azureuser@20.89.60.23 "sudo bash /tmp/y2b-release-$release_id/deploy/deploy-
 > [!IMPORTANT]
 > 第 3 步不能只拷二进制。`y2b-extension.ts`、`policy.json`、`audit-policy.json`、`brawl-stars-glossary.json` 与二进制必须来自同一份输入；`deploy-app.sh` 会把它们一起放入 `/opt/y2b/releases/$release_id/`。`/opt/y2b/pi` 只是指向 `current/pi` 的兼容链接，禁止再向这个固定路径单独覆盖文件。
 
-> [!WARNING]
-> 不要绕过脚本手工停止、覆盖二进制或迁移数据库。`deploy-app.sh` 会先获取 maintenance hold，再等待两次连续 idle；若超时，应按输出的 blocker 明细处理存量任务，而不是强制重启。
-
 ### maintenance hold 与原子 release 边界
 
 **maintenance hold** 是 SQLite 中带 owner、原因和租期的真实写锁，不再只是运维约定。它会阻止 watch、手动 `y2b run` 和字幕流程领取新工作；部署获取锁后仍要等待已经领取的任务结束。`deploy-app.sh` 以 `deploy:<revision>:<UTC 时间>:<PID>` 作为唯一 owner，每轮等待都会续租，并用 `status --json --owner <本次 owner>` 排除自己的锁。`active_claims`、`upload_attempts`、`subtitle_attempts` 等 blocker 的 kind、数量和 details 都会原样打印。
 
-手工维护也必须使用唯一 owner，并始终显式指定数据库：
+手工维护用同一组命令，`--owner` 取一个唯一值、`--database` 显式写出：
 
 ```bash
 owner="manual:$(date -u +%Y%m%dT%H%M%SZ):$$"
@@ -237,7 +228,7 @@ y2b maintenance renew --database /var/lib/y2b/state.db \
 y2b maintenance release --database /var/lib/y2b/state.db --owner "$owner"
 ```
 
-`--owner` 只在 status 中排除调用方自己的 hold；省略它可从旁观者视角确认当前维护者。租约到期后锁可被接管，但不能把等待到期当作正常释放流程。`maintenance status` 对不存在的数据库会报错，部署也会拒绝继续，不会因路径写错而新建空库。
+`--owner` 只在 status 中排除调用方自己的 hold；省略它可从旁观者视角确认当前维护者。租约到期后锁可被接管。`maintenance status` 对不存在的数据库会报错，部署也会拒绝继续，不会因路径写错而新建空库。
 
 应用 release 已按 commit 原子化。旧说明“应用 release 当前不是原子切换”已经失效；当前契约是：
 
@@ -304,11 +295,11 @@ yt-dlp -v --simulate 'https://www.youtube.com/watch?v=VIDEO_ID' 2>&1 \
 
 ## 备份与恢复
 
-在线备份每 6 小时一次，保留 4 个小时备份、7 个日备份、4 个周备份。`deploy-app.sh` 每次迁移前还会在 `backups/deploy/` 自动生成并验证专用快照；手工迁移仍须先执行 `y2b backup`。恢复必须使用与备份兼容的完整 release，不能只替换数据库或二进制。
+在线备份每 6 小时一次，保留 4 个小时备份、7 个日备份、4 个周备份。`deploy-app.sh` 每次迁移前还会在 `backups/deploy/` 自动生成并验证专用快照；手工迁移前先执行一次 `y2b backup`。恢复要用与备份兼容的完整 release，不能只替换数据库或二进制——schema 对不上服务起不来。
 
 1. 记录备份时间、来源 schema 和对应 release；用唯一 owner 获取 maintenance hold，并通过带同一 `--owner` 的 status 确认全部 blockers 为空，而不只是查看 `uploading`／运行中的 stage。保留当前数据库与整套 release 作为成对回退点。
 2. 空服务器先运行 `bootstrap-server.sh`，再恢复 `/etc/y2b/config.toml`、`/etc/y2b/y2b.env` 和两个 cookies 文件，并用 `y2b-set-deepseek-key` 重新注入 DeepSeek Key。Pi 资源随应用 release 安装，无需单独备份。
-3. 先用 `deploy-app.sh` 安装与当前代码匹配的完整 release，再从 `backups/daily` 或 `weekly` 选择数据库并执行 `deploy/restore.sh BACKUP.db`；不要手工覆盖在线 `state.db`，也不要并行运行部署和恢复。任何恢复决策都要记录 release 与数据库这一对，禁止只回退其中一边。
+3. 先用 `deploy-app.sh` 安装与当前代码匹配的完整 release，再从 `backups/daily` 或 `weekly` 选择数据库并执行 `deploy/restore.sh BACKUP.db`。release 与数据库成对选择，把这一对记下来备查。
 4. `restore.sh` 在停服务前完成强预检：把备份复制到数据库所在文件系统的暂存路径，要求 SQLite `integrity_check` 精确返回单独一行 `ok`，同时检查关键表和可读 schema。预检通过后才记录原 service 状态、停服务、保存旧库，并以同文件系统 `mv` 原子替换数据库和清理旧 WAL/SHM。
 5. 原服务先前为 active 时，脚本启动它并等待幂等迁移到 schema v22，再复查数据库完整性，并通过稳定窗口健康检查确认 service 稳定。任一步骤失败，EXIT trap 都尝试恢复旧数据库及原 service 状态并返回非零；成功后仍要核对 schema v22、队列数量、最近备份、`upload_uncertain` 和 `subtitle_attempts` 中的 `uncertain`。不确定的投稿或字幕提交只能人工核对，不能因恢复而自动重试。
 6. SQLite 保存完整队列：准备和 CC 字幕任务通过原子领取、租约与心跳避免多进程重复执行；过期租约在重启后恢复。任务模式和追加目标 BV 不丢失，`dead_letter` 可从 TUI 或 CLI 安全恢复。旧频道和任务模式均为 `translated`；升级前停在待补字幕的任务各获一次自动补交机会，旧 `retry_wait` 行沿用固定 10 分钟退避。
