@@ -64,6 +64,82 @@ fn tool_checks(config: &Config) -> [(&'static str, PathBuf, Vec<&'static str>); 
     ]
 }
 
+fn baseline_tools(
+    config: &Config,
+) -> impl Iterator<Item = (&'static str, PathBuf, Vec<&'static str>)> {
+    // 保持现有基线格式：ffprobe 检查可运行性，但不记录摘要。
+    tool_checks(config)
+        .into_iter()
+        .filter(|(name, _, _)| *name != "ffprobe")
+}
+
+fn policy_resources(config: &Config) -> [(&'static str, &'static str, PathBuf); 4] {
+    [
+        ("pi-extension", "Pi extension", config.ai.extension.clone()),
+        ("pi-policy", "Pi policy", config.ai.policy.clone()),
+        (
+            "pi-audit-policy",
+            "Pi audit policy",
+            config.ai.policy.with_file_name("audit-policy.json"),
+        ),
+        (
+            "brawl-stars-glossary",
+            "Brawl Stars glossary",
+            config.ai.policy.with_file_name("brawl-stars-glossary.json"),
+        ),
+    ]
+}
+
+fn baseline_check(config: &Config, baseline: &Baseline) -> CheckItem {
+    let mut expected = baseline_tools(config)
+        .map(|(name, path, _)| (name, path))
+        .chain(policy_resources(config).map(|(name, _, path)| (name, path)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut external_drift = Vec::new();
+    let mut y2b_seen = false;
+    let mut y2b_drift = false;
+    for item in &baseline.items {
+        if item.name == "y2b" {
+            // 应用更新/旧 release 清理是正常部署行为，仅作告警。
+            y2b_drift |= y2b_seen || !baseline_hash_matches(item, Path::new(&item.path));
+            y2b_seen = true;
+        } else if let Some(path) = expected.remove(item.name.as_str()) {
+            if Path::new(&item.path) != path || !baseline_hash_matches(item, &path) {
+                external_drift.push(item.name.clone());
+            }
+        } else {
+            external_drift.push(format!("{}（重复或未知条目）", item.name));
+        }
+    }
+    external_drift.extend(expected.keys().map(|name| format!("{name}（缺少条目）")));
+    y2b_drift |= !y2b_seen;
+    let mut details = Vec::new();
+    if !external_drift.is_empty() {
+        details.push(format!("漂移或基线不完整: {}", external_drift.join(", ")));
+    }
+    if y2b_drift {
+        details.push("y2b 自身与基线不一致（部署预期变更，仅告警）".into());
+    }
+    CheckItem {
+        name: "dependency baseline".into(),
+        ok: details.is_empty(),
+        required: !external_drift.is_empty() || !y2b_drift,
+        detail: if details.is_empty() {
+            format!("无漂移，基线 {}", baseline.generated_at)
+        } else {
+            details.join("；")
+        },
+    }
+}
+
+fn baseline_hash_matches(item: &BaselineItem, path: &Path) -> bool {
+    item.sha256.as_ref().is_some_and(|expected| {
+        hash_file(path)
+            .map(|actual| actual == *expected)
+            .unwrap_or(false)
+    })
+}
+
 fn schema_check(schema: i64) -> CheckItem {
     CheckItem {
         name: "database schema".into(),
@@ -148,16 +224,13 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
             detail: format!("读取版本失败: {error}"),
         },
     });
-    let glossary_path = config.ai.policy.with_file_name("brawl-stars-glossary.json");
-    let audit_policy_path = config.ai.policy.with_file_name("audit-policy.json");
     for (name, p) in [
-        ("YouTube cookies", &config.youtube.cookies),
-        ("Bilibili cookies", &config.bilibili.cookies),
-        ("Pi extension", &config.ai.extension),
-        ("Pi policy", &config.ai.policy),
-        ("Pi audit policy", &audit_policy_path),
-        ("Brawl Stars glossary", &glossary_path),
-    ] {
+        ("YouTube cookies", config.youtube.cookies.clone()),
+        ("Bilibili cookies", config.bilibili.cookies.clone()),
+    ]
+    .into_iter()
+    .chain(policy_resources(config).map(|(_, label, path)| (label, path)))
+    {
         out.push(CheckItem {
             name: name.into(),
             ok: p.exists(),
@@ -171,46 +244,7 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
             .ok()
             .and_then(|raw| serde_json::from_slice::<Baseline>(&raw).ok())
         {
-            Some(baseline) => {
-                // 基线条目分两类：外部依赖（pi、yt-dlp、ffmpeg、biliup、Pi 资源文件）
-                // 被偷换是意外，必须作为必选失败；y2b 自身的变化是部署的预期结果，
-                // 部署脚本本身就是变更来源，不应由它拦住部署，因此只降级为告警。
-                let mut external_drift = Vec::new();
-                let mut y2b_drift = false;
-                for item in &baseline.items {
-                    let drifted = item.sha256.as_ref().is_some_and(|expected| {
-                        hash_file(Path::new(&item.path))
-                            .map(|actual| actual != *expected)
-                            .unwrap_or(true)
-                    });
-                    if !drifted {
-                        continue;
-                    }
-                    if item.name == "y2b" {
-                        y2b_drift = true;
-                    } else {
-                        external_drift.push(item.name.clone());
-                    }
-                }
-                let y2b_only_drift = y2b_drift && external_drift.is_empty();
-                out.push(CheckItem {
-                    name: "dependency baseline".into(),
-                    ok: external_drift.is_empty() && !y2b_drift,
-                    required: !y2b_only_drift,
-                    detail: if external_drift.is_empty() && !y2b_drift {
-                        format!("无漂移，基线 {}", baseline.generated_at)
-                    } else {
-                        let mut parts = Vec::new();
-                        if !external_drift.is_empty() {
-                            parts.push(format!("漂移: {}", external_drift.join(", ")));
-                        }
-                        if y2b_drift {
-                            parts.push("y2b 自身与基线不一致（部署预期变更，仅告警）".into());
-                        }
-                        parts.join("；")
-                    },
-                });
-            }
+            Some(baseline) => out.push(baseline_check(config, &baseline)),
             None => out.push(CheckItem {
                 name: "dependency baseline".into(),
                 ok: false,
@@ -260,12 +294,8 @@ pub async fn write_baseline(
     checks: &[CheckItem],
 ) -> Result<Baseline> {
     let mut items = Vec::new();
-    // 基线只记录会被二进制更新影响的工具，ffprobe 由 run() 检查但不入基线。
     // 版本必须复用本轮检查结果，不能再次执行命令后把另一份结果写入基线。
-    for (name, path, _) in tool_checks(config)
-        .into_iter()
-        .filter(|(name, _, _)| *name != "ffprobe")
-    {
+    for (name, path, _) in baseline_tools(config) {
         if !path.exists() {
             anyhow::bail!("生成依赖基线失败，缺少必选工具 {name}: {}", path.display());
         }
@@ -294,22 +324,13 @@ pub async fn write_baseline(
             sha256: Some(hash_file(&path)?),
         });
     }
-    let glossary_path = config.ai.policy.with_file_name("brawl-stars-glossary.json");
-    let audit_policy_path = config.ai.policy.with_file_name("audit-policy.json");
-    for (name, path) in [
-        ("pi-extension", config.ai.extension.as_path()),
-        ("pi-policy", config.ai.policy.as_path()),
-        ("pi-audit-policy", audit_policy_path.as_path()),
-        ("brawl-stars-glossary", glossary_path.as_path()),
-    ] {
-        if path.exists() {
-            items.push(BaselineItem {
-                name: name.into(),
-                path: path.display().to_string(),
-                version: String::new(),
-                sha256: Some(hash_file(path)?),
-            });
-        }
+    for (name, _, path) in policy_resources(config) {
+        items.push(BaselineItem {
+            name: name.into(),
+            path: path.display().to_string(),
+            version: String::new(),
+            sha256: Some(hash_file(&path)?),
+        });
     }
     let mut details = std::collections::BTreeMap::new();
     details.insert(
@@ -401,107 +422,155 @@ mod tests {
         assert!(!destination.exists());
     }
 
-    fn config_with_missing_tools(data_dir: &Path) -> Config {
+    async fn baseline_fixture(dir: &Path) -> (Config, Database, Baseline) {
+        use std::os::unix::fs::PermissionsExt;
+
         let mut config = Config::default();
-        config.runtime.data_dir = data_dir.to_path_buf();
-        let missing = data_dir.join("missing-tool").display().to_string();
-        config.ai.pi = missing.clone();
-        config.youtube.yt_dlp = missing.clone();
-        config.render.ffmpeg = missing.clone();
-        config.render.ffprobe = missing.clone();
-        config.bilibili.biliup = missing;
-        config
+        config.runtime.data_dir = dir.to_path_buf();
+        let tool = dir.join("tool");
+        fs::write(&tool, "#!/bin/sh\nprintf 'fixture-version\\n'\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
+        let tool = tool.display().to_string();
+        config.ai.pi = tool.clone();
+        config.youtube.yt_dlp = tool.clone();
+        config.render.ffmpeg = tool.clone();
+        config.render.ffprobe = tool.clone();
+        config.bilibili.biliup = tool;
+        config.ai.extension = dir.join("extension.ts");
+        config.ai.policy = dir.join("policy.json");
+        config.youtube.cookies = dir.join("youtube.cookies");
+        config.bilibili.cookies = dir.join("bilibili.cookies");
+        for (_, _, path) in policy_resources(&config) {
+            fs::write(path, "fixture-resource").unwrap();
+        }
+        let db = Database::open(&dir.join("state.db")).unwrap();
+        let checks = run(&config, &db).await;
+        let baseline = write_baseline(&config, &dir.join("dependency-baseline.json"), &checks)
+            .await
+            .unwrap();
+        (config, db, baseline)
     }
 
-    fn write_baseline_json(dir: &Path, items: Vec<BaselineItem>) {
-        let baseline = Baseline {
-            generated_at: "test".into(),
-            os: "test".into(),
-            arch: "test".into(),
-            items,
-            details: std::collections::BTreeMap::new(),
-        };
+    fn save_test_baseline(dir: &Path, baseline: &Baseline) {
         fs::write(
             dir.join("dependency-baseline.json"),
-            serde_json::to_vec_pretty(&baseline).unwrap(),
+            serde_json::to_vec_pretty(baseline).unwrap(),
         )
         .unwrap();
+    }
+
+    fn baseline_result(checks: &[CheckItem]) -> &CheckItem {
+        checks
+            .iter()
+            .find(|item| item.name == "dependency baseline")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn generated_baseline_matches_current_dependencies() {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, db, baseline) = baseline_fixture(temp.path()).await;
+        let checks = run(&config, &db).await;
+        assert!(baseline_result(&checks).ok);
+        // Existing baselines deliberately omit ffprobe, which is probed separately.
+        assert!(!baseline.items.iter().any(|item| item.name == "ffprobe"));
     }
 
     #[tokio::test]
     async fn external_dependency_drift_is_a_required_failure() {
         let temp = tempfile::tempdir().unwrap();
-        let config = config_with_missing_tools(temp.path());
-        let ytdlp = temp.path().join("yt-dlp");
-        fs::write(&ytdlp, "2026.01.01\n").unwrap();
-        let y2b = temp.path().join("y2b");
-        fs::write(&y2b, "current-binary\n").unwrap();
-        write_baseline_json(
-            temp.path(),
-            vec![
-                BaselineItem {
-                    name: "yt-dlp".into(),
-                    path: ytdlp.display().to_string(),
-                    version: "2026.01.01".into(),
-                    // 与磁盘上的 yt-dlp 不一致，模拟外部依赖被偷换。
-                    sha256: Some("0".repeat(64)),
-                },
-                BaselineItem {
-                    name: "y2b".into(),
-                    path: y2b.display().to_string(),
-                    version: "test".into(),
-                    sha256: Some(hash_file(&y2b).unwrap()),
-                },
-            ],
-        );
-        let db = Database::open(&temp.path().join("state.db")).unwrap();
-
+        let (config, db, _) = baseline_fixture(temp.path()).await;
+        fs::write(&config.ai.policy, "changed-resource").unwrap();
         let checks = run(&config, &db).await;
-        let item = checks
-            .iter()
-            .find(|item| item.name == "dependency baseline")
-            .unwrap();
-        assert!(item.required, "外部依赖漂移必须保持必选失败");
+        let item = baseline_result(&checks);
+        assert!(item.required);
         assert!(!item.ok);
+        assert!(item.detail.contains("pi-policy"), "{}", item.detail);
+    }
+
+    #[tokio::test]
+    async fn changed_dependency_path_cannot_keep_checking_the_old_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut config, db, _) = baseline_fixture(temp.path()).await;
+        let old_tool = config.youtube.yt_dlp.clone();
+        let new_tool = temp.path().join("new-tool");
+        fs::copy(&old_tool, &new_tool).unwrap();
+        // Even identical bytes at a different configured path require explicit rebaselining.
+        config.youtube.yt_dlp = new_tool.display().to_string();
+        let checks = run(&config, &db).await;
+        assert!(Path::new(&old_tool).exists());
+        assert!(checks.iter().find(|item| item.name == "yt-dlp").unwrap().ok);
+        let item = baseline_result(&checks);
+        assert!(item.required && !item.ok, "{item:?}");
         assert!(item.detail.contains("yt-dlp"), "{}", item.detail);
+
+        let old_policy = config.ai.policy.clone();
+        config.youtube.yt_dlp = old_tool;
+        config.ai.policy = temp.path().join("new-policy.json");
+        fs::copy(old_policy, &config.ai.policy).unwrap();
+        let checks = run(&config, &db).await;
+        let item = baseline_result(&checks);
+        assert!(item.required && !item.ok, "{item:?}");
+        assert!(item.detail.contains("pi-policy"), "{}", item.detail);
+    }
+
+    #[tokio::test]
+    async fn incomplete_or_ambiguous_baselines_are_required_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, db, baseline) = baseline_fixture(temp.path()).await;
+        let mut empty = baseline.clone();
+        empty.items.clear();
+        let mut missing = baseline.clone();
+        missing.items.retain(|item| item.name != "pi-policy");
+        let mut no_hash = baseline.clone();
+        no_hash
+            .items
+            .iter_mut()
+            .find(|item| item.name == "yt-dlp")
+            .unwrap()
+            .sha256 = None;
+        let mut duplicate = baseline.clone();
+        duplicate.items.push(duplicate.items[0].clone());
+        for (case, invalid) in [
+            ("empty", empty),
+            ("missing", missing),
+            ("null hash", no_hash),
+            ("duplicate", duplicate),
+        ] {
+            save_test_baseline(temp.path(), &invalid);
+            let checks = run(&config, &db).await;
+            let item = baseline_result(&checks);
+            assert!(item.required && !item.ok, "{case}: {item:?}");
+        }
     }
 
     #[tokio::test]
     async fn y2b_own_drift_is_only_a_warning() {
         let temp = tempfile::tempdir().unwrap();
-        let config = config_with_missing_tools(temp.path());
-        let ytdlp = temp.path().join("yt-dlp");
-        fs::write(&ytdlp, "2026.01.01\n").unwrap();
-        let y2b = temp.path().join("y2b");
-        fs::write(&y2b, "new-binary\n").unwrap();
-        write_baseline_json(
-            temp.path(),
-            vec![
-                BaselineItem {
-                    name: "yt-dlp".into(),
-                    path: ytdlp.display().to_string(),
-                    version: "2026.01.01".into(),
-                    sha256: Some(hash_file(&ytdlp).unwrap()),
-                },
-                BaselineItem {
-                    name: "y2b".into(),
-                    path: y2b.display().to_string(),
-                    version: "test".into(),
-                    // 基线记录的是上一版二进制，当前二进制已经更新。
-                    sha256: Some("f".repeat(64)),
-                },
-            ],
-        );
-        let db = Database::open(&temp.path().join("state.db")).unwrap();
-
+        let (config, db, mut baseline) = baseline_fixture(temp.path()).await;
+        baseline
+            .items
+            .iter_mut()
+            .find(|item| item.name == "y2b")
+            .unwrap()
+            .sha256 = Some("f".repeat(64));
+        save_test_baseline(temp.path(), &baseline);
         let checks = run(&config, &db).await;
-        let item = checks
-            .iter()
-            .find(|item| item.name == "dependency baseline")
-            .unwrap();
+        let item = baseline_result(&checks);
         assert!(!item.required, "y2b 自身漂移不应构成必选失败");
         assert!(!item.ok);
-        assert!(item.detail.contains("y2b"), "{}", item.detail);
         assert!(item.detail.contains("仅告警"), "{}", item.detail);
+    }
+
+    #[tokio::test]
+    async fn missing_resource_cannot_overwrite_a_complete_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, db, _) = baseline_fixture(temp.path()).await;
+        let path = temp.path().join("dependency-baseline.json");
+        let original = fs::read(&path).unwrap();
+        fs::remove_file(&config.ai.policy).unwrap();
+        let checks = run(&config, &db).await;
+        assert!(write_baseline(&config, &path, &checks).await.is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 }
