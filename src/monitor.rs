@@ -1154,7 +1154,7 @@ impl Monitor {
                 Ok(discovered) => count += discovered,
                 Err(error) => tracing::warn!(
                     channel = %channel.name,
-                    error = %error,
+                    error = %format!("{error:#}"),
                     "RSS 探针失败"
                 ),
             }
