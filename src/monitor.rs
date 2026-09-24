@@ -385,15 +385,21 @@ fn source_language_matches(expected: &str, actual: &str) -> bool {
 impl FeedFetchError {
     fn retryable(&self) -> bool {
         match self {
-            // 404 在 feeds 端点上不代表频道不存在：被限流时 YouTube 会对同一个
-            // feed 随机返回 404/500，几秒后重放就能拿到 200。频道真的没了会稳定
-            // 404，重试耗尽后照样上报失败，代价只是每轮多几次请求。
-            Self::Http { status, .. } => {
-                status.is_server_error() || *status == StatusCode::NOT_FOUND
-            }
+            Self::Http { .. } => self.upstream_flaky(),
             Self::Request { source } => source.is_timeout() || source.is_connect(),
             Self::BodyTooLarge { .. } => false,
         }
+    }
+
+    /// 404 在 feeds 端点上不代表频道不存在：被限流时 YouTube 会对同一个
+    /// feed 随机返回 404/500，几秒后重放就能拿到 200。频道真的没了会稳定
+    /// 404，重试耗尽后照样上报失败，代价只是每轮多几次请求。
+    fn upstream_flaky(&self) -> bool {
+        matches!(
+            self,
+            Self::Http { status, .. }
+                if status.is_server_error() || *status == StatusCode::NOT_FOUND
+        )
     }
 
     fn retry_at(&self) -> Option<DateTime<Utc>> {
@@ -1152,6 +1158,20 @@ impl Monitor {
                 .await
             {
                 Ok(discovered) => count += discovered,
+                // YouTube feeds 端点每天 UTC 23:00-07:00 前后会对大多数频道
+                // 返回 404/500，WebSub 和 Data API 兜底照常发现视频；逐频道
+                // 记 INFO 以免淹没真正的告警，全局熔断仍以 WARN 上报。
+                Err(error)
+                    if error
+                        .downcast_ref::<FeedFetchError>()
+                        .is_some_and(FeedFetchError::upstream_flaky) =>
+                {
+                    tracing::info!(
+                        channel = %channel.name,
+                        error = %format!("{error:#}"),
+                        "RSS 探针被 YouTube 拒绝"
+                    )
+                }
                 Err(error) => tracing::warn!(
                     channel = %channel.name,
                     error = %format!("{error:#}"),
@@ -2477,6 +2497,31 @@ esac
         // 429 有 Retry-After，按频道退避处理，不在这里空转重试。
         assert!(!http(StatusCode::TOO_MANY_REQUESTS).retryable());
         assert!(!http(StatusCode::FORBIDDEN).retryable());
+    }
+
+    /// 探针失败日志按 anyhow 链里的 FeedFetchError 分级：只有上游抖动
+    /// （404/5xx）降为 INFO，429、403 和网络错误仍是 WARN。
+    #[test]
+    fn rss_upstream_flaky_is_found_through_probe_context() {
+        let flaky = |status| {
+            anyhow::Error::new(FeedFetchError::Http {
+                status,
+                retry_at: None,
+            })
+            .context("RSS 探针不可用")
+            .downcast_ref::<FeedFetchError>()
+            .is_some_and(FeedFetchError::upstream_flaky)
+        };
+        assert!(flaky(StatusCode::NOT_FOUND));
+        assert!(flaky(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!flaky(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!flaky(StatusCode::FORBIDDEN));
+        assert!(
+            !FeedFetchError::BodyTooLarge {
+                limit: RSS_BODY_LIMIT
+            }
+            .upstream_flaky()
+        );
     }
 
     #[tokio::test]
