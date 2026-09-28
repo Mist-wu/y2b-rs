@@ -56,7 +56,7 @@ Pi 调用固定为 `deepseek` + `thinking=off`：分句、投稿元数据、长�
 ```bash
 # 审计模型能力
 python3 scripts/audit_brawl_glossary.py \
-  --server azureuser@<server-ip> \
+  --server <server> \
   --models deepseek-flash \
   --output /tmp/y2b-brawl-glossary-audit.json
 

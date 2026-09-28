@@ -8,6 +8,7 @@ import collections
 import concurrent.futures
 import dataclasses
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -575,7 +576,11 @@ def nonnegative_int(value: str) -> int:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--server", default="azureuser@<server-ip>")
+    parser.add_argument(
+        "--server",
+        default=os.environ.get("Y2B_SERVER"),
+        help="SSH target such as user@host; defaults to $Y2B_SERVER",
+    )
     parser.add_argument(
         "--models",
         default=PI_MODEL,
@@ -616,6 +621,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     models = [model.strip() for model in args.models.split(",") if model.strip()]
     if models not in ([], [PI_MODEL]):
         parser.error(f"--models must be {PI_MODEL!r} or empty")
+    if models and not args.server:
+        parser.error("--server or $Y2B_SERVER is required when auditing models")
     if bool(args.production_from) != bool(args.production_output):
         parser.error("--production-from and --production-output must be used together")
     if args.production_from and args.shard_count != 1:

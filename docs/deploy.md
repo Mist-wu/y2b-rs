@@ -23,12 +23,12 @@ CI 只有一个工作流 `.github/workflows/ci.yml`，四个并行 job：Rust、
 
 ## 部署
 
-目标：Ubuntu 22.04 x86_64，`azureuser@<server-ip>`。Azure 镜像禁止 root 直接 SSH，特权操作走 `azureuser` 免密 `sudo`。服务器不编译 Rust 或 FFmpeg。
+目标：Ubuntu 22.04 x86_64。下文的 `<server>` 换成你的 SSH 目标（如 `azureuser@1.2.3.4`）。Azure 镜像禁止 root 直接 SSH，特权操作走 `azureuser` 免密 `sudo`。服务器不编译 Rust 或 FFmpeg。
 
 ```bash
 # 1. 服务器：2 GiB swap、预编译依赖和自动 PO Token Provider
-scp deploy/bootstrap-server.sh deploy/install-ytdlp-pot-provider.sh azureuser@<server-ip>:/tmp/
-ssh azureuser@<server-ip> 'sudo bash /tmp/bootstrap-server.sh'
+scp deploy/bootstrap-server.sh deploy/install-ytdlp-pot-provider.sh <server>:/tmp/
+ssh <server> 'sudo bash /tmp/bootstrap-server.sh'
 
 # 2. Mac：静态交叉编译
 brew install zig
@@ -38,16 +38,16 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 
 # 3. 按 commit 建独立传输目录，上传二进制、运行资源和安全换钥工具
 release_id=$(git rev-parse --short=12 HEAD)
-scp target/x86_64-unknown-linux-musl/release/y2b azureuser@<server-ip>:/tmp/y2b-$release_id
-ssh azureuser@<server-ip> "install -d /tmp/y2b-release-$release_id"
-scp -r pi config.example.toml deploy Cargo.lock azureuser@<server-ip>:/tmp/y2b-release-$release_id/
-ssh azureuser@<server-ip> "sudo install -o root -g root -m 755 /tmp/y2b-release-$release_id/deploy/y2b-set-deepseek-key.py /usr/local/sbin/y2b-set-deepseek-key"
+scp target/x86_64-unknown-linux-musl/release/y2b <server>:/tmp/y2b-$release_id
+ssh <server> "install -d /tmp/y2b-release-$release_id"
+scp -r pi config.example.toml deploy Cargo.lock <server>:/tmp/y2b-release-$release_id/
+ssh <server> "sudo install -o root -g root -m 755 /tmp/y2b-release-$release_id/deploy/y2b-set-deepseek-key.py /usr/local/sbin/y2b-set-deepseek-key"
 
 # 4. 在 Mac 终端输入新 Key；输入不回显，Key 只经 stdin 发送且不会出现在命令历史
-(read -r -s 'Y2B_DEEPSEEK_KEY?请输入新的 DeepSeek API Key: '; printf '\n'; printf '%s' "$Y2B_DEEPSEEK_KEY" | ssh azureuser@<server-ip> 'sudo /usr/local/sbin/y2b-set-deepseek-key')
+(read -r -s 'Y2B_DEEPSEEK_KEY?请输入新的 DeepSeek API Key: '; printf '\n'; printf '%s' "$Y2B_DEEPSEEK_KEY" | ssh <server> 'sudo /usr/local/sbin/y2b-set-deepseek-key')
 
 # 5. 部署应用
-ssh azureuser@<server-ip> "sudo bash /tmp/y2b-release-$release_id/deploy/deploy-app.sh /tmp/y2b-$release_id"
+ssh <server> "sudo bash /tmp/y2b-release-$release_id/deploy/deploy-app.sh /tmp/y2b-$release_id"
 ```
 
 换钥工具会原子写入专用认证文件，并删除 `/etc/y2b/y2b.env` 和全局 Pi 认证中的旧 DeepSeek 条目；它不会打印明文 Key。部署前可用 `sudo y2b-set-deepseek-key --check` 只读检查单一路径约束。
