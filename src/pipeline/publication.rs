@@ -438,16 +438,13 @@ pub(super) fn build_upload_args(
     vec![
         "--submit".into(),
         "web".into(),
-        "--title".into(),
-        metadata.title.clone(),
-        "--desc".into(),
-        build_description(meta),
-        "--tag".into(),
-        metadata.tags.join(","),
+        // Bind free-form values to their flags so leading hyphens stay literal.
+        format!("--title={}", metadata.title),
+        format!("--desc={}", build_description(meta)),
+        format!("--tag={}", metadata.tags.join(",")),
         "--tid".into(),
         BILIBILI_TID.to_string(),
-        "--dynamic".into(),
-        metadata.dynamic.clone(),
+        format!("--dynamic={}", metadata.dynamic),
         "--copyright".into(),
         "1".into(),
         "--no-reprint".into(),
@@ -779,6 +776,51 @@ mod tests {
         assert!(build_publication_payload(TransferMode::Translated, &meta, None, 200_000).is_err());
     }
 
+    fn parse_upload_args(args: Vec<String>) -> clap::ArgMatches {
+        clap::Command::new("upload")
+            .args(
+                [
+                    "submit",
+                    "title",
+                    "desc",
+                    "tag",
+                    "tid",
+                    "dynamic",
+                    "copyright",
+                    "no-reprint",
+                    "limit",
+                ]
+                .into_iter()
+                .map(|name| clap::Arg::new(name).long(name).num_args(1).required(true)),
+            )
+            .try_get_matches_from(std::iter::once("upload".to_owned()).chain(args))
+            .expect("upload metadata must parse as literal option values")
+    }
+
+    #[test]
+    fn upload_args_preserve_hyphen_prefixed_metadata_as_literal_values() {
+        for title in ["-14…", "--help", "--copyright=2", "- 标题 = \"原文\""] {
+            let publication = PublicationMetadata {
+                title: title.into(),
+                dynamic: "--help\n- 动态 = \"原文\"".into(),
+                tags: vec!["-自定义标签".into(), "荒野乱斗".into()],
+                tid: BILIBILI_TID,
+                raw_json: String::new(),
+            };
+            let parsed = parse_upload_args(build_upload_args(&publication, &metadata()));
+            assert_eq!(parsed.get_one::<String>("title").unwrap(), title);
+            assert_eq!(
+                parsed.get_one::<String>("dynamic").unwrap(),
+                &publication.dynamic
+            );
+            assert_eq!(
+                parsed.get_one::<String>("tag").unwrap(),
+                "-自定义标签,荒野乱斗"
+            );
+            assert_eq!(parsed.get_one::<String>("copyright").unwrap(), "1");
+        }
+    }
+
     #[test]
     fn upload_args_are_fixed_original_metadata_and_detailed_description() {
         let publication = parse_publication_metadata(&json!({
@@ -788,18 +830,17 @@ mod tests {
         }))
         .unwrap();
         let args = build_upload_args(&publication, &metadata());
-        let value_after = |flag: &str| {
-            let index = args.iter().position(|value| value == flag).unwrap();
-            args[index + 1].as_str()
-        };
-        assert_eq!(value_after("--tid"), "172");
-        assert_eq!(value_after("--submit"), "web");
-        assert_eq!(value_after("--copyright"), "1");
-        assert_eq!(value_after("--no-reprint"), "0");
         assert!(!args.iter().any(|value| value == "--source"));
-        assert_eq!(value_after("--tag"), "荒野乱斗,排位赛");
-        assert_eq!(value_after("--dynamic"), "最后一局上演极限翻盘。");
-        let description = value_after("--desc");
+        let parsed = parse_upload_args(args);
+        let value = |name: &str| parsed.get_one::<String>(name).unwrap().as_str();
+        assert_eq!(value("tid"), "172");
+        assert_eq!(value("submit"), "web");
+        assert_eq!(value("copyright"), "1");
+        assert_eq!(value("no-reprint"), "0");
+        assert_eq!(value("title"), "2026年最佳排位赛");
+        assert_eq!(value("tag"), "荒野乱斗,排位赛");
+        assert_eq!(value("dynamic"), "最后一局上演极限翻盘。");
+        let description = value("desc");
         assert!(description.contains("原标题：Best Ranked Match 2026"));
         assert!(description.contains("来源：https://www.youtube.com/watch?v=video"));
         assert!(description.contains("原作者：Player One"));
