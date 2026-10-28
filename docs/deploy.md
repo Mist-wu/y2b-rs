@@ -23,7 +23,16 @@ CI 只有一个工作流 `.github/workflows/ci.yml`，四个并行 job：Rust、
 
 ## 部署
 
-目标：Ubuntu 22.04 x86_64。下文的 `<server>` 换成你的 SSH 目标（如 `azureuser@1.2.3.4`）。Azure 镜像禁止 root 直接 SSH，特权操作走 `azureuser` 免密 `sudo`。服务器不编译 Rust 或 FFmpeg。
+目标：AWS Lightsail 首尔（`ap-northeast-2`）的 `y2b-rs-01`，Ubuntu 22.04 x86_64，US$12/月（2 GiB 内存、60 GB 磁盘）。固定公网 IP 为 `52.78.29.197`。下文的 `<server>` 使用 `y2b` 或 `ubuntu@52.78.29.197`，特权操作走 `ubuntu` 免密 `sudo`。服务器不编译 Rust 或 FFmpeg。
+
+```bash
+# 本机已配置别名、密钥和 SSH 保活
+ssh y2b
+# 不使用本机别名时
+ssh -i ~/.ssh/id_ed25519 -o ServerAliveInterval=30 ubuntu@52.78.29.197
+```
+
+本机 `y2b` 别名启用连接复用（`ControlMaster auto`、`ControlPersist 1h`），每 30 秒发送保活，连续 6 次失败才断开。WebSub 公网入口仍为 `https://push.mistwu.com`，通过 Cloudflare Tunnel 连接服务器本机 `127.0.0.1:8787`。
 
 ```bash
 # 1. 服务器：2 GiB swap、预编译依赖和自动 PO Token Provider
