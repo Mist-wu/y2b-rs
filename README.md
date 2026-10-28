@@ -2,7 +2,7 @@
 
 # y2b-rs
 
-**监控 YouTube 频道 → 下载 → Pi 分句翻译 → 投稿 Bilibili → 自动补中文 CC 字幕**
+**监控 YouTube 频道 → 下载 → DeepSeek API 分句翻译 → 投稿 Bilibili → 自动补中文 CC 字幕**
 
 单二进制 Rust CLI，可选 TUI，SQLite 持久化队列，部署在云服务器上全程无人值守。
 
@@ -22,7 +22,7 @@
 - 调度与限流：RSS、Data API 和 WebSub 三路发现新视频。yt-dlp 回退有单频道冷却和全局熔断（10 分钟最多 3 次）。B 站返回限流码 `21566` 时，全局冷却 6 小时后自动重试。
 - LLM 翻译带游戏词库：从游戏客户端本地化资源提取官方译名，按“人工校订 > 数值模板 > 现行 > 历史”四层优先级注入。每次只注入字幕里实际出现的词条，控制 token 用量。
 - 进程与内存限制：外部命令独占 Unix 进程组，超时时清理整棵进程树，不留孤儿进程。systemd 限制 `MemoryMax=1600M`，准备、上传、字幕三个 worker 分开排队。
-- CI 门禁：`cargo fmt`、`clippy -D warnings`、测试、TypeScript 类型检查、依赖漏洞审计和 Gitleaks 全历史扫描，任一失败就阻断合并。
+- CI 门禁：`cargo fmt`、`clippy -D warnings`、测试、依赖漏洞审计和 Gitleaks 全历史扫描，任一失败就阻断合并。
 
 ## 工作原理
 
@@ -31,7 +31,7 @@ YouTube 频道 ──RSS / Data API / WebSub──> 发现新视频 ──> SQLi
                                                           │
                 ┌─────────────────────────────────────────┘
                 ▼
-   准备 worker：下载原片 ∥ 下载英文字幕 → Pi 分句 → Pi 翻译 → 生成中文标题、简介、标签
+   准备 worker：下载原片 ∥ 下载英文字幕 → DeepSeek 分句 → DeepSeek 翻译 → 生成中文标题、简介、标签
                 │
                 ▼
    上传 worker：biliup 投稿原片（严格串行，默认间隔 30 分钟）
@@ -44,8 +44,8 @@ YouTube 频道 ──RSS / Data API / WebSub──> 发现新视频 ──> SQLi
 
 | 模式 | 流程 | 字幕 |
 | --- | --- | --- |
-| `direct` | 下载视频，用 Pi 生成中文标题、简介和标签 | 不处理字幕 |
-| `translated` | 英文字幕 → Pi 分句 → Pi 翻译 → 上传原片 → 提交中文 CC | B 站软字幕，观众可开关 |
+| `direct` | 下载视频，用 DeepSeek 生成中文标题、简介和标签 | 不处理字幕 |
+| `translated` | 英文字幕 → DeepSeek 分句 → DeepSeek 翻译 → 上传原片 → 提交中文 CC | B 站软字幕，观众可开关 |
 
 `video_id` 全局唯一，同一个视频不会重复入队或重复投稿。优先频道单独按 60 秒轮询，在各个队列里都排在普通频道前面。
 
@@ -63,7 +63,7 @@ y2b check --write-baseline
 y2b watch                # 常驻运行
 ```
 
-运行时依赖 `yt-dlp`、`ffmpeg`、`biliup` 和 [pi](https://pi.dev)，`y2b check` 会逐项检查。
+运行时依赖 `yt-dlp`、`ffmpeg` 和 `biliup`；AI 由 Rust 直接请求 DeepSeek API。运行前按[部署说明](docs/deploy.md#部署)配置专用 DeepSeek 认证文件，`y2b check` 会检查依赖与凭据。
 
 ## 常用命令
 
@@ -91,7 +91,7 @@ TUI 用 `Tab` 切换任务和频道列表，`n` 输入单个 URL，`r` 重试失
 ```text
 y2b-rs/
 ├── src/          # Rust 主程序：发现、队列、下载、投稿、字幕、TUI
-├── pi/           # Pi extension、翻译策略和荒野乱斗词库
+├── pi/           # AI 提示词、翻译策略和荒野乱斗词库
 ├── scripts/      # 词库审计脚本（Python）
 ├── deploy/       # 服务器初始化、原子发布、恢复脚本和 systemd 单元
 └── tests/
@@ -99,9 +99,8 @@ y2b-rs/
 
 ## 文档
 
-- [工作流程与 Pi 集成](docs/workflow.md)：发现、筛选、投稿参数、队列容错和词库的细节
+- [工作流程与 DeepSeek API](docs/workflow.md)：发现、筛选、投稿参数、队列容错和词库的细节
 - [部署与运维](docs/deploy.md)：质量门禁、交叉编译部署、维护锁、依赖基线、备份与恢复
-- [发现机制重构](DISCOVERY_REARCHITECTURE.md)：WebSub 推送方案
 
 ## License
 
