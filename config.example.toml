@@ -75,6 +75,7 @@ warn_free_gib = 10
 stop_free_gib = 5
 delete_large_after_upload = true
 daily_backups = 7
+auto_backup = true # false 关闭 watch 自动备份，手动 backup 命令仍可使用
 weekly_backups = 4
 
 [translation]

@@ -135,6 +135,8 @@ pub struct StorageConfig {
     pub warn_free_gib: u64,
     pub stop_free_gib: u64,
     pub delete_large_after_upload: bool,
+    /// 是否由 watch 的维护循环自动创建数据库备份；不影响手动备份。
+    pub auto_backup: bool,
     pub daily_backups: usize,
     pub weekly_backups: usize,
 }
@@ -259,6 +261,7 @@ impl Default for StorageConfig {
             warn_free_gib: 10,
             stop_free_gib: 5,
             delete_large_after_upload: true,
+            auto_backup: true,
             daily_backups: 7,
             weekly_backups: 4,
         }

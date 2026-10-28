@@ -945,7 +945,7 @@ async fn run_backup_and_prune(config: &Config, db: &Database) {
     let outcome = tokio::task::spawn_blocking(move || {
         // 备份失败不该跳过清理，两者分别汇报。
         (
-            backup(&config, &db),
+            config.storage.auto_backup.then(|| backup(&config, &db)),
             db.prune_history(HISTORY_RETENTION_DAYS),
         )
     })
@@ -953,8 +953,9 @@ async fn run_backup_and_prune(config: &Config, db: &Database) {
     match outcome {
         Ok((backup_result, prune_result)) => {
             match backup_result {
-                Ok(dest) => tracing::info!(path = %dest.display(), "备份完成"),
-                Err(e) => tracing::error!(error = %e, "备份失败"),
+                Some(Ok(dest)) => tracing::info!(path = %dest.display(), "备份完成"),
+                Some(Err(e)) => tracing::error!(error = %e, "备份失败"),
+                None => {}
             }
             match prune_result {
                 Ok((ai_calls, events, stages)) => {
@@ -1135,6 +1136,46 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Output;
+
+    #[tokio::test]
+    async fn disabled_automatic_backup_does_not_write_files_or_disable_manual_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.runtime.data_dir = temp.path().to_path_buf();
+        config.runtime.database = temp.path().join("state.db");
+        config.runtime.backup_dir = temp.path().join("backups");
+        config.storage.auto_backup = false;
+        let db = Database::open(&config.runtime.database).unwrap();
+        let conn = rusqlite::Connection::open(&config.runtime.database).unwrap();
+        conn.execute(
+            "INSERT INTO events(level,message,created_at) VALUES('info','old','2000-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        db.event(None, "info", "recent").unwrap();
+
+        run_backup_and_prune(&config, &db).await;
+        assert!(!config.runtime.backup_dir.exists());
+        let remaining: String = conn
+            .query_row("SELECT message FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, "recent");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let manual = backup(&config, &db).unwrap();
+        assert!(manual.is_file());
+    }
+
+    #[test]
+    fn automatic_backup_defaults_on_and_can_be_disabled_in_config() {
+        let default: y2b_rs::config::StorageConfig = toml::from_str("").unwrap();
+        assert!(default.auto_backup);
+        let disabled: y2b_rs::config::StorageConfig =
+            toml::from_str("auto_backup = false").unwrap();
+        assert!(!disabled.auto_backup);
+    }
 
     #[tokio::test]
     async fn required_check_failure_returns_error_without_overwriting_baseline() {
