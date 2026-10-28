@@ -1,6 +1,6 @@
-//! 字幕流程：下载英文字幕、Pi 分句、Pi 翻译，以及各级缓存/检查点。
+//! 字幕流程：下载英文字幕、DeepSeek 分句、DeepSeek 翻译，以及各级缓存/检查点。
 use super::ai::{
-    PI_MAX_PROMPT_ARGUMENT_BYTES, PI_PROMPT_OVERHEAD_TOKENS, batch_mode_name,
+    AI_MAX_PAYLOAD_BYTES, AI_PROMPT_OVERHEAD_TOKENS, batch_mode_name,
     estimate_segment_argument_bytes, estimate_segment_tokens, estimate_translation_tokens,
     is_ai_global_fault, parse_ranges, parse_translations, segment_cue_argument_bytes,
     segment_cue_tokens, translation_cue_tokens,
@@ -25,7 +25,7 @@ pub(super) struct PreparedSubtitle {
     pub(super) cues: Vec<Cue>,
 }
 
-/// Pi 负责选择语义边界，但这些可读性限制必须由程序兜底，不能只依赖提示词。
+/// DeepSeek 负责选择语义边界，但这些可读性限制必须由程序兜底，不能只依赖提示词。
 pub(super) const SEGMENT_REQUIRED_GAP_SECONDS: f64 = 0.8;
 pub(super) const SEGMENT_MAX_DURATION_SECONDS: f64 = 8.0;
 pub(super) const SEGMENT_MAX_SOURCE_CHARS: usize = 72;
@@ -41,7 +41,7 @@ pub(super) fn max_segment_window_end(
     if start >= cues.len() {
         bail!("分句窗口起点越界: {start}/{}", cues.len())
     }
-    let mut total = PI_PROMPT_OVERHEAD_TOKENS;
+    let mut total = AI_PROMPT_OVERHEAD_TOKENS;
     let mut bytes = 512usize;
     let mut end = None;
     for (index, cue) in cues.iter().enumerate().skip(start) {
@@ -59,7 +59,7 @@ pub(super) fn max_segment_window_end(
     end.with_context(|| {
         format!(
             "单条字幕已超过安全输入阈值: cue={start}, estimated_tokens={}/{token_budget}, bytes={}/{byte_budget}",
-            PI_PROMPT_OVERHEAD_TOKENS + segment_cue_tokens(&cues[start]),
+            AI_PROMPT_OVERHEAD_TOKENS + segment_cue_tokens(&cues[start]),
             512 + segment_cue_argument_bytes(0, &cues[start])
         )
     })
@@ -78,19 +78,19 @@ pub(super) fn translation_batches(
     }
     let mut batches = Vec::new();
     let mut start = 0;
-    let mut total = PI_PROMPT_OVERHEAD_TOKENS;
+    let mut total = AI_PROMPT_OVERHEAD_TOKENS;
     for (index, cue) in cues.iter().enumerate() {
         let item = translation_cue_tokens(cue);
-        if PI_PROMPT_OVERHEAD_TOKENS.saturating_add(item) > budget {
+        if AI_PROMPT_OVERHEAD_TOKENS.saturating_add(item) > budget {
             bail!(
                 "单句翻译已超过安全 token 阈值 {budget}: cue={index}, estimated={}",
-                PI_PROMPT_OVERHEAD_TOKENS + item
+                AI_PROMPT_OVERHEAD_TOKENS + item
             )
         }
         if index > start && (index - start >= max_cues || total.saturating_add(item) > budget) {
             batches.push((start, index));
             start = index;
-            total = PI_PROMPT_OVERHEAD_TOKENS;
+            total = AI_PROMPT_OVERHEAD_TOKENS;
         }
         total += item;
     }
@@ -102,12 +102,12 @@ pub(super) fn validate_ranges_cover(len: usize, ranges: &[(usize, usize)]) -> Re
     let mut expected = 0;
     for &(start, end) in ranges {
         if start != expected || end < start || end >= len {
-            bail!("Pi 分句范围不连续或越界: {start}..{end}, expected={expected}, len={len}")
+            bail!("DeepSeek 分句范围不连续或越界: {start}..{end}, expected={expected}, len={len}")
         }
         expected = end + 1;
     }
     if expected != len {
-        bail!("Pi 分句没有覆盖完整窗口: {expected}/{len}")
+        bail!("DeepSeek 分句没有覆盖完整窗口: {expected}/{len}")
     }
     Ok(())
 }
@@ -133,7 +133,7 @@ fn source_range_within_limits(cues: &[Cue], start: usize, end: usize) -> bool {
         && words <= SEGMENT_MAX_SOURCE_WORDS
 }
 
-/// 在 Pi 返回的语义范围内做确定性细分：遇到静音间隔或加入下一条后超过任一
+/// 在 DeepSeek 返回的语义范围内做确定性细分：遇到静音间隔或加入下一条后超过任一
 /// 硬限制，就在原始 cue 边界处断开。单个原始 cue 本身无法再精确拆时按提示词
 /// 约定保留，不能伪造词级时间戳。
 pub(super) fn enforce_segment_limits(
@@ -224,11 +224,11 @@ pub(super) fn validate_translation_indexes(
     translations: &[(usize, String)],
 ) -> Result<()> {
     if translations.len() != len {
-        bail!("Pi 翻译数量不匹配: {}/{}", translations.len(), len)
+        bail!("DeepSeek 翻译数量不匹配: {}/{}", translations.len(), len)
     }
     for (expected, (index, _)) in translations.iter().enumerate() {
         if *index != expected {
-            bail!("Pi 翻译索引无序或缺失: index={index}, expected={expected}")
+            bail!("DeepSeek 翻译索引无序或缺失: index={index}, expected={expected}")
         }
     }
     Ok(())
@@ -317,7 +317,7 @@ pub(super) fn choose_adaptive_boundary(
                 usize::from(end > preferred_end),
             )
         })
-        .context("Pi 分句窗口中没有可用边界")
+        .context("DeepSeek 分句窗口中没有可用边界")
 }
 
 pub(super) fn append_core_ranges(
@@ -739,12 +739,12 @@ impl Pipeline {
         let mut duration = 0;
         let mut peak = 0;
         let mut calls = 0;
-        let fits_tokens = estimated <= budget && estimated_bytes <= PI_MAX_PROMPT_ARGUMENT_BYTES;
+        let fits_tokens = estimated <= budget && estimated_bytes <= AI_MAX_PAYLOAD_BYTES;
         let fits_window = fits_tokens && cues.len() <= self.config.ai.segment_max_cues;
         if self.config.ai.batch_mode == BatchMode::WholeVideo || fits_window {
             if !fits_tokens {
                 bail!(
-                    "whole_video 分句超过安全输入阈值: estimated_tokens={estimated}/{budget}, bytes={estimated_bytes}/{PI_MAX_PROMPT_ARGUMENT_BYTES}；请改用 adaptive"
+                    "whole_video 分句超过安全输入阈值: estimated_tokens={estimated}/{budget}, bytes={estimated_bytes}/{AI_MAX_PAYLOAD_BYTES}；请改用 adaptive"
                 )
             }
             let batch = self
@@ -766,12 +766,8 @@ impl Pipeline {
             let mut cursor = 0;
             while cursor < cues.len() {
                 let window_start = cursor.saturating_sub(overlap);
-                let budget_end = max_segment_window_end(
-                    cues,
-                    window_start,
-                    budget,
-                    PI_MAX_PROMPT_ARGUMENT_BYTES,
-                )?;
+                let budget_end =
+                    max_segment_window_end(cues, window_start, budget, AI_MAX_PAYLOAD_BYTES)?;
                 let window_end = budget_end.min(window_start + self.config.ai.segment_max_cues - 1);
                 if window_end < cursor {
                     bail!("安全 token 阈值过小，无法容纳分句核心字幕")
@@ -862,7 +858,7 @@ impl Pipeline {
         let mut last_error = None;
         let mut result = None;
         for attempt in 1..=attempts {
-            let r = self.call_pi(job_id, stage, payload.clone()).await;
+            let r = self.call_ai(job_id, stage, payload.clone()).await;
             match r {
                 Ok(r) => match parse_ranges(&r.value).and_then(|local| {
                     validate_ranges_cover(cues.len(), &local)?;
@@ -967,7 +963,7 @@ impl Pipeline {
             aggregate_call_ms += duration_ms;
             peak = peak.max(peak_rss_kib);
         }
-        // 先释放流，取消仍在飞的 Pi 调用，再收尾阶段行。
+        // 先释放流，取消仍在飞的 DeepSeek 调用，再收尾阶段行。
         drop(results);
         let wall_duration_ms = stage.elapsed_ms();
         if let Some(error) = failure {
@@ -1007,7 +1003,7 @@ impl Pipeline {
             "target_lang":self.config.translation.target_lang,
             "items":items
         });
-        // 每次尝试都会带上不同的 feedback；call_pi 在调用边界统一登记审计行。
+        // 每次尝试都会带上不同的 feedback；call_ai 在调用边界统一登记审计行。
         let attempts = self.config.ai.translation_batch_retries.saturating_add(1);
         let mut aggregate_duration_ms = 0;
         let mut peak_rss_kib = 0;
@@ -1019,7 +1015,7 @@ impl Pipeline {
             if let Some(message) = &feedback {
                 call_payload["feedback"] = json!(message);
             }
-            match self.call_pi(job_id, stage, call_payload).await {
+            match self.call_ai(job_id, stage, call_payload).await {
                 Ok(result) => {
                     aggregate_duration_ms += result.output.duration_ms;
                     peak_rss_kib = peak_rss_kib.max(result.output.peak_rss_kib);
@@ -1272,18 +1268,18 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_segmentation_respects_process_argument_byte_limit() {
-        // 5.5KB 长句 × 100 条 ≈ 556KB，超过 512KB 窗口上限但不超过 token 预算。
+    fn adaptive_segmentation_respects_payload_byte_limit() {
+        // 5.5KB 长句 × 100 条 ≈ 556KB，超过 96 KiB 输入上限但不超过 token 预算。
         let long_text = "x".repeat(5_500);
         let cues = (0..100)
             .map(|index| cue(index, &long_text))
             .collect::<Vec<_>>();
         assert!(estimate_segment_tokens(&cues) < 200_000);
-        assert!(estimate_segment_argument_bytes(&cues) > PI_MAX_PROMPT_ARGUMENT_BYTES);
+        assert!(estimate_segment_argument_bytes(&cues) > AI_MAX_PAYLOAD_BYTES);
 
-        let end = max_segment_window_end(&cues, 0, 200_000, PI_MAX_PROMPT_ARGUMENT_BYTES).unwrap();
+        let end = max_segment_window_end(&cues, 0, 200_000, AI_MAX_PAYLOAD_BYTES).unwrap();
         assert!(end < cues.len() - 1);
-        assert!(estimate_segment_argument_bytes(&cues[..=end]) <= PI_MAX_PROMPT_ARGUMENT_BYTES);
+        assert!(estimate_segment_argument_bytes(&cues[..=end]) <= AI_MAX_PAYLOAD_BYTES);
     }
 
     #[test]

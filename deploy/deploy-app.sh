@@ -90,7 +90,7 @@ current_temp="$app_root/.current-${owner_tag}"
 
 # 所有会拒绝部署的静态检查都放在 maintenance hold 之前。
 for resource in \
-  "$root_dir/pi/y2b-extension.ts" \
+  "$root_dir/pi/system-prompt.txt" \
   "$root_dir/pi/policy.json" \
   "$root_dir/pi/audit-policy.json" \
   "$root_dir/pi/brawl-stars-glossary.json" \
@@ -108,15 +108,6 @@ if [[ ! -f "$config_file" ]]; then
   install -m 0644 "$root_dir/config.example.toml" "$config_file"
 fi
 "$binary" --config "$config_file" config-check
-
-# Pi extension 由 pi 子进程加载，config-check 只看文件在不在、不解析内容：一个
-# 反引号写进模板字符串就能让所有 Pi 调用等到运行时才炸，并白白消耗任务重试次数。
-# `node --check` 对 .ts 无效（不剥类型，恒为 0），这里用真正的 import 解析一遍。
-node --input-type=module -e "await import('file://'+process.argv[1])" \
-  "$root_dir/pi/y2b-extension.ts" || {
-  echo "pi extension failed to parse: $root_dir/pi/y2b-extension.ts" >&2
-  exit 1
-}
 
 [[ -f "$env_file" ]] || { echo "missing credential file: $env_file" >&2; exit 1; }
 if env_owner=$(stat -c '%U:%G' "$env_file" 2>/dev/null); then
@@ -206,6 +197,8 @@ rollback_required=false
 database_restore_required=false
 release_created=false
 migration_backup=
+baseline_backup=
+baseline_path="$state_dir/dependency-baseline.json"
 backup_temp=
 integrity_output=
 rollback_temp=
@@ -357,6 +350,15 @@ rollback_on_error() {
     if [[ "$database_restore_required" == true ]] && ! restore_database; then
       rollback_ok=false
     fi
+    # 新版可能删除旧版必选依赖；基线必须随 release 一起恢复。
+    if [[ -n "$baseline_backup" ]]; then
+      if ! cp -a -- "$baseline_backup" "$baseline_path"; then
+        echo "依赖基线回滚失败" >&2
+        rollback_ok=false
+      fi
+    elif ! rm -f -- "$baseline_path"; then
+      rollback_ok=false
+    fi
     if [[ "$rollback_ok" == true ]]; then
       if ! "$current_link/y2b" --config "$config_file" check --write-baseline; then
         echo "旧 release 的 y2b check 失败" >&2
@@ -483,7 +485,7 @@ install -d -m 0755 "$releases_dir"
 # 新资源先写入隐藏 staging，完整后才发布为不可变 releases/<revision>；此时不碰 current。
 install -d -m 0755 "$staging_dir/pi" "$staging_dir/deploy"
 install -m 0755 "$binary" "$staging_dir/y2b"
-install -m 0644 "$root_dir/pi/y2b-extension.ts" "$staging_dir/pi/y2b-extension.ts"
+install -m 0644 "$root_dir/pi/system-prompt.txt" "$staging_dir/pi/system-prompt.txt"
 install -m 0644 "$root_dir/pi/policy.json" "$staging_dir/pi/policy.json"
 install -m 0644 "$root_dir/pi/audit-policy.json" "$staging_dir/pi/audit-policy.json"
 install -m 0644 "$root_dir/pi/brawl-stars-glossary.json" "$staging_dir/pi/brawl-stars-glossary.json"
@@ -518,11 +520,16 @@ migration_backup="$backup_dir/state-before-${revision}-${deployment_timestamp}.d
 "$mv_cmd" -- "$backup_temp" "$migration_backup"
 backup_temp=
 
+if [[ -f "$baseline_path" ]]; then
+  baseline_backup="${migration_backup%.db}.dependency-baseline.json"
+  cp -a -- "$baseline_path" "$baseline_backup"
+fi
+
 database_restore_required=true
 rollback_required=true
 "$systemctl_cmd" stop "$service"
 
-# 固定兼容路径只间接指向 current；以后 binary、Pi、Cargo.lock 与运维脚本同步切换。
+# 固定兼容路径只间接指向 current；以后 binary、AI 资源、Cargo.lock 与运维脚本同步切换。
 install_release_alias "$app_root/pi" 'current/pi'
 install_release_alias "$app_root/Cargo.lock" 'current/Cargo.lock'
 install_release_alias "$app_root/deploy" 'current/deploy'

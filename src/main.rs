@@ -1258,7 +1258,7 @@ mod tests {
 
         let service = fs::read_to_string(root.join("deploy/y2b-watch.service")).unwrap();
         assert!(service.contains("ExecStart=/opt/y2b/current/y2b"));
-        assert!(service.contains("/opt/y2b/current/pi/y2b-extension.ts"));
+        assert!(service.contains("/opt/y2b/current/pi/policy.json"));
     }
 
     #[test]
@@ -1678,7 +1678,6 @@ exec "{python}" "$@"
 "#
             ),
         );
-        write_executable(&bin_dir.join("node"), "#!/usr/bin/env bash\nexit 0\n");
         write_executable(
             &bin_dir.join("mv"),
             &format!(
@@ -1827,7 +1826,7 @@ PY
                 .env("DEPLOY_TEST_EVENTS", &self.events)
                 .env(
                     "DEPLOY_TEST_BASELINE",
-                    self.state_dir.join("dependency-baseline"),
+                    self.state_dir.join("dependency-baseline.json"),
                 )
                 .env("DEPLOY_TEST_Y2B_LOG", self.state_dir.join("y2b.log"));
             command
@@ -2134,7 +2133,7 @@ wait_for_stable_service systemctl_stub test.service
     fn deploy_rejects_when_external_dependency_drifts() {
         let fixture = deploy_fixture("success");
         fs::write(
-            fixture.state_dir.join("dependency-baseline"),
+            fixture.state_dir.join("dependency-baseline.json"),
             "y2b=releases/000000000000\nexternal=external-drifted\n",
         )
         .unwrap();
@@ -2165,7 +2164,7 @@ wait_for_stable_service systemctl_stub test.service
     fn deploy_continues_when_only_the_deployed_binary_drifts() {
         let fixture = deploy_fixture("success");
         fs::write(
-            fixture.state_dir.join("dependency-baseline"),
+            fixture.state_dir.join("dependency-baseline.json"),
             "y2b=releases/000000000000\nexternal=external-stable\n",
         )
         .unwrap();
@@ -2189,8 +2188,14 @@ wait_for_stable_service systemctl_stub test.service
     }
 
     #[test]
-    fn deploy_rollback_reports_success_when_only_y2b_drifts_from_baseline() {
+    fn deploy_rollback_restores_dependency_baseline_with_release() {
         let fixture = deploy_fixture("health_failure");
+        let baseline = format!("y2b=releases/{OLD_DEPLOY_REVISION}\nexternal=external-stable\n");
+        fs::write(
+            fixture.state_dir.join("dependency-baseline.json"),
+            &baseline,
+        )
+        .unwrap();
         let output = fixture.run(3);
         assert!(!output.status.success());
         let detail = output_detail(&output);
@@ -2199,8 +2204,11 @@ wait_for_stable_service systemctl_stub test.service
             "{detail}"
         );
         assert!(!detail.contains("自动回滚未完整成功"), "{detail}");
-        // 回滚切回旧 release 后，其 y2b 身份与部署写入的新基线不一致；门禁必须只当告警，
-        // 否则旧 release 的 check 会失败，脚本会误报“自动回滚未完整成功”。
+        assert_eq!(
+            fs::read_to_string(fixture.state_dir.join("dependency-baseline.json")).unwrap(),
+            baseline
+        );
+        // 新版检查允许自身二进制变更，回滚后恢复与旧 release 对应的依赖基线。
         let events = fs::read_to_string(&fixture.events).unwrap();
         assert!(events.contains("baseline:y2b-drift-tolerated"), "{events}");
         assert_eq!(

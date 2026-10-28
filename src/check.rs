@@ -38,9 +38,8 @@ pub struct BaselineItem {
 
 /// 依赖工具清单：名称、可执行路径、版本探测参数。
 /// `run` 与 `write_baseline` 共用，保证两边检测一致。
-fn tool_checks(config: &Config) -> [(&'static str, PathBuf, Vec<&'static str>); 5] {
+fn tool_checks(config: &Config) -> [(&'static str, PathBuf, Vec<&'static str>); 4] {
     [
-        ("pi", PathBuf::from(&config.ai.pi), vec!["--version"]),
         (
             "yt-dlp",
             PathBuf::from(&config.youtube.yt_dlp),
@@ -73,13 +72,12 @@ fn baseline_tools(
         .filter(|(name, _, _)| *name != "ffprobe")
 }
 
-fn policy_resources(config: &Config) -> [(&'static str, &'static str, PathBuf); 4] {
+fn policy_resources(config: &Config) -> [(&'static str, &'static str, PathBuf); 3] {
     [
-        ("pi-extension", "Pi extension", config.ai.extension.clone()),
-        ("pi-policy", "Pi policy", config.ai.policy.clone()),
+        ("pi-policy", "AI policy", config.ai.policy.clone()),
         (
             "pi-audit-policy",
-            "Pi audit policy",
+            "AI audit policy",
             config.ai.policy.with_file_name("audit-policy.json"),
         ),
         (
@@ -103,6 +101,9 @@ fn baseline_check(config: &Config, baseline: &Baseline) -> CheckItem {
             // 应用更新/旧 release 清理是正常部署行为，仅作告警。
             y2b_drift |= y2b_seen || !baseline_hash_matches(item, Path::new(&item.path));
             y2b_seen = true;
+        } else if matches!(item.name.as_str(), "pi" | "pi-extension") {
+            // 从 Pi 迁移时忽略已经不再执行的旧依赖，其他依赖仍须逐项核对。
+            continue;
         } else if let Some(path) = expected.remove(item.name.as_str()) {
             if Path::new(&item.path) != path || !baseline_hash_matches(item, &path) {
                 external_drift.push(item.name.clone());
@@ -178,6 +179,15 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
             }),
         }
     }
+    let credential = crate::pipeline::read_api_key(&config.ai.auth_file);
+    out.push(CheckItem {
+        name: "DeepSeek credential".into(),
+        ok: credential.is_ok(),
+        required: true,
+        detail: credential
+            .map(|_| "专用认证文件可读，格式有效".into())
+            .unwrap_or_else(|e| e.to_string()),
+    });
     let swap = fs::read_to_string("/proc/swaps")
         .map(|x| x.lines().count() > 1)
         .unwrap_or(false);
@@ -387,7 +397,6 @@ mod tests {
         let mut config = Config::default();
         config.runtime.data_dir = temp.path().to_path_buf();
         let missing = temp.path().join("missing-tool").display().to_string();
-        config.ai.pi = missing.clone();
         config.youtube.yt_dlp = missing.clone();
         config.render.ffmpeg = missing.clone();
         config.render.ffprobe = missing.clone();
@@ -406,19 +415,19 @@ mod tests {
     async fn missing_required_tool_does_not_create_partial_baseline() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
-        config.ai.pi = temp.path().join("missing-pi").display().to_string();
+        config.youtube.yt_dlp = temp.path().join("missing-ytdlp").display().to_string();
         let destination = temp.path().join("dependency-baseline.json");
         let checks = vec![CheckItem {
-            name: "pi".into(),
+            name: "yt-dlp".into(),
             ok: false,
             required: true,
-            detail: "未找到 pi".into(),
+            detail: "未找到 yt-dlp".into(),
         }];
 
         let error = write_baseline(&config, &destination, &checks)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("缺少必选工具 pi"));
+        assert!(error.to_string().contains("缺少必选工具 yt-dlp"));
         assert!(!destination.exists());
     }
 
@@ -431,12 +440,10 @@ mod tests {
         fs::write(&tool, "#!/bin/sh\nprintf 'fixture-version\\n'\n").unwrap();
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
         let tool = tool.display().to_string();
-        config.ai.pi = tool.clone();
         config.youtube.yt_dlp = tool.clone();
         config.render.ffmpeg = tool.clone();
         config.render.ffprobe = tool.clone();
         config.bilibili.biliup = tool;
-        config.ai.extension = dir.join("extension.ts");
         config.ai.policy = dir.join("policy.json");
         config.youtube.cookies = dir.join("youtube.cookies");
         config.bilibili.cookies = dir.join("bilibili.cookies");

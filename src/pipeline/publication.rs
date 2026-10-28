@@ -1,8 +1,8 @@
-//! 投稿元数据：Pi 生成中文标题/动态/标签，以及确定性的简介与 biliup 参数。
+//! 投稿元数据：DeepSeek 生成中文标题/动态/标签，以及确定性的简介与 biliup 参数。
 use super::Pipeline;
 use super::StageGuard;
 use super::ai::{
-    PI_MAX_PROMPT_ARGUMENT_BYTES, PI_METADATA_OUTPUT_RESERVE_TOKENS, PI_PROMPT_OVERHEAD_TOKENS,
+    AI_MAX_PAYLOAD_BYTES, AI_METADATA_OUTPUT_RESERVE_TOKENS, AI_PROMPT_OVERHEAD_TOKENS,
     estimate_text_tokens,
 };
 use crate::model::{PublicationMetadata, TransferMode, VideoMetadata};
@@ -43,7 +43,7 @@ pub(super) fn build_publication_payload(
     }
     if mode == TransferMode::Direct {
         bail!(
-            "YouTube 元数据超过 Pi 输入限制: estimated_tokens={}, bytes={}",
+            "YouTube 元数据超过 DeepSeek 输入限制: estimated_tokens={}, bytes={}",
             estimate_publication_tokens(&full),
             full.to_string().len()
         )
@@ -55,12 +55,12 @@ pub(super) fn build_publication_payload(
         let sampled = publication_payload_value(mode, meta, all_cues, &indices, true);
         let estimated = estimate_publication_tokens(&sampled);
         let bytes = sampled.to_string().len();
-        if estimated <= budget && bytes <= PI_MAX_PROMPT_ARGUMENT_BYTES {
+        if estimated <= budget && bytes <= AI_MAX_PAYLOAD_BYTES {
             return Ok(sampled);
         }
         if count == 2 {
             bail!(
-                "保留首尾字幕后投稿元数据仍超过 Pi 输入限制: estimated_tokens={estimated}, bytes={bytes}"
+                "保留首尾字幕后投稿元数据仍超过 DeepSeek 输入限制: estimated_tokens={estimated}, bytes={bytes}"
             )
         }
         let token_count = count
@@ -68,7 +68,7 @@ pub(super) fn build_publication_payload(
             .checked_div(estimated)
             .unwrap_or(0);
         let byte_count = count
-            .saturating_mul(PI_MAX_PROMPT_ARGUMENT_BYTES)
+            .saturating_mul(AI_MAX_PAYLOAD_BYTES)
             .checked_div(bytes)
             .unwrap_or(0);
         let shrunk = token_count.min(byte_count);
@@ -113,14 +113,14 @@ pub(super) fn publication_payload_value(
 }
 
 pub(super) fn estimate_publication_tokens(payload: &Value) -> usize {
-    PI_PROMPT_OVERHEAD_TOKENS
-        .saturating_add(PI_METADATA_OUTPUT_RESERVE_TOKENS)
+    AI_PROMPT_OVERHEAD_TOKENS
+        .saturating_add(AI_METADATA_OUTPUT_RESERVE_TOKENS)
         .saturating_add(estimate_text_tokens(&payload.to_string()))
 }
 
 pub(super) fn publication_payload_fits(payload: &Value, token_budget: usize) -> bool {
     estimate_publication_tokens(payload) <= token_budget
-        && payload.to_string().len() <= PI_MAX_PROMPT_ARGUMENT_BYTES
+        && payload.to_string().len() <= AI_MAX_PAYLOAD_BYTES
 }
 
 pub(super) fn uniform_sample_indices(len: usize, count: usize) -> Vec<usize> {
@@ -143,27 +143,27 @@ pub(super) fn parse_publication_metadata(value: &Value) -> Result<PublicationMet
         value
             .get("title")
             .and_then(Value::as_str)
-            .context("Pi 投稿元数据缺少字符串 title")?,
+            .context("DeepSeek 投稿元数据缺少字符串 title")?,
     );
     let dynamic = sanitize_publication_text(
         value
             .get("dynamic")
             .and_then(Value::as_str)
-            .context("Pi 投稿元数据缺少字符串 dynamic")?,
+            .context("DeepSeek 投稿元数据缺少字符串 dynamic")?,
     );
     let raw_tags = value
         .get("tags")
         .and_then(Value::as_array)
-        .context("Pi 投稿元数据缺少数组 tags")?;
+        .context("DeepSeek 投稿元数据缺少数组 tags")?;
     if raw_tags.is_empty() {
-        bail!("Pi 投稿元数据 tags 为空")
+        bail!("DeepSeek 投稿元数据 tags 为空")
     }
     let raw_tags = raw_tags
         .iter()
         .map(|tag| {
             tag.as_str()
                 .map(str::to_string)
-                .context("Pi 投稿元数据 tags 含非字符串项")
+                .context("DeepSeek 投稿元数据 tags 含非字符串项")
         })
         .collect::<Result<Vec<_>>>()?;
     let metadata = PublicationMetadata {
@@ -490,7 +490,7 @@ impl Pipeline {
             if let Some(message) = &feedback {
                 payload["feedback"] = json!(message);
             }
-            let r = match self.call_pi(job_id, stage.id(), payload).await {
+            let r = match self.call_ai(job_id, stage.id(), payload).await {
                 Ok(result) => result,
                 Err(error) => {
                     let elapsed = stage.elapsed_ms();
@@ -760,8 +760,8 @@ mod tests {
         let bounded =
             build_publication_payload(TransferMode::Translated, &metadata(), Some(&large), 200_000)
                 .unwrap();
-        assert!(bounded.to_string().len() <= PI_MAX_PROMPT_ARGUMENT_BYTES);
-        // 128KB 上限下 1075 条双语字幕（约 300KB）触发均匀采样。
+        assert!(bounded.to_string().len() <= AI_MAX_PAYLOAD_BYTES);
+        // 96 KiB 上限下 1075 条双语字幕（约 300KB）触发均匀采样。
         assert_eq!(bounded["subtitle_sampling"]["sampled"], true);
         assert!(bounded["subtitles"].as_array().unwrap().len() < large.len());
     }

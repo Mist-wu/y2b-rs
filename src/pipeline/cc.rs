@@ -222,7 +222,7 @@ pub(super) fn is_missing_subtitle_material(error: &anyhow::Error) -> bool {
 impl Pipeline {
     /// 给已投稿视频补中文 CC 字幕（B站软字幕，提交后走平台审核）。
     ///
-    /// 素材优先复用下载目录里的翻译缓存；缺失时重新下载英文字幕、分句并调 Pi
+    /// 素材优先复用下载目录里的翻译缓存；缺失时重新下载英文字幕、分句并请求 DeepSeek
     /// 翻译。返回给人看的说明文字。
     pub async fn backfill_cc_subtitle(&self, bvid: &str) -> Result<String> {
         let job = self
@@ -555,10 +555,9 @@ mod tests {
     use crate::model::TransferMode;
     use crate::pipeline::testing::{cue, metadata};
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
-    fn cache_test_pipeline(directory: &Path) -> (Pipeline, Job, VideoMetadata) {
+    async fn cache_test_pipeline(directory: &Path) -> (Pipeline, Job, VideoMetadata) {
         let meta = metadata();
         let db = Database::open(&directory.join("state.db")).unwrap();
         let id = db
@@ -574,44 +573,40 @@ mod tests {
             .unwrap()
             .unwrap();
         let job = db.get_job(&id).unwrap().unwrap();
-        let response = |text: &str| {
-            serde_json::json!({
-                "type": "agent_end",
-                "messages": [{
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": serde_json::json!({
-                        "translations": [{"i": 0, "text": text}]
-                    }).to_string()}]
-                }]
-            })
-            .to_string()
-        };
-        let pi = directory.join("fake-pi");
-        fs::write(
-            &pi,
-            format!(
-                r#"#!/bin/sh
-script_dir=$(dirname "$0")
-for argument do payload="$argument"; done
-printf '%s\n' "$payload" >> "$script_dir/calls"
-case "$payload" in
-    *First*) printf '%s\n' '{}' ;;
-    *Second*)
-        if [ -f "$script_dir/fail-second" ]; then exit 1; fi
-        printf '%s\n' '{}'
-        ;;
-    *) exit 2 ;;
-esac
-"#,
-                response("第一句"),
-                response("第二句")
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = Config::default();
         config.runtime.download_dir = directory.join("downloads");
-        config.ai.pi = pi.to_string_lossy().into_owned();
+        let directory = directory.to_path_buf();
+        let fixture_dir = directory.clone();
+        crate::pipeline::testing::mock_ai(&mut config, &directory, move |request| {
+            use axum::http::StatusCode;
+            use std::io::Write;
+            let payload: serde_json::Value =
+                serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+            let mut calls = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(fixture_dir.join("calls"))
+                .unwrap();
+            writeln!(calls, "{payload}").unwrap();
+            let text = match payload["items"][0]["text"].as_str().unwrap() {
+                "First" => "第一句",
+                "Second" if fixture_dir.join("fail-second").exists() => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        serde_json::json!({"error":{"message":"temporary failure"}}),
+                    );
+                }
+                "Second" => "第二句",
+                other => panic!("unexpected input: {other}"),
+            };
+            (
+                StatusCode::OK,
+                crate::pipeline::testing::completion(
+                    serde_json::json!({"translations":[{"i":0,"text":text}]}),
+                ),
+            )
+        })
+        .await;
         config.ai.batch_mode = BatchMode::Adaptive;
         config.ai.translation_batch_cues = 1;
         config.ai.translation_concurrency = 1;
@@ -626,7 +621,7 @@ esac
     #[tokio::test]
     async fn cc_cache_retries_interrupted_translation_before_producing_submission_cues() {
         let directory = tempfile::tempdir().unwrap();
-        let (pipeline, job, meta) = cache_test_pipeline(directory.path());
+        let (pipeline, job, meta) = cache_test_pipeline(directory.path()).await;
         let work = pipeline.config.runtime.download_dir.join(&meta.id);
         let segmented = work.join(format!("{}.en.segmented.json", meta.id));
         let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
@@ -642,7 +637,7 @@ esac
         let partial = subtitle::load_json(&translated).unwrap();
         assert_eq!(partial[0].translation.as_deref(), Some("第一句"));
         assert_eq!(partial[1].translation, None);
-        // 缓存模式不能把第一批的子集交给投稿路径，也不能继续调用 Pi。
+        // 缓存模式不能把第一批的子集交给投稿路径，也不能继续请求 AI。
         let missing = pipeline
             .prepare_cc_cues(&job, &meta, 10.0, false)
             .await
@@ -681,7 +676,7 @@ esac
     async fn cc_cache_rebuilds_corrupt_or_mismatched_translation_from_segmented_source() {
         for invalid in ["corrupt", "mismatch", "invalid-timeline"] {
             let directory = tempfile::tempdir().unwrap();
-            let (pipeline, job, meta) = cache_test_pipeline(directory.path());
+            let (pipeline, job, meta) = cache_test_pipeline(directory.path()).await;
             let work = pipeline.config.runtime.download_dir.join(&meta.id);
             let segmented = work.join(format!("{}.en.segmented.json", meta.id));
             let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
@@ -728,7 +723,7 @@ esac
     async fn cc_cache_supports_legacy_translation_without_segmented_file() {
         for partial in [false, true] {
             let directory = tempfile::tempdir().unwrap();
-            let (pipeline, job, meta) = cache_test_pipeline(directory.path());
+            let (pipeline, job, meta) = cache_test_pipeline(directory.path()).await;
             let work = pipeline.config.runtime.download_dir.join(&meta.id);
             let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
             let mut cached = vec![cue(0, "First"), cue(1, "Second")];

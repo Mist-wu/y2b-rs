@@ -38,15 +38,17 @@ submit_interval_seconds = 1800
 rate_limit_cooldown_seconds = 21600
 
 [ai]
-pi = "/usr/local/bin/pi"
-extension = "/opt/y2b/pi/y2b-extension.ts"
+base_url = "https://api.deepseek.com"
+# 延用专用认证文件，不从环境变量或全局 Pi 认证读取。
+auth_file = "/var/lib/y2b/pi-agent/auth.json"
+max_output_tokens = 16384
 policy = "/opt/y2b/pi/policy.json"
 provider = "deepseek"
 model = "deepseek-flash"
 translation_model = "deepseek-flash"
 # 投稿元数据、分句和翻译统一关闭 thinking，避免成本和流式输出量失控。
 thinking = "off"
-# 单次 Pi 调用超时。长视频翻译批次偶发超过 5 分钟，默认 15 分钟。
+# 单次 DeepSeek HTTP 请求超时。长视频翻译批次偶发超过 5 分钟，默认 15 分钟。
 timeout_seconds = 900
 # adaptive: 分句按 token 自适应；翻译同时按 token 和条数上限拆批。
 # whole_video: 只允许整条视频一次处理，超过安全阈值则停止并提示切换模式。
@@ -58,9 +60,9 @@ segment_overlap_cues = 12
 segment_max_cues = 400
 # 每批 cue 数。40 比 25 少约 40% 调用，固定 prompt 开销跟着摊薄；对齐比小批次更稳。
 translation_batch_cues = 40
-# Pi 翻译批次并发。2 GiB 服务器实测 3 路仅约 320–380 MiB，默认提高到 4；继续受 systemd 内存上限保护。
+# 翻译批次并发；同一任务复用 HTTP 连接池。
 translation_concurrency = 4
-# 单批输出不是有效 JSON、索引校验失败或 Pi 调用失败时的额外重试次数。
+# 单批输出不是有效 JSON、索引校验失败或 API 请求失败时的额外重试次数。
 translation_batch_retries = 2
 # daily_token_limit = 1000000
 

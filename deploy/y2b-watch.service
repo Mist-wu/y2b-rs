@@ -7,13 +7,12 @@ After=network-online.target
 Type=simple
 WorkingDirectory=/var/lib/y2b
 Environment=HOME=/root
-# DeepSeek 只从此专用 Pi 目录的 auth.json 读取；环境文件不保存 DeepSeek Key。
+# Rust HTTP 客户端直接读取专用 auth.json；保留旧路径以支持成对回滚。
 Environment=PI_CODING_AGENT_DIR=/var/lib/y2b/pi-agent
 EnvironmentFile=/etc/y2b/y2b.env
 UnsetEnvironment=DEEPSEEK_API_KEY
 Environment=RUST_LOG=y2b_rs=info
 # /opt/y2b/pi 是 deploy-app.sh 建立的 current/pi 兼容链接；启动前同时验证 release 资源完整。
-ExecStartPre=/usr/bin/test -r /opt/y2b/current/pi/y2b-extension.ts
 ExecStartPre=/usr/bin/test -r /opt/y2b/current/pi/policy.json
 ExecStartPre=/usr/bin/test -r /opt/y2b/current/pi/audit-policy.json
 ExecStartPre=/usr/bin/test -r /opt/y2b/current/pi/brawl-stars-glossary.json

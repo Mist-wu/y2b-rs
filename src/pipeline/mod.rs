@@ -1,6 +1,6 @@
 //! 流水线编排：任务准备、原片/封面下载和投稿收尾。
 //!
-//! 具体环节分散在子模块中：`ai` 负责 Pi 调用与 token 估算，`subtitle_flow`
+//! 具体环节分散在子模块中：`ai` 负责 DeepSeek HTTP 调用与 token 估算，`subtitle_flow`
 //! 负责字幕获取/分句/翻译，`publication` 负责投稿元数据，`upload` 负责 biliup
 //! 与投稿窗口，`cc` 负责中文 CC 字幕补交。
 use crate::config::Config;
@@ -24,11 +24,13 @@ use tokio::process::Command;
 // 子模块保持私有：拆分是内部结构调整，crate 对外暴露的仍然只有 `Pipeline`
 // 和少数几个常量，与拆分前一致。
 mod ai;
+mod ai_prompt;
 mod cc;
 mod publication;
 mod subtitle_flow;
 mod upload;
 
+pub(crate) use ai::read_api_key;
 pub use cc::{CC_INITIAL_DELAY_SECONDS, CC_MAX_ATTEMPTS};
 pub use upload::NEXT_BILIBILI_SUBMIT_AT;
 
@@ -114,6 +116,8 @@ pub struct Pipeline {
     /// 复用的有界 HTTP 客户端（目前只用于拉 YouTube 封面）。每次调用新建
     /// `reqwest::Client` 会重建 TLS 配置和连接池，没有必要。
     http: reqwest::Client,
+    ai_http: reqwest::Client,
+    ai_policy: tokio::sync::OnceCell<ai_prompt::PromptPolicy>,
 }
 
 /// `stage_runs` 行的 RAII 句柄。
@@ -620,6 +624,8 @@ impl Pipeline {
             db,
             ai_circuit_breaker,
             http: cover_http_client(),
+            ai_http: ai::http_client(),
+            ai_policy: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -1580,8 +1586,11 @@ mod tests {
 
     #[test]
     fn global_ai_fault_is_non_retryable_prepare_failure() {
-        let stream = r#"{"type":"agent_end","messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Insufficient Balance"}]}"#;
-        let error = ai::parse_pi_stream(stream).unwrap_err();
+        let error = ai::provider_error(
+            402,
+            &serde_json::json!({"error":{"message":"Insufficient Balance"}}),
+            "fixture-key",
+        );
         assert_eq!(
             classify_prepare_failure(&error),
             PrepareFailureClass::GlobalAi

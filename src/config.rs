@@ -6,8 +6,7 @@ use std::path::{Path, PathBuf};
 
 pub const AI_PROVIDER: &str = "deepseek";
 pub const AI_MODEL: &str = "deepseek-flash";
-/// V4.1 Flash 在性能、成本、速度上取代了 V4 Pro，2026-09-14 12:00 起 `deepseek-v4-pro`
-/// 也会被路由到它；等 V4.1 Pro 上线后再决定翻译是否换回更强的模型。
+/// 翻译与其他 AI 阶段保持相同模型。
 pub const AI_TRANSLATION_MODEL: &str = "deepseek-flash";
 pub const AI_THINKING: &str = "off";
 const MAX_TRANSLATION_BATCH_RETRIES: usize = 10;
@@ -86,13 +85,18 @@ pub struct BilibiliConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiConfig {
+    /// 兼容旧配置；HTTP 调用不再使用这两个字段。
+    #[serde(skip_serializing)]
     pub pi: String,
+    #[serde(skip_serializing)]
     pub extension: PathBuf,
+    pub base_url: String,
+    pub auth_file: PathBuf,
+    pub max_output_tokens: usize,
     pub policy: PathBuf,
     pub provider: String,
     pub model: String,
-    /// 翻译模型单独留一个字段：当前与 `model` 同为 V4.1 Flash，等 V4.1 Pro 上线后
-    /// 可以只把长列表翻译换成对齐更稳的模型，不动分句/元数据。
+    /// 独立字段保留与现有任务审计和配置兼容。
     pub translation_model: String,
     /// 所有 AI 阶段共用同一个思考级别，避免任务间配置漂移。
     pub thinking: String,
@@ -218,6 +222,9 @@ impl Default for BilibiliConfig {
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
+            base_url: "https://api.deepseek.com".into(),
+            auth_file: base_dir().join("pi-agent/auth.json"),
+            max_output_tokens: 16_384,
             pi: "/usr/local/bin/pi".into(),
             extension: "/opt/y2b/pi/y2b-extension.ts".into(),
             policy: "/opt/y2b/pi/policy.json".into(),
@@ -324,6 +331,29 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         self.validate_ai_profile()?;
+        let api_url = reqwest::Url::parse(&self.ai.base_url).context("ai.base_url 无效")?;
+        anyhow::ensure!(
+            api_url.scheme() == "https"
+                || (api_url.scheme() == "http"
+                    && matches!(
+                        api_url.host_str(),
+                        Some("127.0.0.1" | "[::1]" | "localhost")
+                    )),
+            "ai.base_url 必须使用 HTTPS（本机测试可用 HTTP）"
+        );
+        anyhow::ensure!(
+            api_url.host_str().is_some()
+                && api_url.username().is_empty()
+                && api_url.password().is_none()
+                && api_url.query().is_none()
+                && api_url.fragment().is_none(),
+            "ai.base_url 不能包含凭据、查询参数或片段"
+        );
+        anyhow::ensure!(
+            (1..=32_768).contains(&self.ai.max_output_tokens),
+            "ai.max_output_tokens 必须在 1..=32768 之间"
+        );
+
         self.validate_discovery()?;
         self.validate_websub()?;
         anyhow::ensure!(

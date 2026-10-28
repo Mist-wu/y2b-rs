@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit Pi models against Brawl Stars EN -> Simplified Chinese terminology."""
+"""Audit DeepSeek models against Brawl Stars EN -> Simplified Chinese terminology."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import json
 import os
 import pathlib
 import re
-import shlex
 import subprocess
 import time
 import unicodedata
@@ -22,10 +21,7 @@ from typing import Any
 
 API_ROOT = "https://api.brawlapi.com"
 USER_AGENT = "y2b-rs-glossary-audit/2.0"
-PI_PROVIDER = "deepseek"
-PI_MODEL = "deepseek-flash"
-PI_THINKING = "off"
-PI_AUTH_DIR = "/var/lib/y2b/pi-agent"
+AI_MODEL = "deepseek-flash"
 PATTERN_RULES = [
     {
         "id": "numeric-gems",
@@ -287,111 +283,52 @@ def extract_terms(workers: int) -> tuple[list[Term], dict[str, Any]]:
     return terms, metadata
 
 
-def parse_pi_output(stdout: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    final_text: str | None = None
-    usage: dict[str, Any] | None = None
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") != "message_end":
-            continue
-        message = event.get("message") or {}
-        if message.get("role") != "assistant":
-            continue
-        texts = [
-            block.get("text", "")
-            for block in message.get("content", [])
-            if block.get("type") == "text"
-        ]
-        if texts:
-            final_text = texts[-1]
-        usage = message.get("usage") or usage
-    if final_text is None:
-        raise RuntimeError("Pi output did not contain a final assistant text message")
-    value = json.loads(final_text)
-    if not isinstance(value, dict):
-        raise RuntimeError("Pi final response is not a JSON object")
-    return value, usage
-
-
-def call_pi(
-    server: str,
-    model: str,
-    terms: list[Term],
-    timeout: int,
-    extension: str,
-    policy: str,
+def call_api(
+    server: str, model: str, terms: list[Term], timeout: int, policy: str,
 ) -> tuple[list[str], dict[str, Any] | None, float]:
-    payload = json.dumps(
-        {
-            "task": "glossary_audit",
-            "source_lang": "en",
-            "target_lang": "zh-CN",
-            "items": [term.source for term in terms],
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    args = [
-        "env",
-        "-u",
-        "DEEPSEEK_API_KEY",
-        "HOME=/root",
-        f"PI_CODING_AGENT_DIR={PI_AUTH_DIR}",
-        f"Y2B_PI_POLICY_PATH={policy}",
-        "/usr/local/bin/pi",
-        "--mode",
-        "json",
-        "--print",
-        "--no-session",
-        "--no-tools",
-        "--no-skills",
-        "--no-context-files",
-        "--no-prompt-templates",
-        "--no-extensions",
-        "--extension",
-        extension,
-        "--provider",
-        PI_PROVIDER,
-        "--model",
-        model,
-        "--thinking",
-        PI_THINKING,
-        "--no-approve",
-        payload,
-    ]
-    remote_command = f"exec {shlex.join(args)}"
-    if not server.startswith("root@"):
-        # 凭据文件和 Pi session 只有 root 可读，非 root 登录时提权执行。
-        remote_command = f"sudo -n bash -c {shlex.quote(remote_command)}"
-    command = ["ssh", "-o", "BatchMode=yes", server, remote_command]
+    payload = {"task": "glossary_audit", "source_lang": "en", "target_lang": "zh-CN",
+               "items": [term.source for term in terms]}
+    # 代码和公开输入经 stdin 发送，Key 只在服务器内读取，不进入 argv/输出。
+    script = r"""
+import json, pathlib, urllib.request, urllib.error
+cfg = json.loads(INPUT)
+policy_path = pathlib.Path(cfg['policy'])
+policy = json.loads(policy_path.read_text())
+system = policy_path.with_name('system-prompt.txt').read_text() + json.dumps(policy, ensure_ascii=False)
+key = json.loads(pathlib.Path('/var/lib/y2b/pi-agent/auth.json').read_text())['deepseek']['key']
+body = {'model': cfg['model'], 'thinking': {'type': 'disabled'}, 'response_format': {'type': 'json_object'},
+        'max_tokens': 16384, 'stream': False, 'messages': [{'role': 'system', 'content': system},
+        {'role': 'user', 'content': json.dumps(cfg['payload'], ensure_ascii=False)}]}
+request = urllib.request.Request('https://api.deepseek.com/chat/completions', data=json.dumps(body).encode(),
+        headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
+try:
+    with urllib.request.urlopen(request, timeout=cfg['timeout']) as response:
+        data = response.read(4 * 1024 * 1024 + 1)
+    if len(data) > 4 * 1024 * 1024: raise ValueError('response too large')
+    result = json.loads(data)
+    if result['choices'][0]['finish_reason'] != 'stop': raise ValueError('incomplete response')
+    value = json.loads(result['choices'][0]['message']['content'])
+    print(json.dumps({'value': value, 'usage': result.get('usage')}))
+except urllib.error.HTTPError as error:
+    raise SystemExit('DeepSeek HTTP ' + str(error.code))
+"""
+    settings = json.dumps({"model": model, "policy": policy, "payload": payload, "timeout": timeout})
+    script = "INPUT = " + repr(settings) + "\n" + script
+    remote = "python3 -" if server.startswith("root@") else "sudo -n python3 -"
     started = time.monotonic()
-    process = subprocess.run(
-        command,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
-    )
-    elapsed = time.monotonic() - started
-    if process.returncode != 0:
-        raise RuntimeError(
-            f"Pi exited {process.returncode}: {process.stderr[-1000:]}"
-        )
-    value, usage = parse_pi_output(process.stdout)
-    translations = value.get("translations")
-    if not isinstance(translations, list):
-        raise RuntimeError("Pi response has no translations array")
-    if len(translations) != len(terms) or not all(
-        isinstance(row, str) for row in translations
-    ):
-        raise RuntimeError(
-            f"Pi response length/type mismatch: expected={len(terms)} "
-            f"actual={len(translations)}"
-        )
-    return translations, usage, elapsed
+    process = subprocess.run(["ssh", "-o", "BatchMode=yes", server, remote], input=script,
+                             text=True, capture_output=True, timeout=timeout + 15, check=False)
+    if process.returncode:
+        raise RuntimeError(f"DeepSeek audit request failed (exit {process.returncode})")
+    response = json.loads(process.stdout)
+    translations = response["value"].get("translations")
+    if not isinstance(translations, list) or len(translations) != len(terms) or not all(isinstance(v, str) for v in translations):
+        raise RuntimeError("DeepSeek response translations do not match the input")
+    usage = response.get("usage") or {}
+    cached = usage.get("prompt_cache_hit_tokens", 0)
+    return translations, {"input": usage.get("prompt_tokens", 0) - cached,
+        "output": usage.get("completion_tokens", 0), "cacheRead": cached,
+        "totalTokens": usage.get("total_tokens", 0)}, time.monotonic() - started
 
 
 def merge_usage(total: dict[str, float], usage: dict[str, Any] | None) -> None:
@@ -418,14 +355,13 @@ def test_batch(
     model: str,
     terms: list[Term],
     timeout: int,
-    extension: str,
     policy: str,
     attempts: int = 2,
 ) -> tuple[list[str], dict[str, Any] | None, float]:
     error: Exception | None = None
     for attempt in range(attempts):
         try:
-            return call_pi(server, model, terms, timeout, extension, policy)
+            return call_api(server, model, terms, timeout, policy)
         except Exception as exc:  # noqa: BLE001 - retry protocol/provider failures
             error = exc
             if attempt + 1 < attempts:
@@ -439,10 +375,10 @@ def test_batch(
         return [""], None, float(timeout)
     midpoint = len(terms) // 2
     left, left_usage, left_elapsed = test_batch(
-        server, model, terms[:midpoint], timeout, extension, policy, attempts=1
+        server, model, terms[:midpoint], timeout, policy, attempts=1
     )
     right, right_usage, right_elapsed = test_batch(
-        server, model, terms[midpoint:], timeout, extension, policy, attempts=1
+        server, model, terms[midpoint:], timeout, policy, attempts=1
     )
     usage: dict[str, float] = collections.defaultdict(float)
     merge_usage(usage, left_usage)
@@ -583,12 +519,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--models",
-        default=PI_MODEL,
-        help=f"Fixed Pi model ({PI_MODEL}); empty means extraction only",
+        default=AI_MODEL,
+        help=f"Fixed DeepSeek model ({AI_MODEL}); empty means extraction only",
     )
     parser.add_argument("--batch-size", type=positive_int, default=300)
     parser.add_argument("--timeout", type=positive_int, default=180)
-    parser.add_argument("--extension", default="/opt/y2b/pi/y2b-extension.ts")
     parser.add_argument("--policy", default="/opt/y2b/pi/audit-policy.json")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--workers", type=positive_int, default=16)
@@ -619,8 +554,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.shard_index >= args.shard_count:
         parser.error("--shard-index must be within [0, --shard-count)")
     models = [model.strip() for model in args.models.split(",") if model.strip()]
-    if models not in ([], [PI_MODEL]):
-        parser.error(f"--models must be {PI_MODEL!r} or empty")
+    if models not in ([], [AI_MODEL]):
+        parser.error(f"--models must be {AI_MODEL!r} or empty")
     if models and not args.server:
         parser.error("--server or $Y2B_SERVER is required when auditing models")
     if bool(args.production_from) != bool(args.production_output):
@@ -721,7 +656,6 @@ def main() -> int:
                 model,
                 batch,
                 args.timeout,
-                args.extension,
                 args.policy,
             )
             outputs.extend(translations)

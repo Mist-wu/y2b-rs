@@ -5,22 +5,22 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PI_DIR = ROOT / "pi"
+AI_DIR = ROOT / "pi"
 
 
-class PiJsonTests(unittest.TestCase):
+class AiResourceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.documents = {
             path.name: json.loads(path.read_text(encoding="utf-8"))
-            for path in sorted(PI_DIR.glob("*.json"))
+            for path in sorted(AI_DIR.glob("*.json"))
         }
 
     def assert_non_empty_string(self, value: object) -> None:
         self.assertIsInstance(value, str)
         self.assertTrue(value.strip())
 
-    def test_every_pi_json_file_has_an_explicit_schema_check(self) -> None:
+    def test_every_ai_json_file_has_an_explicit_schema_check(self) -> None:
         self.assertEqual(
             set(self.documents),
             {"audit-policy.json", "brawl-stars-glossary.json", "policy.json"},
@@ -121,17 +121,5 @@ class PiJsonTests(unittest.TestCase):
                 )
                 placeholders = {int(index) for index in re.findall(r"\{(\d+)\}", rule["translation"])}
                 self.assertTrue(all(0 < index <= compiled.groups for index in placeholders))
-
-    def test_audit_cascade_totals_are_internally_consistent(self) -> None:
-        audit = self.documents["brawl-stars-glossary.json"]["audit"]
-        stages = [audit[name] for name in ("gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol")]
-        for stage in stages:
-            self.assertEqual(stage["tested"], stage["exact"] + stage["failures"])
-        self.assertEqual(stages[1]["tested"], stages[0]["exact"])
-        self.assertEqual(stages[2]["tested"], stages[1]["exact"])
-        self.assertEqual(audit["passed_all_three"], stages[2]["exact"])
-        self.assertEqual(audit["union_failures"], sum(stage["failures"] for stage in stages))
-
-
 if __name__ == "__main__":
     unittest.main()

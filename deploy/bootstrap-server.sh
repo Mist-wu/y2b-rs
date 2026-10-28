@@ -24,9 +24,6 @@ if ! command -v node >/dev/null || [[ $(node -p 'Number(process.versions.node.sp
   curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
   apt-get install -y nodejs
 fi
-npm install -g @earendil-works/pi-coding-agent@0.83.0
-pi_path=$(command -v pi)
-if [[ "$pi_path" != /usr/local/bin/pi ]]; then ln -sfn "$pi_path" /usr/local/bin/pi; fi
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -72,7 +69,6 @@ if [[ ! -f /etc/y2b/y2b.env ]]; then
 fi
 
 echo "node=$(node --version)"
-echo "pi=$(pi --version)"
 echo "yt-dlp=$(yt-dlp --version)"
 ffmpeg -version | head -1
 biliup --version

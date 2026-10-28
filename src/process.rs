@@ -11,9 +11,8 @@ use tokio::process::Command;
 
 /// 读取子进程输出并限制捕获大小：超过上限时只保留尾部。
 ///
-/// pi 的 JSONL 事件流可能输出数百 MB（deepseek 的 thinking 全量流式），
-/// 无限收集会撑爆低配服务器内存；关键信息（agent_end 事件、biliup 的 BV
-/// 号、错误尾部）都位于输出末尾，保留尾部即可。
+/// yt-dlp/biliup 可能输出大量进度日志；保留尾部的投稿结果和错误，
+/// 避免长任务的日志持续占用低配服务器内存。
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -52,8 +51,7 @@ pub struct ProcessOutput {
 
 /// 子进程已经退出、且 stdout/stderr 已完整回收时的失败。
 ///
-/// 调用方通常只需要把它当作普通错误处理；Pi 审计则会读取其中的 JSONL 尾部，
-/// 尽可能回收供应商已经返回的 token/费用，避免“请求已计费但本地只看到退出码”。
+/// 同时保留输出，供投稿结果核对及故障诊断。
 #[derive(Debug, Error)]
 #[error("子进程退出码 {code:?}: {detail}")]
 pub struct ProcessFailure {
@@ -86,7 +84,7 @@ impl ProcessDrainFailure {
 }
 
 /// 总超时触发时，直接子进程（及其进程组）被终止；已捕获的输出和真实耗时随错误
-/// 保留，供 Pi 审计回收供应商已经返回但本地尚未落账的 token/费用。
+/// 保留，供投稿结果核对及故障诊断。
 #[derive(Debug, Error)]
 #[error("子进程超时: {detail}")]
 pub struct ProcessTimeoutFailure {
@@ -98,23 +96,6 @@ impl ProcessTimeoutFailure {
     pub fn output(&self) -> &ProcessOutput {
         &self.output
     }
-}
-
-/// 从错误里取回各失败路径携带的已捕获输出（供审计恢复 token/费用）。
-pub fn process_error_output(error: &anyhow::Error) -> Option<&ProcessOutput> {
-    error
-        .downcast_ref::<ProcessFailure>()
-        .map(ProcessFailure::output)
-        .or_else(|| {
-            error
-                .downcast_ref::<ProcessDrainFailure>()
-                .map(ProcessDrainFailure::output)
-        })
-        .or_else(|| {
-            error
-                .downcast_ref::<ProcessTimeoutFailure>()
-                .map(ProcessTimeoutFailure::output)
-        })
 }
 
 /// `run_monitored` future 被 `try_join!` 等调用方取消时，Tokio 的
