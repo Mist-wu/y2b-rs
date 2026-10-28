@@ -1510,14 +1510,10 @@ elif [[ "$line" == *" schema-version "* ]]; then
 elif [[ "$line" == *" check "* ]]; then
   content=$(<"$DEPLOY_TEST_DATABASE")
   record_event "check:$target:$content"
-  if [[ "$line" == *" --write-baseline "* ]]; then
-    baseline="$DEPLOY_TEST_BASELINE"
-    previous_y2b=
-    previous_external=
-    if [[ -f "$baseline" ]]; then
-      previous_y2b=$(sed -n 's/^y2b=//p' "$baseline")
-      previous_external=$(sed -n 's/^external=//p' "$baseline")
-    fi
+  baseline="$DEPLOY_TEST_BASELINE"
+  if [[ -f "$baseline" ]]; then
+    previous_y2b=$(jq -r '.y2b' "$baseline")
+    previous_external=$(jq -r '.external' "$baseline")
     # 模拟真实 check 的两类基线条目：外部依赖漂移是必选失败，y2b 自身漂移仅告警。
     if [[ -n "$previous_external" && "$previous_external" != "external-stable" ]]; then
       echo "FAIL dependency baseline 漂移: external" >&2
@@ -1526,7 +1522,21 @@ elif [[ "$line" == *" check "* ]]; then
     if [[ -n "$previous_y2b" && "$previous_y2b" != "$target" ]]; then
       record_event 'baseline:y2b-drift-tolerated'
     fi
-    printf 'y2b=%s\nexternal=external-stable\n' "$target" >"$baseline"
+    python3 - "$baseline" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+for item in json.loads(Path(sys.argv[1]).read_text())["items"]:
+    if hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest() != item["sha256"]:
+        raise SystemExit(f"FAIL dependency baseline 漂移: {item['name']}")
+PY
+  fi
+  if [[ "$line" == *" --write-baseline "* ]]; then
+    [[ -f "$baseline" ]] || printf '{"items":[]}\n' >"$baseline"
+    jq --arg target "$target" '.y2b=$target | .external="external-stable"' \
+      "$baseline" >"$baseline.new"
+    mv "$baseline.new" "$baseline"
   fi
 else
   echo "未预期的 y2b 参数: $*" >&2
@@ -1806,6 +1816,29 @@ PY
     }
 
     impl DeployFixture {
+        fn write_baseline(&self, y2b: &str, external: &str) -> serde_json::Value {
+            use sha2::{Digest, Sha256};
+            let items: Vec<_> = [
+                ("pi-policy", "policy.json"),
+                ("pi-audit-policy", "audit-policy.json"),
+                ("brawl-stars-glossary", "brawl-stars-glossary.json"),
+            ]
+            .into_iter()
+            .map(|(name, file)| {
+                let path = self.app_root.join("pi").join(file);
+                let hash = format!("{:x}", Sha256::digest(fs::read(&path).unwrap()));
+                serde_json::json!({"name": name, "path": path, "sha256": hash})
+            })
+            .collect();
+            let baseline = serde_json::json!({"y2b": y2b, "external": external, "items": items});
+            fs::write(
+                self.state_dir.join("dependency-baseline.json"),
+                serde_json::to_vec_pretty(&baseline).unwrap(),
+            )
+            .unwrap();
+            baseline
+        }
+
         fn command(&self, idle_max_checks: usize) -> std::process::Command {
             let mut command = std::process::Command::new("bash");
             command
@@ -2173,11 +2206,7 @@ wait_for_stable_service systemctl_stub test.service
     #[test]
     fn deploy_rejects_when_external_dependency_drifts() {
         let fixture = deploy_fixture("success");
-        fs::write(
-            fixture.state_dir.join("dependency-baseline.json"),
-            "y2b=releases/000000000000\nexternal=external-drifted\n",
-        )
-        .unwrap();
+        fixture.write_baseline("releases/000000000000", "external-drifted");
         let output = fixture.run(3);
         assert!(!output.status.success());
         let detail = output_detail(&output);
@@ -2185,8 +2214,10 @@ wait_for_stable_service systemctl_stub test.service
             detail.contains("FAIL dependency baseline 漂移: external"),
             "{detail}"
         );
-        assert!(detail.contains("自动回滚未完整成功"), "{detail}");
-        // 外部依赖被偷换必须拦住部署：current 回滚到旧 release，数据库恢复，服务保持停止。
+        assert!(!detail.contains("自动回滚未完整成功"), "{detail}");
+        // 外部依赖漂移在停服前被拦住，current、数据库和运行进程均未变更。
+        assert!(!fixture.systemctl_log.exists());
+        assert!(!fixture.hold.exists());
         assert_eq!(
             fs::read_link(&fixture.current).unwrap(),
             PathBuf::from(format!("releases/{OLD_DEPLOY_REVISION}"))
@@ -2197,20 +2228,30 @@ wait_for_stable_service systemctl_stub test.service
         );
         assert_eq!(
             fs::read_to_string(&fixture.service_state).unwrap(),
-            "inactive\n"
+            "active\n"
         );
     }
 
     #[test]
-    fn deploy_continues_when_only_the_deployed_binary_drifts() {
+    fn deploy_refreshes_bundled_resources_and_tolerates_binary_drift() {
         let fixture = deploy_fixture("success");
-        fs::write(
-            fixture.state_dir.join("dependency-baseline.json"),
-            "y2b=releases/000000000000\nexternal=external-stable\n",
-        )
-        .unwrap();
+        let old_baseline = fixture.write_baseline("releases/000000000000", "external-stable");
         let output = fixture.run(3);
         assert!(output.status.success(), "{}", output_detail(&output));
+        let baseline: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.state_dir.join("dependency-baseline.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(baseline["external"], old_baseline["external"]);
+        for (old, new) in old_baseline["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(baseline["items"].as_array().unwrap())
+        {
+            assert_eq!(old["path"], new["path"]);
+            assert_ne!(old["sha256"], new["sha256"]);
+        }
         let events = fs::read_to_string(&fixture.events).unwrap();
         assert!(events.contains("baseline:y2b-drift-tolerated"), "{events}");
         assert_eq!(
@@ -2231,12 +2272,10 @@ wait_for_stable_service systemctl_stub test.service
     #[test]
     fn deploy_rollback_restores_dependency_baseline_with_release() {
         let fixture = deploy_fixture("health_failure");
-        let baseline = format!("y2b=releases/{OLD_DEPLOY_REVISION}\nexternal=external-stable\n");
-        fs::write(
-            fixture.state_dir.join("dependency-baseline.json"),
-            &baseline,
-        )
-        .unwrap();
+        let baseline = fixture.write_baseline(
+            &format!("releases/{OLD_DEPLOY_REVISION}"),
+            "external-stable",
+        );
         let output = fixture.run(3);
         assert!(!output.status.success());
         let detail = output_detail(&output);
@@ -2246,7 +2285,10 @@ wait_for_stable_service systemctl_stub test.service
         );
         assert!(!detail.contains("自动回滚未完整成功"), "{detail}");
         assert_eq!(
-            fs::read_to_string(fixture.state_dir.join("dependency-baseline.json")).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(
+                &fs::read(fixture.state_dir.join("dependency-baseline.json")).unwrap()
+            )
+            .unwrap(),
             baseline
         );
         // 新版检查允许自身二进制变更，回滚后恢复与旧 release 对应的依赖基线。

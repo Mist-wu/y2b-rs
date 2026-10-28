@@ -84,11 +84,11 @@ y2b maintenance release --database /var/lib/y2b/state.db --owner "$owner"
 
 应用 release 已按 commit 原子化。当前契约是：
 
-1. 在获取 hold 之前完成 `config-check`、AI 配置校验、凭据、Python、SQLite 等静态预检。
+1. 在获取 hold 之前完成 `config-check`、AI 配置校验、凭据、Python、SQLite 等静态预检，并用旧 release 的 `check` 核对现有依赖基线。
 2. 获取 hold，间隔等待两次连续 idle；hold 挡住新领取，两次检查只需排空存量工作。
 3. 把二进制、全部 AI 资源、`Cargo.lock` 和 deploy 脚本（含 watch systemd 单元）写入隐藏 staging，完整后发布为不可变的 `/opt/y2b/releases/<revision>/`，不改动运行中的 `current`。
 4. 在 maintenance hold 保护下生成迁移前在线快照，并做严格完整性校验（`integrity_check` 只返回一行 `ok`）。
-5. 以临时符号链接和单次 `mv -T` 原子切换 `/opt/y2b/current`，再依次执行显式迁移、`y2b check --write-baseline`、启动和稳定窗口健康检查。systemd 直接执行 `/opt/y2b/current/y2b`，AI 资源路径也经 `current/pi` 解析。
+5. 以临时符号链接和单次 `mv -T` 原子切换 `/opt/y2b/current`，再依次执行显式迁移、更新本次发布携带的资源基线、`y2b check --write-baseline`、启动和稳定窗口健康检查。systemd 直接执行 `/opt/y2b/current/y2b`，AI 资源路径也经 `current/pi` 解析。
 6. 稳定窗口健康检查成功后才释放 hold。脚本保留当前版、上一版和若干旧 release；超出上限时只按修改时间清理名称符合十六进制 revision 规则的真实目录，不跟随符号链接。
 
 `deploy-app.sh` 只支持已经建立 `/opt/y2b/current -> releases/<revision>`、且数据库包含唯一 `maintenance_hold` 表的 release 布局。旧数据库必须先通过 `restore.sh` 显式迁移；旧扁平布局或首次安装必须先执行一次性布局迁移。部署脚本不会再退化到无维护锁的自举路径，也不会在常规发布中捕获旧扁平目录。
@@ -99,11 +99,12 @@ y2b maintenance release --database /var/lib/y2b/state.db --owner "$owner"
 
 `y2b check --write-baseline` 把必选工具和资源文件的 sha256 写入
 `/var/lib/y2b/dependency-baseline.json`，后续每次 `y2b check` 都与基线比对。迁移到 API 后忽略旧基线的 `pi`、`pi-extension` 条目，其余依赖仍严格检查。基线
-条目分两类，处理不同：
+条目按以下规则处理：
 
 | 类别 | 条目 | 漂移处理 |
 | --- | --- | --- |
-| 外部依赖 | `yt-dlp`、`ffmpeg`、`biliup`、`pi-policy`、`pi-audit-policy`、`brawl-stars-glossary` | 漂移是意外，作为必选失败（FAIL）拦住部署 |
+| 外部工具 | `yt-dlp`、`ffmpeg`、`biliup` | 漂移作为必选失败（FAIL）拦住部署 |
+| 发布资源 | `pi-policy`、`pi-audit-policy`、`brawl-stars-glossary` | 日常检查严格匹配；部署仅允许更新解析到新 release 内对应文件的哈希 |
 | `y2b` 自身 | 部署的二进制 | 漂移是部署的预期结果，只降级为告警（WARN），不拦住部署 |
 
 这样区分是因为：部署一个新二进制必然改变 `y2b` 的 sha256，若把它的漂移当作必选
@@ -111,9 +112,9 @@ y2b maintenance release --database /var/lib/y2b/state.db --owner "$owner"
 健康检查也会因旧二进制与基线不一致而误判。外部依赖被偷换时仍然会以必选失败拒绝
 部署，这是基线存在的意义。
 
-`deploy-app.sh` 在切换 `current` 后执行 `check --write-baseline`，把新二进制的
-sha 写回基线；回滚时先恢复部署前的基线，再用旧二进制校验并写回。因此只有 `y2b`
-漂移的部署和回滚都能通过门禁，而任何外部依赖漂移仍会阻断。
+`deploy-app.sh` 在停服前校验旧基线并备份，切换 `current` 后只刷新上述三项发布资源的
+哈希，再执行 `check --write-baseline`。外部工具的预期哈希保持不变；配置在 release
+之外的资源不会被自动接受。回滚时先恢复部署前的基线，再用旧二进制校验并写回。
 
 PO Token Provider 使用独立的**原子 release**：安装器先写入版本化 `releases/<version>`，校验完整后再以临时符号链接和单次 `mv` 切换 `current`。失败时旧 `current` 仍可用，不会暴露半份 provider。
 

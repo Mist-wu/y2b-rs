@@ -420,6 +420,9 @@ if (( maintenance_hold_tables != 1 )); then
   exit 1
 fi
 
+# 在变更任何资源前核对旧基线，外部依赖漂移不应等到停服后才发现。
+"$maintenance_y2b" --config "$config_file" check
+
 # 先获取维护锁，之后所有 status 都带 owner，避免被自己的锁误判为 blocker。
 hold_acquired=true
 if ! "$maintenance_y2b" maintenance acquire \
@@ -542,6 +545,40 @@ atomic_set_current "releases/$revision"
 "$current_link/y2b" migrate --database "$database"
 "$current_link/y2b" maintenance renew \
   --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
+# 只接受随 current 一起发布的资源变更；外部工具仍由原基线严格校验。
+if [[ -f "$baseline_path" ]]; then
+  python3 - "$baseline_path" "$current_link/pi" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+baseline_path = Path(sys.argv[1])
+resource_dir = Path(sys.argv[2]).resolve(strict=True)
+resources = {
+    "pi-policy": "policy.json",
+    "pi-audit-policy": "audit-policy.json",
+    "brawl-stars-glossary": "brawl-stars-glossary.json",
+}
+baseline = json.loads(baseline_path.read_text())
+for item in baseline["items"]:
+    if item["name"] in resources:
+        resource = resource_dir / resources[item["name"]]
+        if Path(item["path"]).resolve(strict=True) != resource:
+            raise SystemExit(f"拒绝更新 release 之外的资源基线: {item['name']}")
+        item["sha256"] = hashlib.sha256(resource.read_bytes()).hexdigest()
+fd, temporary = tempfile.mkstemp(prefix=".deploy-baseline-", dir=baseline_path.parent)
+try:
+    with os.fdopen(fd, "w") as output:
+        json.dump(baseline, output, ensure_ascii=False, indent=2)
+        output.write("\n")
+    os.replace(temporary, baseline_path)
+finally:
+    Path(temporary).unlink(missing_ok=True)
+PY
+fi
 "$current_link/y2b" --config "$config_file" check --write-baseline
 "$current_link/y2b" maintenance renew \
   --database "$database" --owner "$owner" --lease-seconds "$hold_lease_seconds" >/dev/null
