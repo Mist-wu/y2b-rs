@@ -13,6 +13,7 @@ EnvironmentFile=/etc/y2b/y2b.env
 UnsetEnvironment=DEEPSEEK_API_KEY
 Environment=RUST_LOG=y2b_rs=info
 # /opt/y2b/pi 是 deploy-app.sh 建立的 current/pi 兼容链接；启动前同时验证 release 资源完整。
+ExecStartPre=/usr/bin/test -s /opt/y2b/current/pi/system-prompt.txt
 ExecStartPre=/usr/bin/test -r /opt/y2b/current/pi/policy.json
 ExecStartPre=/usr/bin/test -r /opt/y2b/current/pi/audit-policy.json
 ExecStartPre=/usr/bin/test -r /opt/y2b/current/pi/brawl-stars-glossary.json

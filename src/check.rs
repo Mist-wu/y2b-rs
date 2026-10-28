@@ -72,8 +72,13 @@ fn baseline_tools(
         .filter(|(name, _, _)| *name != "ffprobe")
 }
 
-fn policy_resources(config: &Config) -> [(&'static str, &'static str, PathBuf); 3] {
+fn policy_resources(config: &Config) -> [(&'static str, &'static str, PathBuf); 4] {
     [
+        (
+            "ai-system-prompt",
+            "AI system prompt",
+            config.ai.policy.with_file_name("system-prompt.txt"),
+        ),
         ("pi-policy", "AI policy", config.ai.policy.clone()),
         (
             "pi-audit-policy",
@@ -243,7 +248,11 @@ pub async fn run(config: &Config, db: &Database) -> Vec<CheckItem> {
     {
         out.push(CheckItem {
             name: name.into(),
-            ok: p.exists(),
+            ok: if name == "AI system prompt" {
+                fs::read_to_string(&p).is_ok_and(|text| !text.trim().is_empty())
+            } else {
+                p.exists()
+            },
             required: true,
             detail: p.display().to_string(),
         });
@@ -488,11 +497,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (config, db, _) = baseline_fixture(temp.path()).await;
         fs::write(&config.ai.policy, "changed-resource").unwrap();
+        fs::write(
+            config.ai.policy.with_file_name("system-prompt.txt"),
+            "changed-prompt",
+        )
+        .unwrap();
         let checks = run(&config, &db).await;
         let item = baseline_result(&checks);
         assert!(item.required);
         assert!(!item.ok);
         assert!(item.detail.contains("pi-policy"), "{}", item.detail);
+        assert!(item.detail.contains("ai-system-prompt"), "{}", item.detail);
     }
 
     #[tokio::test]

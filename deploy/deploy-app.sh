@@ -558,11 +558,21 @@ import tempfile
 baseline_path = Path(sys.argv[1])
 resource_dir = Path(sys.argv[2]).resolve(strict=True)
 resources = {
+    "ai-system-prompt": "system-prompt.txt",
     "pi-policy": "policy.json",
     "pi-audit-policy": "audit-policy.json",
     "brawl-stars-glossary": "brawl-stars-glossary.json",
 }
 baseline = json.loads(baseline_path.read_text())
+# 首次从内嵌提示词升级时，旧基线尚无此项；路径与配置中的 policy 保持同目录。
+if not any(item["name"] == "ai-system-prompt" for item in baseline["items"]):
+    policy_path = next(item["path"] for item in baseline["items"] if item["name"] == "pi-policy")
+    baseline["items"].append({
+        "name": "ai-system-prompt",
+        "path": str(Path(policy_path).with_name("system-prompt.txt")),
+        "version": "",
+        "sha256": None,
+    })
 for item in baseline["items"]:
     if item["name"] in resources:
         resource = resource_dir / resources[item["name"]]

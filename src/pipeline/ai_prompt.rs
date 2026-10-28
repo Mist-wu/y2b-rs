@@ -1,10 +1,8 @@
-//! 将原 Pi extension 的策略/词库注入移入进程内；每个 Pipeline 只加载一次。
+//! 从外部文件加载提示词、策略和词库；每个 Pipeline 只加载一次。
 use anyhow::{Context, Result};
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 use std::{collections::BTreeMap, fs, path::Path};
-
-const SYSTEM_PROMPT: &str = include_str!("../../pi/system-prompt.txt");
 
 struct Term {
     source: String,
@@ -19,6 +17,7 @@ struct Pattern {
 }
 
 pub(super) struct PromptPolicy {
+    system_prompt: String,
     policy: Value,
     terms: Vec<Term>,
     curated: Vec<Term>,
@@ -65,6 +64,10 @@ fn terms(layer: &Value) -> Vec<Term> {
 
 impl PromptPolicy {
     pub(super) fn load(path: &Path) -> Result<Self> {
+        let prompt_path = path.with_file_name("system-prompt.txt");
+        let system_prompt = fs::read_to_string(&prompt_path)
+            .with_context(|| format!("读取 AI 提示词 {}", prompt_path.display()))?;
+        anyhow::ensure!(!system_prompt.trim().is_empty(), "AI 提示词不能为空");
         let policy: Value = serde_json::from_slice(&fs::read(path).context("读取 AI policy")?)
             .context("AI policy JSON 无效")?;
         anyhow::ensure!(policy.is_object(), "AI policy 必须是 JSON 对象");
@@ -121,6 +124,7 @@ impl PromptPolicy {
         }
         let curated = terms(&policy["glossary"]);
         Ok(Self {
+            system_prompt,
             policy,
             terms: merged.into_values().collect(),
             curated,
@@ -184,7 +188,8 @@ impl PromptPolicy {
         let mut policy = self.policy.clone();
         policy["glossary"] = self.glossary(input);
         format!(
-            "{SYSTEM_PROMPT}{}",
+            "{}{}",
+            self.system_prompt,
             serde_json::to_string_pretty(&policy).expect("JSON value serializes")
         )
     }
@@ -193,6 +198,29 @@ impl PromptPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_comes_from_runtime_file_and_is_reused_until_reloaded() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("policy.json");
+        let prompt_path = temp.path().join("system-prompt.txt");
+        fs::write(&path, "{}").unwrap();
+        assert!(PromptPolicy::load(&path).is_err());
+        for invalid in [b" \n".as_slice(), b"\xff".as_slice()] {
+            fs::write(&prompt_path, invalid).unwrap();
+            assert!(PromptPolicy::load(&path).is_err());
+        }
+        fs::write(&prompt_path, "External prompt\n").unwrap();
+        let cached = PromptPolicy::load(&path).unwrap();
+        fs::write(&prompt_path, "Updated prompt\n").unwrap();
+        assert_eq!(
+            cached.system_prompt(""),
+            "External prompt\n{\n  \"glossary\": {}\n}"
+        );
+        let reloaded = PromptPolicy::load(&path).unwrap();
+        fs::remove_file(&prompt_path).unwrap();
+        assert!(reloaded.system_prompt("").starts_with("Updated prompt\n"));
+    }
 
     #[test]
     fn glossary_keeps_layer_precedence_numeric_patterns_and_word_boundaries() {

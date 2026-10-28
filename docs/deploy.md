@@ -64,6 +64,8 @@ ssh <server> "sudo bash /tmp/y2b-release-$release_id/deploy/deploy-app.sh /tmp/y
 > [!IMPORTANT]
 > 第 3 步不能只拷二进制。`system-prompt.txt`、`policy.json`、`audit-policy.json`、`brawl-stars-glossary.json` 与二进制必须来自同一份输入；`deploy-app.sh` 会把它们一起放入 `/opt/y2b/releases/$release_id/`。`/opt/y2b/pi` 只是指向 `current/pi` 的兼容链接，禁止再向这个固定路径单独覆盖文件。
 
+`system-prompt.txt` 在运行时从 `ai.policy` 所在目录读取。每个 Pipeline 在首次 AI 调用时加载提示词、策略和词库并缓存，后续请求直接使用缓存。仅修改提示词无需重新编译 Rust；发布新资源并重启服务后生效。提示词缺失、为空或不是 UTF-8 时会报错，不会使用内嵌内容兜底。
+
 ### maintenance hold 与原子 release 边界
 
 **maintenance hold** 是 SQLite 中带 owner、原因和租期的真实写锁，不再只是运维约定。它会阻止 watch、手动 `y2b run` 和字幕流程领取新工作；部署获取锁后仍要等待已经领取的任务结束。`deploy-app.sh` 以 `deploy:<revision>:<UTC 时间>:<PID>` 作为唯一 owner，每轮等待都会续租，并用 `status --json --owner <本次 owner>` 排除自己的锁。`active_claims`、`upload_attempts`、`subtitle_attempts` 等 blocker 的 kind、数量和 details 都会原样打印。
@@ -104,7 +106,7 @@ y2b maintenance release --database /var/lib/y2b/state.db --owner "$owner"
 | 类别 | 条目 | 漂移处理 |
 | --- | --- | --- |
 | 外部工具 | `yt-dlp`、`ffmpeg`、`biliup` | 漂移作为必选失败（FAIL）拦住部署 |
-| 发布资源 | `pi-policy`、`pi-audit-policy`、`brawl-stars-glossary` | 日常检查严格匹配；部署仅允许更新解析到新 release 内对应文件的哈希 |
+| 发布资源 | `ai-system-prompt`、`pi-policy`、`pi-audit-policy`、`brawl-stars-glossary` | 日常检查严格匹配；部署仅允许更新解析到新 release 内对应文件的哈希 |
 | `y2b` 自身 | 部署的二进制 | 漂移是部署的预期结果，只降级为告警（WARN），不拦住部署 |
 
 这样区分是因为：部署一个新二进制必然改变 `y2b` 的 sha256，若把它的漂移当作必选
@@ -112,9 +114,9 @@ y2b maintenance release --database /var/lib/y2b/state.db --owner "$owner"
 健康检查也会因旧二进制与基线不一致而误判。外部依赖被偷换时仍然会以必选失败拒绝
 部署，这是基线存在的意义。
 
-`deploy-app.sh` 在停服前校验旧基线并备份，切换 `current` 后只刷新上述三项发布资源的
+`deploy-app.sh` 在停服前校验旧基线并备份，切换 `current` 后只刷新上述四项发布资源的
 哈希，再执行 `check --write-baseline`。外部工具的预期哈希保持不变；配置在 release
-之外的资源不会被自动接受。回滚时先恢复部署前的基线，再用旧二进制校验并写回。
+之外的资源不会被自动接受。首次升级会补齐旧基线中缺少的 `ai-system-prompt` 条目。回滚时先恢复部署前的基线，再用旧二进制校验并写回。
 
 PO Token Provider 使用独立的**原子 release**：安装器先写入版本化 `releases/<version>`，校验完整后再以临时符号链接和单次 `mv` 切换 `current`。失败时旧 `current` 仍可用，不会暴露半份 provider。
 

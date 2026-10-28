@@ -2243,6 +2243,26 @@ wait_for_stable_service systemctl_stub test.service
         )
         .unwrap();
         assert_eq!(baseline["external"], old_baseline["external"]);
+        // 旧版内嵌提示词没有基线条目；首次升级必须补齐并接受新 release 的文件。
+        let prompt = baseline["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "ai-system-prompt")
+            .unwrap();
+        assert_eq!(
+            prompt["path"],
+            fixture
+                .app_root
+                .join("pi/system-prompt.txt")
+                .to_str()
+                .unwrap()
+        );
+        assert!(
+            prompt["sha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
+        );
         for (old, new) in old_baseline["items"]
             .as_array()
             .unwrap()
