@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "game_version": "68.250",
+  "game_version": null,
   "language_pair": "en-CN",
   "source": {
     "kind": "Brawl Stars client localization mirror",
@@ -8,20 +8,20 @@
     "english": "https://api.brawlapi.com/v2/raw/localization/texts",
     "simplified_chinese": "https://api.brawlapi.com/v2/raw/localization/cn",
     "patch": "https://api.brawlapi.com/v2/raw/localization/texts_patch",
-    "generated_at": "2026-07-10T18:31:53.551Z"
+    "generated_at": "2026-10-03T16:59:28.000Z"
   },
   "selection": {
-    "localization_rows": 15481,
-    "referenced_tids": 5374,
-    "unambiguous_terms": 3761,
+    "localization_rows": 16715,
+    "referenced_tids": 5528,
+    "unambiguous_terms": 3881,
     "ambiguous_terms_excluded": 43,
-    "active_candidates": 3088,
-    "legacy_candidates": 673,
-    "model_failure_inputs": 3392,
-    "active_entries": 2720,
-    "legacy_entries": 617,
+    "active_candidates": 3207,
+    "legacy_candidates": 674,
+    "model_failure_inputs": 3606,
+    "active_entries": 2926,
+    "legacy_entries": 622,
     "pattern_collapsed_entries": 6,
-    "excluded_or_unreferenced_failures": 49,
+    "excluded_or_unreferenced_failures": 52,
     "ignored_reference_paths": [
       "csv_client/billing_packages",
       "csv_client/hints",
@@ -37,26 +37,16 @@
     ]
   },
   "audit": {
-    "provider": "openai-codex",
-    "thinking": "high",
-    "strategy": "cascade: Terra all terms, Luna Terra-passing terms, Sol Terra-and-Luna-passing terms",
-    "gpt-5.6-terra": {
-      "tested": 3830,
-      "exact": 632,
-      "failures": 3198
-    },
-    "gpt-5.6-luna": {
-      "tested": 632,
-      "exact": 472,
-      "failures": 160
-    },
-    "gpt-5.6-sol": {
-      "tested": 472,
-      "exact": 438,
-      "failures": 34
-    },
-    "union_failures": 3392,
-    "passed_all_three": 438
+    "provider": "deepseek",
+    "model": "deepseek-flash",
+    "thinking": "off",
+    "strategy": "retain previous corrections and add current model mismatches",
+    "completed_at": "2026-10-28T05:46:35+00:00",
+    "tested": 3881,
+    "exact": 496,
+    "failures": 3385,
+    "retained_failure_inputs": 3392,
+    "union_failures": 3606
   },
   "curated": {
     "source": "policy.json",
@@ -161,6 +151,33 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "8-BIT'S GADGET BUFFIE": {
+      "translation": "8比特妙具增益挂饰",
+      "representative_tid": "TID_BUDDY_ARCADE_GADGETS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "8-BIT'S HYPER BUFFIE": {
+      "translation": "8比特极充增益挂饰",
+      "representative_tid": "TID_BUDDY_ARCADE_OVERCHARGE_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "8-BIT'S STAR BUFFIE": {
+      "translation": "8比特星徽增益挂饰",
+      "representative_tid": "TID_BUDDY_ARCADE_STARPOWERS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "A Ballad About Minced Cutlets": {
       "translation": "肉饼挽歌",
       "representative_tid": "TID_KNOCKOUT_632",
@@ -224,6 +241,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "ACADEMY MANDY": {
+      "translation": "交换生曼迪",
+      "representative_tid": "TID_BACK_TO_SCHOOL_MANDY_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "Acid Lakes": {
       "translation": "酸性毒沼",
       "representative_tid": "TID_BATTLE_ROYALE_5",
@@ -260,11 +286,29 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "ADIDAS": {
+      "translation": "阿迪达斯",
+      "representative_tid": "TID_SKIN_INFO_ADIDAS",
+      "sources": [
+        "csv_logic/skin_campaigns"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "ADIDAS ASH": {
       "translation": "阿迪达斯阿拾",
       "representative_tid": "TID_ADIDAS_BOX_ASH_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "adidas Champion": {
+      "translation": "阿迪达斯冠军",
+      "representative_tid": "TID_TITLE_ADIDAS",
+      "sources": [
+        "csv_logic/player_titles"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -350,6 +394,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "Alchemy": {
+      "translation": "炼金地带",
+      "representative_tid": "TID_WANTED_691",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "ALIEN FAME I": {
       "translation": "异星声望1",
       "representative_tid": "TID_FAME_TIER_ALIEN1",
@@ -413,11 +466,29 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "Alley Oop": {
+      "translation": "空中接力",
+      "representative_tid": "TID_BASKET_05",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "ALLEYCAT BULL": {
       "translation": "猫老大公牛",
       "representative_tid": "TID_ALLEYCAT_BULL_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "ALLI": {
+      "translation": "鳄梨",
+      "representative_tid": "TID_STALKER",
+      "sources": [
+        "csv_logic/characters"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -476,6 +547,33 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "AMBER'S GADGET BUFFIE": {
+      "translation": "琥珀妙具增益挂饰",
+      "representative_tid": "TID_BUDDY_AMBER_GADGETS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "AMBER'S HYPER BUFFIE": {
+      "translation": "琥珀极充增益挂饰",
+      "representative_tid": "TID_BUDDY_AMBER_OVERCHARGE_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "AMBER'S STAR BUFFIE": {
+      "translation": "琥珀星徽增益挂饰",
+      "representative_tid": "TID_BUDDY_AMBER_STARPOWERS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "AMBUSH": {
       "translation": "致命伏击",
       "representative_tid": "TID_SPEC_ABI_AMBUSH",
@@ -490,6 +588,15 @@
       "representative_tid": "TID_AMERICA_SHELLY_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "AMMO ATTRACTOR": {
+      "translation": "磁吸装弹",
+      "representative_tid": "TID_ATTRACTOR_SP_2",
+      "sources": [
+        "csv_logic/cards"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -1160,6 +1267,24 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "BARISTA BARRAGE": {
+      "translation": "加料连射",
+      "representative_tid": "TID_STACKER_ULTI",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Barrel Bluff": {
+      "translation": "伪装圆桶",
+      "representative_tid": "TID_HUNTERSURVIVOR_4",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "BARREL O' BULLETS": {
       "translation": "滚桶扫射",
       "representative_tid": "TID_BARRELBOT_OVERCHARGE",
@@ -1358,6 +1483,15 @@
       "active_references": 1,
       "disabled_references": 1
     },
+    "BELLENSTEIN'S MONSTER": {
+      "translation": "怪异博士的怪物",
+      "representative_tid": "TID_BRAWLOWEEN_PIPER_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "BELLHOP MIKE": {
       "translation": "迎宾员麦克",
       "representative_tid": "TID_BELLHOP_MIKE_SKIN",
@@ -1394,11 +1528,29 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "BIBI": {
+      "translation": "比比",
+      "representative_tid": "TID_BASEBALL",
+      "sources": [
+        "csv_logic/characters"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "BIBI RJ": {
       "translation": "RJ比比",
       "representative_tid": "TID_BT21_BIBI_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "BIBI'S GADGET BUFFIE": {
+      "translation": "比比妙具增益挂饰",
+      "representative_tid": "TID_BUDDY_BASEBALL_GADGETS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -1611,6 +1763,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "BLACKBIRD EDGAR": {
+      "translation": "黑鸟艾德加",
+      "representative_tid": "TID_VIGILANTE_EDGAR_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "BLACKGREEN MELODIE": {
       "translation": "墨绿麦乐迪",
       "representative_tid": "TID_BLACKGREEN_MELODIE_SKIN",
@@ -1728,6 +1889,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "BLUE SQUIDWARD MORTIS": {
+      "translation": "蓝色章鱼哥莫提斯",
+      "representative_tid": "TID_UNDERTAKER_SQUIDWARD_BLUE_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "BLUSTERY BLOW": {
       "translation": "头碰南墙",
       "representative_tid": "TID_SPEC_ABI_BLOWER_1",
@@ -1755,9 +1925,27 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "BO'S GADGET BUFFIE": {
+      "translation": "阿渤妙具增益挂饰",
+      "representative_tid": "TID_BUDDY_BOWDUDE_GADGETS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "BO'S HYPER BUFFIE": {
       "translation": "阿渤极充增益挂饰",
       "representative_tid": "TID_BUDDY_BOWDUDE_OVERCHARGE_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "BO'S STAR BUFFIE": {
+      "translation": "阿渤星徽增益挂饰",
+      "representative_tid": "TID_BUDDY_BOWDUDE_STARPOWERS_UNLOCK",
       "sources": [
         "csv_logic/cards"
       ],
@@ -1805,6 +1993,15 @@
       "representative_tid": "TID_CANNON_GIRL_SMALL_WEAPON",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "BONE COLLECTOR ALLI": {
+      "translation": "白骨猎手鳄梨",
+      "representative_tid": "TID_MAKE_ALLI_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -1949,15 +2146,6 @@
       "representative_tid": "TID_EVENT_MODIFIER_10",
       "sources": [
         "csv_logic/event_modifiers"
-      ],
-      "active_references": 1,
-      "disabled_references": 0
-    },
-    "BOSS TECH TARA": {
-      "translation": "首领科幻塔拉",
-      "representative_tid": "TID_MEGA_BOSS_BLACKHOLE",
-      "sources": [
-        "csv_logic/locations"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -2324,6 +2512,24 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "BRAWLER BOX": {
+      "translation": "英雄宝箱",
+      "representative_tid": "TID_SHOP_OFFER_TITLE_71",
+      "sources": [
+        "csv_logic/random_reward_containers"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "BRAWLER BOXES": {
+      "translation": "英雄宝箱",
+      "representative_tid": "TID_SKIN_INFO_BOXES",
+      "sources": [
+        "csv_logic/skin_campaigns"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "BRAWLER COLLECTION I": {
       "translation": "英雄鉴赏家I",
       "representative_tid": "TID_ACH_UNLOCK_BRAWLERS_1_TITLE",
@@ -2383,6 +2589,33 @@
       "representative_tid": "TID_ACH_BULL_KNOCKBACKS_IN_ONE_MATCH_TITLE_SHOWDOWN",
       "sources": [
         "csv_logic/records"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "BRAWLER KEY": {
+      "translation": "英雄钥匙",
+      "representative_tid": "TID_VAULT_BRAWLER_KEY",
+      "sources": [
+        "csv_logic/resources"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "BRAWLER MAGNET": {
+      "translation": "英雄磁铁",
+      "representative_tid": "TID_BRAWLERS_MAGNET",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Brawler's Rift": {
+      "translation": "英雄峡谷",
+      "representative_tid": "TID_MOBA_692",
+      "sources": [
+        "csv_logic/locations"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -2586,6 +2819,15 @@
       "active_references": 2,
       "disabled_references": 0
     },
+    "BRUCE NITA": {
+      "translation": "布鲁斯妮塔",
+      "representative_tid": "TID_APRIL_FOOLS_NITA_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "BSC 2020": {
       "translation": "2020全球锦标赛",
       "representative_tid": "TID_SKIN_INFO_CAMPAIGN_15_NOT_AVAILABLE",
@@ -2699,6 +2941,24 @@
       "representative_tid": "TID_VAULT_BUDDY_KEY",
       "sources": [
         "csv_logic/resources"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "BUG BANDAGE": {
+      "translation": "虫虫绷带",
+      "representative_tid": "TID_STACKER_SP_2",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Buggin' Out": {
+      "translation": "阴暗爬行中",
+      "representative_tid": "TID_TITLE_PRESTIGE_STACKER",
+      "sources": [
+        "csv_logic/player_titles"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -3041,6 +3301,15 @@
       "representative_tid": "TID_DANCER_WEAPON",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "CAPTAIN CARL": {
+      "translation": "船长卡尔",
+      "representative_tid": "TID_CARL_CAPTAIN_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -3533,6 +3802,33 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "CHUCK'S GADGET BUFFIE": {
+      "translation": "查克妙具增益挂饰",
+      "representative_tid": "TID_BUDDY_CHUCK_GADGETS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "CHUCK'S HYPER BUFFIE": {
+      "translation": "查克极充增益挂饰",
+      "representative_tid": "TID_BUDDY_CHUCK_OVERCHARGE_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "CHUCK'S STAR BUFFIE": {
+      "translation": "查克星徽增益挂饰",
+      "representative_tid": "TID_BUDDY_CHUCK_STARPOWERS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "CHUM BALLS": {
       "translation": "海霸丸",
       "representative_tid": "TID_SB_DAMAGE_1",
@@ -3767,6 +4063,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "COFFIN BOX": {
+      "translation": "棺材宝箱",
+      "representative_tid": "TID_SHOP_OFFER_TITLE_95",
+      "sources": [
+        "csv_logic/random_reward_containers"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "COILED SNAKE": {
       "translation": "蝮蛇出洞",
       "representative_tid": "TID_SPEC_ABI_LONGER_DASH",
@@ -3844,6 +4149,15 @@
       "representative_tid": "TID_BUDDY_PERCENTER_GADGETS_UNLOCK",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "COLETTE'S GHOST BUFFIE": {
+      "translation": "科莱特幽灵增益挂饰",
+      "representative_tid": "TID_COLETTE_BUDDY_GHOSTLY_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -3992,6 +4306,24 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "COME TO PAPA": {
+      "translation": "毛虫归家",
+      "representative_tid": "TID_STACKER_SP_1",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "COMMON PINS": {
+      "translation": "普通表情",
+      "representative_tid": "TID_CATALOG_COLLECTION_EMOTES_COMMON",
+      "sources": [
+        "csv_logic/catalog_collections"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "COMMON PINS I": {
       "translation": "普通表情爱好者I",
       "representative_tid": "TID_ACH_OWN_COMMON_PINS_1_TITLE",
@@ -4118,6 +4450,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "COOKIE CRUMBS": {
+      "translation": "饼干碎屑",
+      "representative_tid": "TID_ACCESSORY_BEAMER_GADGET_2",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "Cookie Lover": {
       "translation": "超爱饼干",
       "representative_tid": "TID_TITLE_PRESTIGE_PEARL",
@@ -4193,6 +4534,15 @@
     "Corner Cave": {
       "translation": "边缘洞穴",
       "representative_tid": "TID_BANKHEIST_6202",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Corner Kickoff": {
+      "translation": "角球区",
+      "representative_tid": "TID_SUPER_BALL_692",
       "sources": [
         "csv_logic/locations"
       ],
@@ -4290,6 +4640,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "CREDIT RUSH": {
+      "translation": "英雄券冲刺",
+      "representative_tid": "TID_RUSH_CREDIT_TITLE",
+      "sources": [
+        "csv_client/special_rush_event_texts"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "CREEP FROM THE DEEP": {
       "translation": "深海怪形",
       "representative_tid": "TID_MENDER_ULTI",
@@ -4299,11 +4658,29 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "Creepy": {
+      "translation": "浑身难受",
+      "representative_tid": "TID_TITLE_MASTERY_STACKER",
+      "sources": [
+        "csv_logic/player_titles"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "CREEPY HARVEST": {
       "translation": "精华吸收",
       "representative_tid": "TID_SPEC_ABI_STEAL_SOULS",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "CREEPY SHADE": {
+      "translation": "恐怖玩偶谢德",
+      "representative_tid": "TID_BRAWLOWEEN_SHADE_CHROMA_1_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -4385,6 +4762,15 @@
       "representative_tid": "TID_SHOWDOWN_681",
       "sources": [
         "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "CROW": {
+      "translation": "黑鸦",
+      "representative_tid": "TID_CROW",
+      "sources": [
+        "csv_logic/characters"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -4570,9 +4956,81 @@
       "active_references": 3,
       "disabled_references": 0
     },
+    "CURSED SHADE": {
+      "translation": "恶咒猴谢德",
+      "representative_tid": "TID_BRAWLOWEEN_SHADE_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "CUTTLEFISH JACKY": {
       "translation": "乌贼雅琪",
       "representative_tid": "TID_SQUID_JACKY_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "CYBER BROCK II": {
+      "translation": "赛博布洛克II",
+      "representative_tid": "TID_BROCK_PROPASS_PROGRESSION_SKIN_2",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "CYBER BROCK III": {
+      "translation": "赛博布洛克III",
+      "representative_tid": "TID_BROCK_PROPASS_PROGRESSION_SKIN_3",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "CYBER BROCK IV": {
+      "translation": "赛博布洛克IV",
+      "representative_tid": "TID_BROCK_PROPASS_PROGRESSION_SKIN_4",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "CYBER BROCK V": {
+      "translation": "赛博布洛克V",
+      "representative_tid": "TID_BROCK_PROPASS_PROGRESSION_SKIN_5",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "CYBER BROCK VI": {
+      "translation": "赛博布洛克VI",
+      "representative_tid": "TID_BROCK_PROPASS_PROGRESSION_SKIN_6",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "CYBER BROCK VII": {
+      "translation": "赛博布洛克VII",
+      "representative_tid": "TID_BROCK_PROPASS_PROGRESSION_SKIN_7",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "CYBER BROCK VIII": {
+      "translation": "赛博布洛克VIII",
+      "representative_tid": "TID_BROCK_PROPASS_PROGRESSION_SKIN_8",
       "sources": [
         "csv_logic/skins"
       ],
@@ -5011,6 +5469,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "DEMON OTIS": {
+      "translation": "恶魔奥蒂斯",
+      "representative_tid": "TID_DEMON_OTIS_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "DEMON WILLOW": {
       "translation": "恶魔薇洛",
       "representative_tid": "TID_WILLOW_DEMON_SKIN",
@@ -5106,6 +5573,15 @@
       "representative_tid": "TID_DEMONIC_ABILITY_3",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Diagonal Dribble": {
+      "translation": "对角运球",
+      "representative_tid": "TID_SUPER_BALL_691",
+      "sources": [
+        "csv_logic/locations"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -5482,6 +5958,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "DR. BELLENSTEIN": {
+      "translation": "怪异博士贝尔",
+      "representative_tid": "TID_BRAWLOWEEN_BELLE_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "DRACO DOUG": {
       "translation": "飞龙道格",
       "representative_tid": "TID_DRAGON_DOUG_SKIN",
@@ -5698,6 +6183,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "DRUM MAJOR NAJIA": {
+      "translation": "乐队指挥娜吉亚",
+      "representative_tid": "TID_BACK_TO_SCHOOL_NAJIA_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "DRUM SOLO": {
       "translation": "密集鼓点",
       "representative_tid": "TID_MORNINGSTAR_OVERCHARGE",
@@ -5757,6 +6251,33 @@
       "representative_tid": "TID_TILE_MASTERY_DRACO",
       "sources": [
         "csv_logic/player_titles"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Dungeon Train": {
+      "translation": "地城火车",
+      "representative_tid": "TID_GEMGRAB_691",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "DUO MEGA BOSS": {
+      "translation": "双人超级首领",
+      "representative_tid": "TID_GAME_MODE_69",
+      "sources": [
+        "csv_logic/game_mode_variations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "DUO SHOWDOWN": {
+      "translation": "双人荒野决斗",
+      "representative_tid": "TID_GAME_MODE_9",
+      "sources": [
+        "csv_logic/game_mode_variations"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -5824,6 +6345,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "EDGAR": {
+      "translation": "艾德加",
+      "representative_tid": "TID_ENRAGER",
+      "sources": [
+        "csv_logic/characters"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "Edgar Mecha Pin Pack": {
       "translation": "机甲艾德加表情礼包",
       "representative_tid": "TID_EMOTE_BUNDLE_EDGAR_MECHA_PACK",
@@ -5847,6 +6377,15 @@
       "representative_tid": "TID_BUDDY_ENRAGER_GADGETS_UNLOCK",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "EDGAR'S GHOST BUFFIE": {
+      "translation": "艾德加幽灵增益挂饰",
+      "representative_tid": "TID_EDGAR_BUDDY_GHOSTLY_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -6049,6 +6588,33 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "EL PRIMO'S GADGET BUFFIE": {
+      "translation": "艾尔·普里莫妙具增益挂饰",
+      "representative_tid": "TID_BUDDY_LUCHADOR_GADGETS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "EL PRIMO'S HYPER BUFFIE": {
+      "translation": "艾尔·普里莫极充增益挂饰",
+      "representative_tid": "TID_BUDDY_LUCHADOR_OVERCHARGE_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "EL PRIMO'S STAR BUFFIE": {
+      "translation": "艾尔·普里莫星徽增益挂饰",
+      "representative_tid": "TID_BUDDY_LUCHADOR_STARPOWERS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "EL QUARTERBACK": {
       "translation": "四分卫普里莫",
       "representative_tid": "TID_EL_QUARTERBACK_SKIN",
@@ -6148,6 +6714,15 @@
       "active_references": 2,
       "disabled_references": 0
     },
+    "ELIMINATION": {
+      "translation": "硬核模式",
+      "representative_tid": "TID_EVENT_MODIFIER_67",
+      "sources": [
+        "csv_logic/event_modifiers"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "EMERALD PRINCE SPROUT": {
       "translation": "绿宝石王子芽芽",
       "representative_tid": "TID_EMERALD_PRINCE_SPROUT_SKIN",
@@ -6184,11 +6759,29 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "EMZ": {
+      "translation": "艾魅",
+      "representative_tid": "TID_MUMMY",
+      "sources": [
+        "csv_logic/characters"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "EMZ'S GADGET BUFFIE": {
       "translation": "艾魅妙具增益挂饰",
       "representative_tid": "TID_BUDDY_MUMMY_GADGETS_UNLOCK",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "EMZ'S GHOST BUFFIE": {
+      "translation": "艾魅幽灵增益挂饰",
+      "representative_tid": "TID_EMZ_BUDDY_GHOSTLY_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -6243,6 +6836,24 @@
       "representative_tid": "TID_WINDSTOCK_SPROUT_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "EPIC CHAOS DROP": {
+      "translation": "史诗混沌惊喜",
+      "representative_tid": "TID_SPLITTING_STAR_EPIC",
+      "sources": [
+        "csv_logic/random_reward_containers"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "EPIC PINS": {
+      "translation": "史诗表情",
+      "representative_tid": "TID_CATALOG_COLLECTION_EMOTES_EPIC",
+      "sources": [
+        "csv_logic/catalog_collections"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -6360,6 +6971,15 @@
       "representative_tid": "TID_ESPORTS_JACKY_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "ESPRESSO SHOT": {
+      "translation": "咖啡扑面",
+      "representative_tid": "TID_STACKER_WEAPON",
+      "sources": [
+        "csv_logic/cards"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -6576,6 +7196,15 @@
       "representative_tid": "TID_SPEC_ABI_DOORMAN_1",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "False Sense Of Security": {
+      "translation": "虚假安全",
+      "representative_tid": "TID_TAGTEAM_692",
+      "sources": [
+        "csv_logic/locations"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -7156,6 +7785,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "FOOTBONNIE": {
+      "translation": "足球邦妮",
+      "representative_tid": "TID_FOOTBALL_BONNIE_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 2,
+      "disabled_references": 0
+    },
     "FORCE FIELD": {
       "translation": "防御力场",
       "representative_tid": "TID_SPEC_ABI_MECHA_DUDE_1",
@@ -7170,6 +7808,15 @@
       "representative_tid": "TID_GEMGRAB_652",
       "sources": [
         "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "FORTUNE TELLER P": {
+      "translation": "占卜师P先生",
+      "representative_tid": "TID_BRAWLOWEEN_MRP_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -7215,6 +7862,15 @@
       "representative_tid": "TID_BUDDY_HAMMERDUDE_GADGETS_UNLOCK",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "FRANK'S GHOST BUFFIE": {
+      "translation": "弗兰肯幽灵增益挂饰",
+      "representative_tid": "TID_FRANK_BUDDY_GHOSTLY_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -7300,6 +7956,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "FRIENDLY FIRE": {
+      "translation": "队友别开枪",
+      "representative_tid": "TID_EVENT_MODIFIER_45",
+      "sources": [
+        "csv_logic/event_modifiers"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "FRIENDSHIP IS GREAT": {
       "translation": "友谊马尾",
       "representative_tid": "TID_PAINTER_GADGET_1",
@@ -7361,6 +8026,15 @@
         "csv_logic/locations"
       ],
       "active_references": 1,
+      "disabled_references": 0
+    },
+    "FRUIT SAMURAI KENJI": {
+      "translation": "水果武士健次",
+      "representative_tid": "TID_SAMURAI_KENJI_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 2,
       "disabled_references": 0
     },
     "FRUITY KAZE": {
@@ -7532,6 +8206,15 @@
         "csv_logic/cards"
       ],
       "active_references": 1,
+      "disabled_references": 0
+    },
+    "Gated Community": {
+      "translation": "封闭社区",
+      "representative_tid": "TID_SHOWDOWN_643",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 2,
       "disabled_references": 0
     },
     "Gem Fort": {
@@ -7877,6 +8560,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "GOLD MECHA CROW": {
+      "translation": "黄金机甲黑鸦",
+      "representative_tid": "TID_CROW_MECHA_GOLD_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "GOLD NEKO BEA": {
       "translation": "黄金招财猫贝亚",
       "representative_tid": "TID_GOLD_NEKO_BEA_SKIN",
@@ -7921,6 +8613,15 @@
         "csv_logic/skin_campaigns"
       ],
       "active_references": 3,
+      "disabled_references": 0
+    },
+    "GOLDEN WEEK": {
+      "translation": "黄金假日",
+      "representative_tid": "TID_SHOP_GOLDENWEEK_TITLE",
+      "sources": [
+        "csv_logic/seasonal_skin_sections"
+      ],
+      "active_references": 1,
       "disabled_references": 0
     },
     "Golden Week Skin Pins": {
@@ -8005,6 +8706,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "GRAFFITI ALLI": {
+      "translation": "涂鸦鳄梨",
+      "representative_tid": "TID_ALLI_GRAFFIYI_SPECIAL_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "GRAFFITI ENTHUSIAST I": {
       "translation": "涂鸦达人I",
       "representative_tid": "TID_ACH_OWN_SPRAYS_1_TITLE",
@@ -8044,6 +8754,15 @@
     "GRAFFITI MINA": {
       "translation": "涂鸦蜜娜",
       "representative_tid": "TID_DANCER_GRAFFIYI_SPECIAL_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "GRAFFITI STU": {
+      "translation": "涂鸦斯图",
+      "representative_tid": "TID_RETRO_GRAFFIYI_SPECIAL_SKIN",
       "sources": [
         "csv_logic/skins"
       ],
@@ -8095,11 +8814,29 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "GRAVESTONE GRIFF": {
+      "translation": "石碑幽魂格里夫",
+      "representative_tid": "TID_MAKE_GRIFF_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "GRAVEYARD SHIFT": {
       "translation": "暗夜夺魂",
       "representative_tid": "TID_EVENT_MODIFIER_4",
       "sources": [
         "csv_logic/event_modifiers"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "GRAVITATIONAL PULL": {
+      "translation": "引力奇点",
+      "representative_tid": "TID_ATTRACTOR_ULTI",
+      "sources": [
+        "csv_logic/cards"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -8149,6 +8886,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "GREEN ENERGY": {
+      "translation": "清洁能源",
+      "representative_tid": "TID_FUTURE_GIRL_OVERCHARGE",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "GREEN GRENADE": {
       "translation": "环保手雷",
       "representative_tid": "TID_FUTURE_GIRL_GADGET_2",
@@ -8172,6 +8918,15 @@
       "representative_tid": "TID_BUDDY_ASSAULT_SHOTGUN_GADGETS_UNLOCK",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "GRIFF'S GHOST BUFFIE": {
+      "translation": "格里夫幽灵增益挂饰",
+      "representative_tid": "TID_GRIFF_BUDDY_GHOSTLY_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -8370,6 +9125,33 @@
       "representative_tid": "TID_GUNSLINGER_COLT_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "GUS' GADGET BUFFIE": {
+      "translation": "格斯妙具增益挂饰",
+      "representative_tid": "TID_BUDDY_SOUL_COLLECTOR_GADGETS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "GUS' HYPER BUFFIE": {
+      "translation": "格斯极充增益挂饰",
+      "representative_tid": "TID_BUDDY_SOUL_COLLECTOR_OVERCHARGE_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "GUS' STAR BUFFIE": {
+      "translation": "格斯星徽增益挂饰",
+      "representative_tid": "TID_BUDDY_SOUL_COLLECTOR_STARPOWERS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -8617,11 +9399,11 @@
       "active_references": 1,
       "disabled_references": 0
     },
-    "HAWKINS HUNT": {
-      "translation": "霍金斯镇激战",
-      "representative_tid": "TID_GAME_MODE_61",
+    "HEAD TEACHER NANI": {
+      "translation": "教导主任纳妮",
+      "representative_tid": "TID_BACK_TO_SCHOOL_NANI_CHROMA_1_SKIN",
       "sources": [
-        "csv_logic/game_mode_variations"
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -8978,6 +9760,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "Hide Tide": {
+      "translation": "暗潮涌动",
+      "representative_tid": "TID_HUNTERSURVIVOR_3",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "Hideout": {
       "translation": "草丛迷踪",
       "representative_tid": "TID_WANTED_8",
@@ -8986,6 +9777,15 @@
       ],
       "active_references": 1,
       "disabled_references": 1
+    },
+    "Hideout Havoc": {
+      "translation": "乱中藏身",
+      "representative_tid": "TID_HUNTERSURVIVOR_5",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
     },
     "HIEROGLYPH HALT": {
       "translation": "漫长等待",
@@ -9050,7 +9850,7 @@
       "active_references": 1,
       "disabled_references": 0
     },
-    "HIS MOTHER’S SON": {
+    "HIS MOTHER'S SON": {
       "translation": "忍者风范",
       "representative_tid": "TID_KATANA_KID_SP_2",
       "sources": [
@@ -9221,6 +10021,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "HOT COFFEE": {
+      "translation": "滚烫咖啡",
+      "representative_tid": "TID_STACKER_GADGET_1",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "HOT COOKIES": {
       "translation": "滚烫饼干",
       "representative_tid": "TID_COOKER_WEAPON",
@@ -9253,6 +10062,15 @@
       "representative_tid": "TID_BANKHEIST_681",
       "sources": [
         "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "HOT ZONE": {
+      "translation": "热区争夺",
+      "representative_tid": "TID_GAME_MODE_17",
+      "sources": [
+        "csv_logic/game_mode_variations"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -9613,6 +10431,15 @@
       "representative_tid": "TID_SPEC_ABI_DUPLICATOR_1",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "In Demand": {
+      "translation": "炙手可热",
+      "representative_tid": "TID_BALL_691",
+      "sources": [
+        "csv_logic/locations"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -10081,6 +10908,15 @@
       "representative_tid": "TID_TITLE_PRESTIGE_CHESTER",
       "sources": [
         "csv_logic/player_titles"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "JOLLY GHOST SHADE": {
+      "translation": "乐声惊魂谢德",
+      "representative_tid": "TID_BRAWLOWEEN_SHADE_CHROMA_2_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -10564,6 +11400,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "KNOCKBACK SPIRIT": {
+      "translation": "灵体冲撞",
+      "representative_tid": "TID_ACCESSORY_SOUL_COLLECTOR_GADGET_2",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "KNOCKOUT": {
       "translation": "乱斗淘汰赛",
       "representative_tid": "TID_GAME_MODE_20",
@@ -10745,6 +11590,24 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "LATIN AMERICA MASTER LEAGUE": {
+      "translation": "拉丁美洲大师联赛",
+      "representative_tid": "TID_SKIN_INFO_CAMPAIGN_LAML",
+      "sources": [
+        "csv_logic/skin_campaigns"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "LATIN AMERICA MASTER LEAGUE SKINS": {
+      "translation": "拉丁美洲大师联赛皮肤",
+      "representative_tid": "TID_SKIN_INFO_CAMPAIGN_LAML_TITLE",
+      "sources": [
+        "csv_logic/seasonal_skin_sections"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "LAVISH LOLA": {
       "translation": "奢华萝拉",
       "representative_tid": "TID_LAVISH_LOLA_SKIN",
@@ -10813,6 +11676,24 @@
       "representative_tid": "TID_TITLE_BATTLEPASSPLUS_SEASON40",
       "sources": [
         "csv_logic/player_titles"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "LEGENDARY CHAOS DROP": {
+      "translation": "传奇混沌惊喜",
+      "representative_tid": "TID_SPLITTING_STAR_LEGENDARY",
+      "sources": [
+        "csv_logic/random_reward_containers"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "LEGENDARY PINS": {
+      "translation": "传奇表情",
+      "representative_tid": "TID_CATALOG_COLLECTION_EMOTES_LEGENDARY",
+      "sources": [
+        "csv_logic/catalog_collections"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -10890,9 +11771,27 @@
       "active_references": 2,
       "disabled_references": 0
     },
+    "LEON'S GADGET BUFFIE": {
+      "translation": "里昂妙具增益挂饰",
+      "representative_tid": "TID_BUDDY_NINJA_GADGETS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "LEON'S HYPER BUFFIE": {
       "translation": "里昂极充增益挂饰",
       "representative_tid": "TID_BUDDY_NINJA_OVERCHARGE_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "LEON'S STAR BUFFIE": {
+      "translation": "里昂星徽增益挂饰",
+      "representative_tid": "TID_BUDDY_NINJA_STARPOWERS_UNLOCK",
       "sources": [
         "csv_logic/cards"
       ],
@@ -10953,6 +11852,16 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "LICENSE TO BRAWL": {
+      "translation": "乱斗许可证",
+      "representative_tid": "TID_SHOP_HUB_SKINS",
+      "sources": [
+        "csv_logic/seasonal_skin_sections",
+        "csv_logic/skin_campaigns"
+      ],
+      "active_references": 3,
+      "disabled_references": 0
+    },
     "LIFE BLOOD": {
       "translation": "蝙蝠增援",
       "representative_tid": "TID_UNDERTAKER_ULTI",
@@ -10983,6 +11892,15 @@
     "LIGHT MECHA BO": {
       "translation": "光明机甲阿渤",
       "representative_tid": "TID_BO_MECHA_LIGHT_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "LIGHT MECHA MORTIS": {
+      "translation": "光明机甲莫提斯",
+      "representative_tid": "TID_LIGHT_MECHA_MORTIS_SKIN",
       "sources": [
         "csv_logic/skins"
       ],
@@ -11138,6 +12056,15 @@
       "representative_tid": "TID_GAME_MODE_72",
       "sources": [
         "csv_logic/game_mode_variations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "LOADED WALLS": {
+      "translation": "重装上阵",
+      "representative_tid": "TID_EVENT_MODIFIER_50",
+      "sources": [
+        "csv_logic/event_modifiers"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -11845,6 +12772,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "MASTER FISHERMAN": {
+      "translation": "捕鱼漩涡",
+      "representative_tid": "TID_KATANA_KID_OVERCHARGE",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "MASTER FLETCHER": {
       "translation": "锐利飞刺",
       "representative_tid": "TID_INSECTMAN_GADGET_2",
@@ -11895,6 +12831,15 @@
       "representative_tid": "TID_TITLE_PRESTIGE_FURY",
       "sources": [
         "csv_logic/player_titles"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "MASTERS": {
+      "translation": "大师",
+      "representative_tid": "TID_CLUB_LEAGUE_MASTERS",
+      "sources": [
+        "csv_logic/alliance_league_ranks"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -12007,9 +12952,27 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "Mecha Box": {
+      "translation": "机甲宝箱",
+      "representative_tid": "TID_SHOP_MECHBOX",
+      "sources": [
+        "csv_logic/random_reward_containers"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "MECHA CHIEF FINX": {
       "translation": "陆战机甲芬克斯",
       "representative_tid": "TID_FINX_MECHA_CHIEF_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "MECHA CROW": {
+      "translation": "机甲黑鸦",
+      "representative_tid": "TID_CROW_MECHA_SKIN",
       "sources": [
         "csv_logic/skins"
       ],
@@ -12151,9 +13114,27 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "MEDUSA EMZ": {
+      "translation": "美杜莎艾魅",
+      "representative_tid": "TID_MEDUSA_EMZ_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 2,
+      "disabled_references": 0
+    },
     "MEEPLE": {
       "translation": "谜宝",
       "representative_tid": "TID_MEEPLE",
+      "sources": [
+        "csv_logic/characters"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "MEG": {
+      "translation": "梅格",
+      "representative_tid": "TID_MECHA_DUDE",
       "sources": [
         "csv_logic/characters"
       ],
@@ -12201,6 +13182,34 @@
       "representative_tid": "TID_MEGA_BEETLE_BEA_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "MEGA BOSS DUO": {
+      "translation": "超级首领多儿",
+      "representative_tid": "TID_MEGA_DUO",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "MEGA BOSS DUO (20 PLAYER)": {
+      "translation": "20人超级首领多儿",
+      "representative_tid": "TID_GAME_MODE_84",
+      "sources": [
+        "csv_logic/game_mode_variations",
+        "csv_logic/locations"
+      ],
+      "active_references": 2,
+      "disabled_references": 0
+    },
+    "MEGA BOSS DUO (5 player)": {
+      "translation": "5人超级首领多儿",
+      "representative_tid": "TID_MEGA_DUO_5P",
+      "sources": [
+        "csv_logic/locations"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -12264,6 +13273,15 @@
       "representative_tid": "TID_MECHA_DUDE_ULTI",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "MEGA MECHA MEG": {
+      "translation": "超级机甲梅格",
+      "representative_tid": "TID_CYBERNOODLES_MEG_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -12381,6 +13399,15 @@
       "representative_tid": "TID_MERCHANT_GALE_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "METAMOTHOSIS": {
+      "translation": "破蛹成蛾",
+      "representative_tid": "TID_STACKER_GADGET_2",
+      "sources": [
+        "csv_logic/cards"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -12799,6 +13826,24 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "MOONLIGHT EVE": {
+      "translation": "云宫灵兔伊芙",
+      "representative_tid": "TID_MOON_FESTIVAL_EVE_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "MOONLIGHT LOLA": {
+      "translation": "月照万象萝拉",
+      "representative_tid": "TID_MOON_FESTIVAL_LOLA_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "Moonveil Mansion": {
       "translation": "月幕庄园",
       "representative_tid": "TID_SHADOW_SMASH_1",
@@ -12813,6 +13858,15 @@
       "representative_tid": "TID_BUDDY_UNDERTAKER_GADGETS_UNLOCK",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "MORTIS' GHOST BUFFIE": {
+      "translation": "莫提斯幽灵增益挂饰",
+      "representative_tid": "TID_MORTIS_BUDDY_GHOSTLY_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -12934,6 +13988,24 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "MR. PSYCHIC": {
+      "translation": "灵能者P先生",
+      "representative_tid": "TID_BRAWLOWEEN_MRP_CHROMA_1_SHOP",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 2,
+      "disabled_references": 0
+    },
+    "MULTIBALL": {
+      "translation": "分裂弹球",
+      "representative_tid": "TID_ACCESSORY_TRICKSHOT_DUDE_BOUNCE_HEAL",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "MULTIBALL LAUNCHER": {
       "translation": "连续发球机",
       "representative_tid": "TID_ACCESSORY_RICO_SHOOT_AROUND",
@@ -12988,11 +14060,29 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "MYSTIC P": {
+      "translation": "秘法师P先生",
+      "representative_tid": "TID_BRAWLOWEEN_MRP_CHROMA_2_SHOP",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 2,
+      "disabled_references": 0
+    },
     "MYSTICAL STARR TECHNIQUE": {
       "translation": "奇妙星能",
       "representative_tid": "TID_MAGICAL_GIRL_SP_2",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "MYTHIC CHAOS DROP": {
+      "translation": "神话混沌惊喜",
+      "representative_tid": "TID_SPLITTING_STAR_MYTHIC",
+      "sources": [
+        "csv_logic/random_reward_containers"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -13090,6 +14180,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "NANI": {
+      "translation": "纳妮",
+      "representative_tid": "TID_CONTROLLER",
+      "sources": [
+        "csv_logic/characters"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "Nanny": {
       "translation": "贴心保姆",
       "representative_tid": "TID_TITLE_MASTERY_NANI",
@@ -13115,7 +14214,25 @@
         "csv_logic/locations",
         "csv_logic/skins"
       ],
-      "active_references": 2,
+      "active_references": 1,
+      "disabled_references": 1
+    },
+    "NANO SKINS": {
+      "translation": "纳米皮肤",
+      "representative_tid": "TID_NANO_WIND_SKIN_COLLECTION_1",
+      "sources": [
+        "csv_logic/skin_albums"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "NANOBOSSES": {
+      "translation": "纳米首领",
+      "representative_tid": "TID_MEGA_BOSS_TITLE_NANO_BOSSES",
+      "sources": [
+        "csv_logic/bosses"
+      ],
+      "active_references": 1,
       "disabled_references": 0
     },
     "NANONOODLE KNOCKOUT": {
@@ -13208,6 +14325,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "Net Presence": {
+      "translation": "纯净存在",
+      "representative_tid": "TID_AIR_HOCKEY_691",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "NEW": {
       "translation": "最新",
       "representative_tid": "TID_CATALOG_COLLECTION_NEW",
@@ -13253,6 +14379,24 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "NIAN NITA": {
+      "translation": "年兽妮塔",
+      "representative_tid": "TID_NIAN_NITA_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "NIGHT MECHA CROW": {
+      "translation": "暗夜机甲黑鸦",
+      "representative_tid": "TID_CROW_MECHA_NIGHT_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "NIGHT PINEAPPLE": {
       "translation": "夜间菠萝屋",
       "representative_tid": "TID_SB_ARTILLERY_2",
@@ -13265,6 +14409,15 @@
     "NIGHT SANDS LILY": {
       "translation": "暗夜沙暴莉莉",
       "representative_tid": "TID_SANDS_OF_TIME_LILY__CHROMA_2_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "NIGHT WITCH MORTIS": {
+      "translation": "暗夜女巫莫提斯",
+      "representative_tid": "TID_UNDERTAKER_NIGHTWITCH_SKIN",
       "sources": [
         "csv_logic/skins"
       ],
@@ -13442,6 +14595,24 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "NORTHERN SAGA": {
+      "translation": "北境传奇",
+      "representative_tid": "TID_SKIN_INFO_NORSEGODS",
+      "sources": [
+        "csv_logic/skin_campaigns"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Nothing Suspicious": {
+      "translation": "毫无疑点",
+      "representative_tid": "TID_HUNTERSURVIVOR_6",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "NOVA CRYSTAL": {
       "translation": "超新星水晶",
       "representative_tid": "TID_EVENT_MODIFIER_54",
@@ -13595,6 +14766,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "OLD HUNTER CROW": {
+      "translation": "老猎人黑鸦",
+      "representative_tid": "TID_DOCTOR_CROW_RED_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "OLD LOBBER": {
       "translation": "老式舰炮",
       "representative_tid": "TID_ARTILLERY_DUDE_ULTI",
@@ -13658,6 +14838,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "One Kick Man": {
+      "translation": "一脚超人",
+      "representative_tid": "TID_TITLE_PRESTIGE_FANG",
+      "sources": [
+        "csv_logic/player_titles"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "One with Nature": {
       "translation": "野性呼唤",
       "representative_tid": "TID_TITLE_MASTERY_BO",
@@ -13712,6 +14901,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "ORBIT": {
+      "translation": "星轨漫游",
+      "representative_tid": "TID_ATTRACTOR_WEAPON",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "ORDER: FALL BACK": {
       "translation": "指令：撤离",
       "representative_tid": "TID_TWINS_GADGET_2",
@@ -13735,6 +14933,15 @@
       "representative_tid": "TID_EDGAR_SERPENT_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "OTIS": {
+      "translation": "奥蒂斯",
+      "representative_tid": "TID_SILENCER",
+      "sources": [
+        "csv_logic/characters"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -13771,6 +14978,15 @@
       "representative_tid": "TID_ACCESSORY_SPLITTER_GADGET_1",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Out of this World": {
+      "translation": "不在服务区",
+      "representative_tid": "TID_TITLE_MASTERY_ATTRACTOR",
+      "sources": [
+        "csv_logic/player_titles"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -13910,6 +15126,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "PANTHER MAX": {
+      "translation": "黑豹麦克斯",
+      "representative_tid": "TID_PANTHER_MAX_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 2,
+      "disabled_references": 0
+    },
     "PAPER CORDELIUS": {
       "translation": "纸片人科迪琉斯",
       "representative_tid": "TID_TOON_DUELIST_SKIN",
@@ -13960,6 +15185,15 @@
       "representative_tid": "TID_TAGTEAM_651",
       "sources": [
         "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Paranormal Investigator": {
+      "translation": "异象调查员",
+      "representative_tid": "TID_TITLE_BATTLEPASSPLUS_SEASON55",
+      "sources": [
+        "csv_logic/player_titles"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -14081,11 +15315,29 @@
       "active_references": 2,
       "disabled_references": 0
     },
+    "Peekproof": {
+      "translation": "防窥地带",
+      "representative_tid": "TID_HUNTERSURVIVOR_2",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "PEGASUS BERRY": {
       "translation": "天马拜瑞",
       "representative_tid": "TID_PEGASUS_BERRY_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "PENNY": {
+      "translation": "潘妮",
+      "representative_tid": "TID_ARTILLERY_DUDE",
+      "sources": [
+        "csv_logic/characters"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -14451,6 +15703,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "PLANETARY PUSHBACK": {
+      "translation": "星体撞击",
+      "representative_tid": "TID_ATTRACTOR_GADGET_1",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "PLANKTON DARRYL": {
       "translation": "痞老板达里尔",
       "representative_tid": "TID_BARREL_BOT_PLANKTON_SKIN",
@@ -14465,6 +15726,15 @@
       "representative_tid": "TID_SPEC_ABI_HEAL_FOREST",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "PLAYER ICONS": {
+      "translation": "玩家头像",
+      "representative_tid": "TID_CATALOG_COLLECTION_PLAYER_ICONS",
+      "sources": [
+        "csv_logic/catalog_collections"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -14490,6 +15760,15 @@
     "PLIÉ PROTECTION": {
       "translation": "战场芭蕾",
       "representative_tid": "TID_DAREDEVIL_SP_1",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "PLOT ARMOR": {
+      "translation": "主角光环",
+      "representative_tid": "TID_SHIELD_TANK_OVERCHARGE",
       "sources": [
         "csv_logic/cards"
       ],
@@ -14550,11 +15829,47 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "POCO": {
+      "translation": "波克",
+      "representative_tid": "TID_DEAD_MARIACHI",
+      "sources": [
+        "csv_logic/characters"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "POCO STARR": {
       "translation": "星妙波克",
       "representative_tid": "TID_POCO_STARR_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "POCO'S GADGET BUFFIE": {
+      "translation": "波克妙具增益挂饰",
+      "representative_tid": "TID_BUDDY_DEAD_MARIACHI_GADGETS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "POCO'S HYPER BUFFIE": {
+      "translation": "波克极充增益挂饰",
+      "representative_tid": "TID_BUDDY_DEAD_MARIACHI_OVERCHARGE_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "POCO'S STAR BUFFIE": {
+      "translation": "波克星徽增益挂饰",
+      "representative_tid": "TID_BUDDY_DEAD_MARIACHI_STARPOWERS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -14910,6 +16225,24 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "PRECESSION": {
+      "translation": "旋进加速",
+      "representative_tid": "TID_ATTRACTOR_SP_1",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "PREHISTORIC FRANK": {
+      "translation": "史前弗兰肯",
+      "representative_tid": "TID_CAVEMAN_FRANK_CHROMA_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "PRESENT PLUNDER": {
       "translation": "夺礼奇兵",
       "representative_tid": "TID_GAME_MODE_16",
@@ -14955,6 +16288,24 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "PRINCESS SHELLY": {
+      "translation": "公主雪莉",
+      "representative_tid": "TID_PRINCESS_SHELLY_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "PRINCIPAL NANI": {
+      "translation": "校长纳妮",
+      "representative_tid": "TID_BACK_TO_SCHOOL_NANI_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "Prize Pushing": {
       "translation": "奖池累积",
       "representative_tid": "TID_UNO_7",
@@ -14987,6 +16338,15 @@
       "representative_tid": "TID_TITLE_PRESTIGE_OLLIE",
       "sources": [
         "csv_logic/player_titles"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Prop Hunt": {
+      "translation": "千变万化",
+      "representative_tid": "TID_EVENT_MODIFIER_66",
+      "sources": [
+        "csv_logic/event_modifiers"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -15099,6 +16459,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "Pump It Up": {
+      "translation": "场边助威",
+      "representative_tid": "TID_BALL_692",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "PUMPING UP": {
       "translation": "以战养战",
       "representative_tid": "TID_CRAB_SP_2",
@@ -15201,6 +16570,15 @@
     "QUEEN JUJU": {
       "translation": "王后珠珠",
       "representative_tid": "TID_CLEOPATRA_VOODOO_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "QUEEN NANI": {
+      "translation": "校园女神纳妮",
+      "representative_tid": "TID_BACK_TO_SCHOOL_NANI_CHROMA_2_SKIN",
       "sources": [
         "csv_logic/skins"
       ],
@@ -15351,11 +16729,38 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "Railroad Robbery": {
+      "translation": "铁路劫案",
+      "representative_tid": "TID_GEMGRAB_641",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "RANKED STARR DROP": {
       "translation": "排位赛星妙惊喜",
       "representative_tid": "TID_SHOP_STARR_DROP_RANKED",
       "sources": [
         "csv_logic/random_reward_containers"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "RARE CHAOS DROP": {
+      "translation": "稀有混沌惊喜",
+      "representative_tid": "TID_SPLITTING_STAR_RARE",
+      "sources": [
+        "csv_logic/random_reward_containers"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "RARE PINS": {
+      "translation": "稀有表情",
+      "representative_tid": "TID_CATALOG_COLLECTION_EMOTES_RARE",
+      "sources": [
+        "csv_logic/catalog_collections"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -15747,6 +17152,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "REPURPOSE": {
+      "translation": "机甲重置",
+      "representative_tid": "TID_ACCESSORY_MECHA_DUDE_TOWER_RELOAD",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "REROUTING": {
       "translation": "更改路线",
       "representative_tid": "TID_ACCESSORY_CONDUCTOR_GADGET_1",
@@ -15804,6 +17218,15 @@
     "RETRO ELEVEN LUMI": {
       "translation": "复古十一露米",
       "representative_tid": "TID_STRANGE_LUMI_PINK_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "RETRO NANI": {
+      "translation": "复古纳妮",
+      "representative_tid": "TID_RETRO_NANI_SKIN",
       "sources": [
         "csv_logic/skins"
       ],
@@ -16053,6 +17476,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "ROBOTS & MONSTERS": {
+      "translation": "机器人与怪兽",
+      "representative_tid": "TID_SKIN_INFO_CAMPAIGN_ROBOTSMONSTERS",
+      "sources": [
+        "csv_logic/skin_campaigns"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "ROCKABILLY MORTIS": {
       "translation": "乡村摇滚莫提斯",
       "representative_tid": "TID_UNDERTAKER_GREASER_SKIN",
@@ -16133,6 +17565,15 @@
       ],
       "active_references": 1,
       "disabled_references": 1
+    },
+    "RODEO HANK": {
+      "translation": "牛仔汉克",
+      "representative_tid": "TID_HANK_RODEO_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 2,
+      "disabled_references": 0
     },
     "ROGUE MORTIS": {
       "translation": "刀客莫提斯",
@@ -16229,6 +17670,24 @@
       "representative_tid": "TID_SKIN_INFO_ROYALS",
       "sources": [
         "csv_logic/skin_campaigns"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Royalty": {
+      "translation": "皇室高手",
+      "representative_tid": "TID_TITLE_BATTLEPASSPLUS_SEASON54",
+      "sources": [
+        "csv_logic/player_titles"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "RUBY PRINCE SPROUT": {
+      "translation": "红宝石王子芽芽",
+      "representative_tid": "TID_RUBY_PRINCE_SPROUT_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -16425,6 +17884,15 @@
     "SAKURA SPIKE": {
       "translation": "斯派克·樱",
       "representative_tid": "TID_CACTUS_PINK_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "SALLY NANI": {
+      "translation": "莎莉纳妮",
+      "representative_tid": "TID_SALLY_NANI_SKIN",
       "sources": [
         "csv_logic/skins"
       ],
@@ -16827,6 +18295,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "Seekret Passage": {
+      "translation": "搜寻通道",
+      "representative_tid": "TID_HUNTERSURVIVOR_1",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "SEISMIC EVENT": {
       "translation": "地动山摇",
       "representative_tid": "TID_DRILLER_OVERCHARGE",
@@ -16907,6 +18384,42 @@
         "csv_logic/skills"
       ],
       "active_references": 2,
+      "disabled_references": 0
+    },
+    "SHADE": {
+      "translation": "谢德",
+      "representative_tid": "TID_GHOST",
+      "sources": [
+        "csv_logic/characters"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "SHADE'S GADGET BUFFIE": {
+      "translation": "谢德妙具增益挂饰",
+      "representative_tid": "TID_BUDDY_GHOST_GADGETS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "SHADE'S HYPER BUFFIE": {
+      "translation": "谢德极充增益挂饰",
+      "representative_tid": "TID_BUDDY_GHOST_OVERCHARGE_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "SHADE'S STAR BUFFIE": {
+      "translation": "谢德星徽增益挂饰",
+      "representative_tid": "TID_BUDDY_GHOST_STARPOWERS_UNLOCK",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
       "disabled_references": 0
     },
     "SHADOW PUPPET": {
@@ -17161,6 +18674,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "SHOWDOWN+": {
+      "translation": "荒野决斗+",
+      "representative_tid": "TID_EVENT_MODIFIER_15",
+      "sources": [
+        "csv_logic/event_modifiers"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "SHREDDING": {
       "translation": "华丽扫拨",
       "representative_tid": "TID_DRAGON_RIDER_SP_2",
@@ -17211,6 +18733,15 @@
       "representative_tid": "TID_EVENT_MODIFIER_29",
       "sources": [
         "csv_logic/event_modifiers"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Side by Side": {
+      "translation": "并肩作战",
+      "representative_tid": "TID_BOUNTY_442",
+      "sources": [
+        "csv_logic/locations"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -17340,6 +18871,15 @@
       "representative_tid": "TID_SPEC_ABI_JESTER_1",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "SIRIUS": {
+      "translation": "西里乌斯",
+      "representative_tid": "TID_SHADOWDEMON",
+      "sources": [
+        "csv_logic/characters"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -17812,20 +19352,20 @@
       "active_references": 1,
       "disabled_references": 0
     },
-    "SOUL COLLECTOR": {
-      "translation": "夺魂之战",
-      "representative_tid": "TID_GAME_MODE_40",
+    "SOLO SHOWDOWN": {
+      "translation": "单人荒野决斗",
+      "representative_tid": "TID_GAME_MODE_6",
       "sources": [
         "csv_logic/game_mode_variations"
       ],
       "active_references": 1,
       "disabled_references": 0
     },
-    "SOUL SWITCHER": {
-      "translation": "灵体转换器",
-      "representative_tid": "TID_ACCESSORY_SOUL_COLLECTOR_GADGET_2",
+    "SOUL COLLECTOR": {
+      "translation": "夺魂之战",
+      "representative_tid": "TID_GAME_MODE_40",
       "sources": [
-        "csv_logic/cards"
+        "csv_logic/game_mode_variations"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -18452,6 +19992,24 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "Starr Garden": {
+      "translation": "星妙花园",
+      "representative_tid": "TID_AIR_HOCKEY_6",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "STARR GUARDIAN SPIKE": {
+      "translation": "星妙守护者斯派克",
+      "representative_tid": "TID_STARR_GIRLS_SPIKE_CHROMA_2_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "Starr Lord": {
       "translation": "群星之主",
       "representative_tid": "TID_TILE_BATTLEPASSPLUS_SEASON34",
@@ -18494,6 +20052,15 @@
       "representative_tid": "TID_MAGICAL_GIRL_OVERCHARGE",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "STARR PARK ORIGINS": {
+      "translation": "星妙乐园起源",
+      "representative_tid": "TID_SKIN_INFO_CAMPAIGN_STARRPARK",
+      "sources": [
+        "csv_logic/skin_campaigns"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -18549,6 +20116,15 @@
       "representative_tid": "TID_TITLE_BATTLEPASSPLUS_SEASON42",
       "sources": [
         "csv_logic/player_titles"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "STARR RUSH": {
+      "translation": "星妙冲刺",
+      "representative_tid": "TID_RUSH_STARR_TITLE",
+      "sources": [
+        "csv_client/special_rush_event_texts"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -18621,6 +20197,24 @@
       "representative_tid": "TID_CONDUCTOR_WEAPON",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "STEAMPUNK GALE": {
+      "translation": "蒸汽朋克格尔",
+      "representative_tid": "TID_STEAMPUNK_GALE_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "STEAMPUNK STU": {
+      "translation": "蒸汽朋克斯图",
+      "representative_tid": "TID_STU_STEAMPUNK_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -18747,6 +20341,15 @@
       "representative_tid": "TID_GEMGRAB_6102",
       "sources": [
         "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "STREET NINJA TARA": {
+      "translation": "街头忍者塔拉",
+      "representative_tid": "TID_TARA_STREET_NINJA_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -18914,6 +20517,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "SUGAR BOMB MIKE": {
+      "translation": "糖果炸弹麦克",
+      "representative_tid": "TID_DYNAMIKE_XMAS_CHROMA_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "SUGAR RAY": {
       "translation": "糖果射线",
       "representative_tid": "TID_BEAMER_ULTI",
@@ -18944,6 +20556,33 @@
     "SUGARPLUM ROSA": {
       "translation": "糖果罗莎",
       "representative_tid": "TID_SUGARPLUM_ROSA_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "SULTAN CARL": {
+      "translation": "苏丹卡尔",
+      "representative_tid": "TID_MAGIC_CARPET_CARL_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "SULTAN CORDELIUS": {
+      "translation": "苏丹科迪琉斯",
+      "representative_tid": "TID_SANDS_OF_TIME_CORDELIUS_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "SUMMER JESSIE": {
+      "translation": "夏日杰西",
+      "representative_tid": "TID_MECHANIC_SUMMER_SKIN",
       "sources": [
         "csv_logic/skins"
       ],
@@ -19117,6 +20756,15 @@
       "representative_tid": "TID_YELLOW_RANGER_BROCK_SKIN",
       "sources": [
         "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "SUPER RARE CHAOS DROP": {
+      "translation": "超稀有混沌惊喜",
+      "representative_tid": "TID_SPLITTING_STAR_SUPER_RARE",
+      "sources": [
+        "csv_logic/random_reward_containers"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -19353,6 +21001,24 @@
         "csv_logic/skins"
       ],
       "active_references": 2,
+      "disabled_references": 0
+    },
+    "SURFER CARL": {
+      "translation": "冲浪卡尔",
+      "representative_tid": "TID_SURFER_CARL_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "SURGE KONG": {
+      "translation": "金刚瑟奇",
+      "representative_tid": "TID_SURGE_KONG_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
       "disabled_references": 0
     },
     "SURGE LIGHTYEAR": {
@@ -19616,6 +21282,24 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "TANUKI JESSIE": {
+      "translation": "狸猫杰西",
+      "representative_tid": "TID_TANUKI_JESSIE_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "TANUKI SPROUT": {
+      "translation": "狸猫芽芽",
+      "representative_tid": "TID_SPROUT_TANUKI_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "TAP TARGET": {
       "translation": "锁敌一击",
       "representative_tid": "TID_SPLITTER_WEAPON",
@@ -19675,6 +21359,15 @@
       "representative_tid": "TID_PERCENTER_WEAPON",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "TEAM CAPTAIN HANK": {
+      "translation": "明星队长汉克",
+      "representative_tid": "TID_BACK_TO_SCHOOL_HANK_CHROMA_2_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -19742,6 +21435,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "TELESCOPE TRAP": {
+      "translation": "观测望远镜",
+      "representative_tid": "TID_ATTRACTOR_GADGET_2",
+      "sources": [
+        "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "TEMPERED STEEL": {
       "translation": "千锤百炼",
       "representative_tid": "TID_SPEC_ABI_CONTROLLER_2",
@@ -19778,9 +21480,27 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "TENGU MIKE": {
+      "translation": "天狗麦克",
+      "representative_tid": "TID_TENGU_MIKE_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "TENTACLE BONNIE": {
       "translation": "小章鱼邦妮",
       "representative_tid": "TID_OCTO_BONNIE_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "TERRORNAUT DAMIAN": {
+      "translation": "死亡金属达米安",
+      "representative_tid": "TID_BRAWLOWEEN_DAMIAN_SKIN",
       "sources": [
         "csv_logic/skins"
       ],
@@ -20366,6 +22086,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "Think Ahead": {
+      "translation": "未雨绸缪",
+      "representative_tid": "TID_KNOCKOUT_6201",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "THIS IS MY DOMAIN": {
       "translation": "异界决斗",
       "representative_tid": "TID_DUELIST_ULTI",
@@ -20852,6 +22581,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "TRASH GOBLIN DARRYL": {
+      "translation": "垃圾桶精\\q达里尔",
+      "representative_tid": "TID_BACK_TO_SCHOOL_DARRYL_SHOP",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "TRASH PANDA PENNY": {
       "translation": "捣蛋浣熊潘妮",
       "representative_tid": "TID_GHOST_METRO_PENNY_SKIN",
@@ -20884,6 +22622,15 @@
       "representative_tid": "TID_TITLE_PRESTIGE_ASH",
       "sources": [
         "csv_logic/player_titles"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "Tread Carefully": {
+      "translation": "谨慎行事",
+      "representative_tid": "TID_HOTZONE_691",
+      "sources": [
+        "csv_logic/locations"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -21022,6 +22769,15 @@
       ],
       "active_references": 1,
       "disabled_references": 1
+    },
+    "Triple Threat": {
+      "translation": "三重危机",
+      "representative_tid": "TID_MOBA_691",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
     },
     "Triple-Double": {
       "translation": "三双战绩",
@@ -21797,6 +23553,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "TRUE GOLD NORI": {
+      "translation": "辉金阿宪",
+      "representative_tid": "TID_TRUE_GOLD_NORI_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "TRUE GOLD OLLIE": {
       "translation": "辉金奥利",
       "representative_tid": "TID_TRUE_GOLD_OLLIE_SKIN",
@@ -22063,6 +23828,15 @@
       "representative_tid": "TID_ACH_OWN_TRUE_GOLD_SKINS_4_TITLE",
       "sources": [
         "csv_logic/records"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "TRUE GOLD WENDY": {
+      "translation": "辉金温蒂",
+      "representative_tid": "TID_TRUE_GOLD_WENDY_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -22787,6 +24561,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "TRUE SILVER NORI": {
+      "translation": "铂银阿宪",
+      "representative_tid": "TID_TRUE_SILVER_NORI_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "TRUE SILVER OLLIE": {
       "translation": "铂银奥利",
       "representative_tid": "TID_TRUE_SILVER_OLLIE_SKIN",
@@ -23057,6 +24840,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "TRUE SILVER WENDY": {
+      "translation": "铂银温蒂",
+      "representative_tid": "TID_TRUE_SILVER_WENDY_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "TRUE SILVER WILLOW": {
       "translation": "铂银薇洛",
       "representative_tid": "TID_TRUE_SILVER_WILLOW_SKIN",
@@ -23183,6 +24975,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "TWILIGHT QUEEN LILY": {
+      "translation": "暮光女皇莉莉",
+      "representative_tid": "TID_MAKE_LILY_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "TWIN SNAKES": {
       "translation": "蛇罐成双",
       "representative_tid": "TID_REDIRECTER_OVERCHARGE",
@@ -23226,6 +25027,15 @@
         "csv_logic/skins"
       ],
       "active_references": 2,
+      "disabled_references": 0
+    },
+    "ULTRA CHAOS DROP": {
+      "translation": "超凡混沌惊喜",
+      "representative_tid": "TID_SPLITTING_STAR_ULTRA",
+      "sources": [
+        "csv_logic/random_reward_containers"
+      ],
+      "active_references": 1,
       "disabled_references": 0
     },
     "ULTRA DRILLER JACKY": {
@@ -23372,6 +25182,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "Unlock Brawler Boxes": {
+      "translation": "解锁英雄宝箱",
+      "representative_tid": "TID_BRAWLER_EARLY_ACCESS_SUBTITLE_DEFAULT",
+      "sources": [
+        "csv_logic/brawler_early_access"
+      ],
+      "active_references": 3,
+      "disabled_references": 0
+    },
     "UNLUCKY JUJU": {
       "translation": "倒霉珠珠",
       "representative_tid": "TID_UNLUCKY_VOODOO_SKIN",
@@ -23496,6 +25315,15 @@
         "csv_logic/skins"
       ],
       "active_references": 2,
+      "disabled_references": 0
+    },
+    "VALKYRIE JANET": {
+      "translation": "女武神珍妮特",
+      "representative_tid": "TID_VALKYRIE_JANET_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
       "disabled_references": 0
     },
     "VAMPRIMO": {
@@ -23656,6 +25484,15 @@
       "representative_tid": "TID_SPEC_ABI_JETPACK_GIRL_2",
       "sources": [
         "csv_logic/cards"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
+    "VOID AMBER": {
+      "translation": "虚空琥珀",
+      "representative_tid": "TID_STARR_GIRLS_AMBER_CHROMA_1_SKIN",
+      "sources": [
+        "csv_logic/skins"
       ],
       "active_references": 1,
       "disabled_references": 0
@@ -24408,6 +26245,15 @@
       "active_references": 1,
       "disabled_references": 0
     },
+    "XENOMECH MAX": {
+      "translation": "异星战甲麦克斯",
+      "representative_tid": "TID_BRAWLOWEEN_MISC_MAX_SKIN",
+      "sources": [
+        "csv_logic/skins"
+      ],
+      "active_references": 1,
+      "disabled_references": 0
+    },
     "YEAR OF THE DRAGON PIN PACK": {
       "translation": "龙年大吉表情礼包",
       "representative_tid": "TID_EMOTE_BUNDLE_LNY_DRAGON",
@@ -25027,6 +26873,15 @@
       "representative_tid": "TID_EVENT_MODIFIER_8",
       "sources": [
         "csv_logic/event_modifiers"
+      ],
+      "active_references": 0,
+      "disabled_references": 1
+    },
+    "BOSS TECH TARA": {
+      "translation": "首领科幻塔拉",
+      "representative_tid": "TID_MEGA_BOSS_BLACKHOLE",
+      "sources": [
+        "csv_logic/locations"
       ],
       "active_references": 0,
       "disabled_references": 1
@@ -25736,6 +27591,15 @@
     "Dancing Roof": {
       "translation": "闪亮舞台",
       "representative_tid": "TID_BASKET_484",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 0,
+      "disabled_references": 1
+    },
+    "Danger Chamber": {
+      "translation": "危险密室",
+      "representative_tid": "TID_TAGTEAM_12",
       "sources": [
         "csv_logic/locations"
       ],
@@ -26471,6 +28335,15 @@
       "active_references": 0,
       "disabled_references": 1
     },
+    "Freezing ripples": {
+      "translation": "冰冻涟漪",
+      "representative_tid": "TID_BRAWLBALL_5V5_1",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 0,
+      "disabled_references": 1
+    },
     "Frenemies": {
       "translation": "亦敌亦友",
       "representative_tid": "TID_BOSS_RACE_3",
@@ -26485,15 +28358,6 @@
       "representative_tid": "TID_LAST_STAND_5",
       "sources": [
         "csv_logic/locations"
-      ],
-      "active_references": 0,
-      "disabled_references": 1
-    },
-    "FRIENDLY FIRE": {
-      "translation": "队友别开枪",
-      "representative_tid": "TID_EVENT_MODIFIER_45",
-      "sources": [
-        "csv_logic/event_modifiers"
       ],
       "active_references": 0,
       "disabled_references": 1
@@ -26681,6 +28545,15 @@
     "Glass Half Full": {
       "translation": "半杯不溢",
       "representative_tid": "TID_GEMGRAB_441",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 0,
+      "disabled_references": 1
+    },
+    "Goalkeeper's Dream": {
+      "translation": "守门员之梦",
+      "representative_tid": "TID_BALL_541",
       "sources": [
         "csv_logic/locations"
       ],
@@ -27304,15 +29177,6 @@
       "representative_tid": "TID_JELLY_CATCH_577",
       "sources": [
         "csv_logic/locations"
-      ],
-      "active_references": 0,
-      "disabled_references": 1
-    },
-    "LOADED WALLS": {
-      "translation": "重装上阵",
-      "representative_tid": "TID_EVENT_MODIFIER_50",
-      "sources": [
-        "csv_logic/event_modifiers"
       ],
       "active_references": 0,
       "disabled_references": 1
@@ -28064,6 +29928,15 @@
       "active_references": 0,
       "disabled_references": 1
     },
+    "Power Washer": {
+      "translation": "高压清洗机",
+      "representative_tid": "TID_SIEGE_JUNE21_1",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 0,
+      "disabled_references": 1
+    },
     "PRESTIGE I": {
       "translation": "威名远扬I",
       "representative_tid": "TID_ACH_EARN_PRESTIGE_1_TITLE",
@@ -28616,6 +30489,15 @@
     "Shabby Shells": {
       "translation": "残破贝壳",
       "representative_tid": "TID_GOLDRUSH_44",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 0,
+      "disabled_references": 1
+    },
+    "Shadow Spirits": {
+      "translation": "暗影精灵",
+      "representative_tid": "TID_BATTLE_ROYALE_49",
       "sources": [
         "csv_logic/locations"
       ],
@@ -30116,6 +31998,15 @@
       "active_references": 0,
       "disabled_references": 1
     },
+    "Winter Party": {
+      "translation": "冬日派对",
+      "representative_tid": "TID_JAN2021MAPS_2",
+      "sources": [
+        "csv_logic/locations"
+      ],
+      "active_references": 0,
+      "disabled_references": 1
+    },
     "Wrecking Ball": {
       "translation": "拆迁专家",
       "representative_tid": "TID_ACH_DEAL_DAMAGE_TO_TOWERS_IN_MOBA_TITLE",
@@ -30275,6 +32166,14 @@
       "translation": "一大箱宝石",
       "reason": "ignored_or_unreferenced"
     },
+    "HAWKINS HUNT": {
+      "translation": "霍金斯镇激战",
+      "reason": "ignored_or_unreferenced"
+    },
+    "HIS MOTHER’S SON": {
+      "translation": "忍者风范",
+      "reason": "ignored_or_unreferenced"
+    },
     "Holiday Pack": {
       "translation": "节日礼包",
       "reason": "ignored_or_unreferenced"
@@ -30353,6 +32252,10 @@
     },
     "SMALL IS BEAUTIFUL": {
       "translation": "玲珑之美",
+      "reason": "ignored_or_unreferenced"
+    },
+    "SOUL SWITCHER": {
+      "translation": "灵体转换器",
       "reason": "ignored_or_unreferenced"
     },
     "STAR POWER": {

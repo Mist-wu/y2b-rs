@@ -1,6 +1,7 @@
 import json
 import re
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 
@@ -45,7 +46,9 @@ class AiResourceTests(unittest.TestCase):
         glossary = self.documents["brawl-stars-glossary.json"]
         self.assertEqual(glossary["version"], 2)
         self.assertEqual(glossary["language_pair"], "en-CN")
-        self.assert_non_empty_string(glossary["game_version"])
+        if glossary["game_version"] is not None:
+            self.assert_non_empty_string(glossary["game_version"])
+        datetime.fromisoformat(glossary["source"]["generated_at"].replace("Z", "+00:00"))
 
         selection = glossary["selection"]
         self.assertEqual(selection["active_entries"], len(glossary["active"]))

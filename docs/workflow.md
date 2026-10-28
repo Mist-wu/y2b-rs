@@ -66,14 +66,18 @@ python3 scripts/audit_brawl_glossary.py \
   --models deepseek-flash \
   --output /tmp/y2b-brawl-glossary-audit.json
 
-# 用已有模型错误并集重建分层生产词库
+# 合并现有校订和本轮模型错误，使用同一数据快照重建生产词库
 python3 scripts/audit_brawl_glossary.py \
   --models '' \
+  --terms-file /tmp/y2b-brawl-glossary-audit.json \
   --output /tmp/y2b-brawl-glossary-extract.json \
   --production-from pi/brawl-stars-glossary.json \
+  --audit-from /tmp/y2b-brawl-glossary-audit.json \
   --production-output pi/brawl-stars-glossary.json
 ```
 
 脚本固定 `deepseek/deepseek-flash` + `thinking=off`，与生产服务一样只从服务器 `/var/lib/y2b/pi-agent/auth.json` 读取 DeepSeek 凭据，默认使用不含答案的 `pi/audit-policy.json`；`--server` 不是 `root@` 时远程命令自动加 `sudo -n`。审计模式下不加载生产词库，避免污染能力测试。支持 `--terms-file` 复用提取结果、`--resume` 断点续跑、`--shard-index/--shard-count` 分片；单词超时或失败计入错误并继续。
+
+生产词库只接受同一快照的完整审计；API 失败留下的空结果会阻止合并。`source.generated_at` 记录镜像时间，只有确认客户端版本时才设置 `--game-version`，否则版本为 `null`。人工 `policy.json` 校订保持独立。
 
 </details>

@@ -16,6 +16,7 @@ import time
 import unicodedata
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -425,8 +426,50 @@ def build_production_glossary(
     terms: list[Term],
     source_metadata: dict[str, Any],
     previous: dict[str, Any],
+    audit_report: dict[str, Any] | None = None,
+    game_version: str | None = None,
 ) -> dict[str, Any]:
     failures = previous_glossary(previous)
+    audit = previous.get("audit", {})
+    if audit_report is not None:
+        expected_terms = [(term.source, term.target, term.tid) for term in terms]
+        audited_terms = [
+            (row["source"], row["target"], row["tid"])
+            for row in audit_report.get("terms", [])
+        ]
+        if (
+            audited_terms != expected_terms
+            or audit_report.get("source") != source_metadata
+        ):
+            raise ValueError("audit report must use the same terminology snapshot")
+        result = audit_report.get("models", {}).get(AI_MODEL, {})
+        mismatches = result.get("failures")
+        if (
+            not isinstance(mismatches, list)
+            or result.get("total") != len(terms)
+            or result.get("exact", -1) + len(mismatches) != len(terms)
+            or any(not row.get("actual", "").strip() for row in mismatches)
+        ):
+            raise ValueError("a complete successful DeepSeek audit is required")
+        merged = {normalize(source): (source, target) for source, target in failures.items()}
+        targets = {term.source: term.target for term in terms}
+        for row in mismatches:
+            if targets.get(row["source"]) != row["expected"]:
+                raise ValueError("audit expected translation differs from the source snapshot")
+            merged[normalize(row["source"])] = (row["source"], row["expected"])
+        audit = {
+            "provider": "deepseek",
+            "model": AI_MODEL,
+            "thinking": "off",
+            "strategy": "retain previous corrections and add current model mismatches",
+            "completed_at": result.get("completed_at"),
+            "tested": result["total"],
+            "exact": result["exact"],
+            "failures": len(mismatches),
+            "retained_failure_inputs": len(failures),
+            "union_failures": len(merged),
+        }
+        failures = dict(merged.values())
     failed_normalized = {normalize(source) for source in failures}
     active: dict[str, Any] = {}
     legacy: dict[str, Any] = {}
@@ -461,9 +504,22 @@ def build_production_glossary(
     )
     return {
         "version": 2,
-        "game_version": previous.get("game_version"),
+        # 镜像只报告生成时间时，不把旧客户端版本号沿用到新快照。
+        "game_version": game_version or (
+            previous.get("game_version")
+            if previous.get("source", {}).get("generated_at")
+            == source_metadata["localization_generated_at"]
+            else None
+        ),
         "language_pair": previous.get("language_pair", "en->zh-CN"),
-        "source": previous.get("source", {}),
+        "source": {
+            "kind": "Brawl Stars client localization mirror",
+            "api": source_metadata["api_root"],
+            "english": f"{source_metadata['api_root']}/v2/raw/localization/texts",
+            "simplified_chinese": f"{source_metadata['api_root']}/v2/raw/localization/cn",
+            "patch": f"{source_metadata['api_root']}/v2/raw/localization/texts_patch",
+            "generated_at": source_metadata["localization_generated_at"],
+        },
         "selection": {
             "localization_rows": source_metadata["localization_rows"],
             "referenced_tids": source_metadata["referenced_tids"],
@@ -478,7 +534,7 @@ def build_production_glossary(
             "excluded_or_unreferenced_failures": excluded,
             "ignored_reference_paths": source_metadata["ignored_reference_paths"],
         },
-        "audit": previous.get("audit", {}),
+        "audit": audit,
         "curated": {
             "source": "policy.json",
             "precedence": "highest",
@@ -527,7 +583,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--policy", default="/opt/y2b/pi/audit-policy.json")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--workers", type=positive_int, default=16)
-    parser.add_argument("--game-version", default="68.250")
+    parser.add_argument(
+        "--game-version",
+        help="Confirmed client version; otherwise record the source timestamp only",
+    )
     parser.add_argument("--shard-index", type=nonnegative_int, default=0)
     parser.add_argument("--shard-count", type=positive_int, default=1)
     parser.add_argument(
@@ -546,6 +605,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Write a layered production glossary",
     )
     parser.add_argument(
+        "--audit-from",
+        type=pathlib.Path,
+        help="Merge a complete DeepSeek audit of the same terms into the existing glossary",
+    )
+    parser.add_argument(
         "--output",
         type=pathlib.Path,
         default=pathlib.Path("/tmp/y2b-brawl-glossary-audit.json"),
@@ -562,12 +626,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--production-from and --production-output must be used together")
     if args.production_from and args.shard_count != 1:
         parser.error("production glossary generation requires --shard-count 1")
+    if args.audit_from and not args.production_from:
+        parser.error("--audit-from requires --production-from and --production-output")
     return args
 
 
 def main() -> int:
     args = parse_args()
     models = [model.strip() for model in args.models.split(",") if model.strip()]
+    game_version = args.game_version
 
     if args.terms_file:
         extracted = json.loads(args.terms_file.read_text(encoding="utf-8"))
@@ -584,6 +651,7 @@ def main() -> int:
             for row in extracted["terms"]
         ]
         source_metadata = extracted["source"]
+        game_version = game_version or extracted.get("game_version")
         print(f"loaded {len(terms)} extracted terms", flush=True)
     else:
         print("extracting official terminology", flush=True)
@@ -609,7 +677,13 @@ def main() -> int:
         raise SystemExit("selected shard must contain at least one term")
     if args.production_from and args.production_output:
         previous = json.loads(args.production_from.read_text(encoding="utf-8"))
-        production = build_production_glossary(terms, source_metadata, previous)
+        audit_report = (
+            json.loads(args.audit_from.read_text(encoding="utf-8"))
+            if args.audit_from else None
+        )
+        production = build_production_glossary(
+            terms, source_metadata, previous, audit_report, game_version
+        )
         write_report(args.production_output, production)
         print(
             f"production glossary: active={len(production['active'])} "
@@ -625,7 +699,7 @@ def main() -> int:
             raise RuntimeError("resume report terminology does not match this extraction")
     else:
         report = {
-            "game_version": args.game_version,
+            "game_version": game_version,
             "source": source_metadata,
             "terms": [dataclasses.asdict(term) for term in terms],
             "models": {},
@@ -691,6 +765,7 @@ def main() -> int:
             failures.append(failure)
             suggested[term.source] = term.target
         result = {
+            "completed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "total": len(terms),
             "exact": len(terms) - len(failures),
             "accuracy": (len(terms) - len(failures)) / len(terms),
@@ -709,9 +784,7 @@ def main() -> int:
             flush=True,
         )
 
-    print(
-        f"union failures={len(suggested)} report={args.output}", flush=True
-    )
+    print(f"report={args.output}", flush=True)
     return 0
 
 
