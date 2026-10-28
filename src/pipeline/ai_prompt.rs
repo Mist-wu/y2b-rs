@@ -14,7 +14,6 @@ struct Term {
 
 struct Pattern {
     regex: Regex,
-    left_boundary: bool,
     right_boundary: bool,
     translation: String,
 }
@@ -95,21 +94,26 @@ impl PromptPolicy {
                 else {
                     continue;
                 };
-                // Rust regex 不支持 lookaround；边界在匹配后检查，保留现有词库规则语义。
+                // 左边界必须参与搜索，避免先匹配后过滤时跳过逗号后的合法数值。
+                // 捕获组 1 保留原始词条，排除为模拟 lookbehind 消耗的前导字符。
                 let left_boundary = pattern.starts_with("(?<![A-Za-z0-9])");
                 let right_boundary = pattern.ends_with("(?![A-Za-z0-9])");
                 let core = pattern
                     .trim_start_matches("(?<![A-Za-z0-9])")
                     .trim_end_matches("(?![A-Za-z0-9])");
+                let core = if left_boundary {
+                    format!("(?:^|[^A-Za-z0-9])({core})")
+                } else {
+                    format!("({core})")
+                };
                 let flags = rule["flags"].as_str().unwrap_or("i");
                 patterns.push(Pattern {
-                    regex: RegexBuilder::new(core)
+                    regex: RegexBuilder::new(&core)
                         .case_insensitive(flags.contains('i'))
                         .multi_line(flags.contains('m'))
                         .dot_matches_new_line(flags.contains('s'))
                         .build()
                         .context("官方词库 pattern 无效")?,
-                    left_boundary,
                     right_boundary,
                     translation: translation.into(),
                 });
@@ -137,20 +141,20 @@ impl PromptPolicy {
         }
         for pattern in &self.patterns {
             for captures in pattern.regex.captures_iter(input) {
-                let matched = captures.get(0).expect("regex whole match");
+                let matched = captures.get(1).expect("regex term capture");
                 if !boundary_matches(
                     input,
                     matched.start(),
                     matched.end(),
-                    pattern.left_boundary,
+                    false,
                     pattern.right_boundary,
                 ) {
                     continue;
                 }
                 let mut translation = pattern.translation.clone();
-                for index in 1..captures.len() {
+                for index in 2..captures.len() {
                     translation = translation.replace(
-                        &format!("{{{index}}}"),
+                        &format!("{{{}}}", index - 1),
                         captures.get(index).map_or("", |m| m.as_str()),
                     );
                 }
@@ -204,6 +208,17 @@ mod tests {
         assert_eq!(value["50 Power Points"], "50战力能量");
         assert_eq!(value["3 Bling"], "3闪闪币");
         assert!(policy.glossary("buzzing").get("Buzz").is_none());
+        let fallback = policy.glossary("x1,200 Gems x3,500 Coins x1.200 Power Points x1.20 Bling");
+        assert_eq!(fallback["200 Gems"], "200宝石");
+        assert_eq!(fallback["500 Coins"], "500金币");
+        assert_eq!(fallback["200 Power Points"], "200战力能量");
+        assert_eq!(fallback["20 Bling"], "20闪闪币");
+        assert!(
+            policy
+                .glossary("x200 Coins 200 Coinsx")
+                .get("200 Coins")
+                .is_none()
+        );
         let audit = PromptPolicy::load(&path.with_file_name("audit-policy.json")).unwrap();
         assert_eq!(audit.glossary("Buzz 50 Gems"), serde_json::json!({}));
     }
