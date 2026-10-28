@@ -310,6 +310,28 @@ fn channel_topic(youtube_channel_id: &str) -> String {
     format!("https://www.youtube.com/xml/feeds/videos.xml?channel_id={youtube_channel_id}")
 }
 
+fn topic_matches_channel(topic: &str, youtube_channel_id: &str) -> bool {
+    let Ok(topic) = reqwest::Url::parse(topic) else {
+        return false;
+    };
+    // YouTube 的订阅地址和 Atom self 链接使用不同的协议、域名别名和 feed 路径。
+    // 仅兼容这些已知写法，频道参数仍必须唯一且精确匹配。
+    if !matches!(topic.scheme(), "http" | "https")
+        || !matches!(topic.host_str(), Some("www.youtube.com" | "youtube.com"))
+        || !topic.username().is_empty()
+        || topic.password().is_some()
+        || topic.port().is_some()
+        || topic.fragment().is_some()
+        || !matches!(topic.path(), "/feeds/videos.xml" | "/xml/feeds/videos.xml")
+    {
+        return false;
+    }
+    let mut params = topic.query_pairs();
+    params.next().is_some_and(|(key, value)| {
+        key == "channel_id" && !value.is_empty() && value == youtube_channel_id
+    }) && params.next().is_none()
+}
+
 fn renewal_lead_seconds() -> u64 {
     WEBSUB_LEASE_SECONDS * (100 - WEBSUB_RENEWAL_PERCENT) / 100
 }
@@ -343,7 +365,9 @@ async fn verify_subscription(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if query.mode != "subscribe" || query.topic != channel_topic(&channel.youtube_channel_id) {
+    if query.mode != "subscribe"
+        || !topic_matches_channel(&query.topic, &channel.youtube_channel_id)
+    {
         return (StatusCode::BAD_REQUEST, "invalid verification topic").into_response();
     }
     let lease_seconds = query
@@ -404,8 +428,7 @@ async fn receive_notification(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let expected_topic = channel_topic(&channel.youtube_channel_id);
-    let videos = match parse_atom_notification(&body, &expected_topic) {
+    let videos = match parse_atom_notification(&body, &channel.youtube_channel_id) {
         Ok(videos) => videos,
         Err(error) => {
             tracing::warn!(channel_id = channel.id, error = %error, "WebSub Atom 通知无效");
@@ -462,11 +485,15 @@ struct NotificationVideo {
     published_at: Option<DateTime<Utc>>,
 }
 
-fn parse_atom_notification(body: &[u8], expected_topic: &str) -> Result<Vec<NotificationVideo>> {
+fn parse_atom_notification(
+    body: &[u8],
+    youtube_channel_id: &str,
+) -> Result<Vec<NotificationVideo>> {
     let feed = parser::parse(body).context("Atom XML 解析失败")?;
     anyhow::ensure!(
         feed.links.iter().any(|link| {
-            link.rel.as_deref() == Some("self") && link.href.as_str() == expected_topic
+            link.rel.as_deref() == Some("self")
+                && topic_matches_channel(&link.href, youtube_channel_id)
         }),
         "通知 topic 不是已知频道"
     );
@@ -571,10 +598,40 @@ mod tests {
         format!("sha1={}", hex::encode(mac.finalize().into_bytes()))
     }
 
+    #[test]
+    fn topic_aliases_still_require_the_expected_youtube_channel() {
+        for scheme in ["http", "https"] {
+            for host in ["youtube.com", "www.youtube.com"] {
+                for path in ["/feeds/videos.xml", "/xml/feeds/videos.xml"] {
+                    let topic = format!("{scheme}://{host}{path}?channel_id=UC-websub");
+                    assert!(topic_matches_channel(&topic, "UC-websub"), "{topic}");
+                }
+            }
+        }
+        for topic in [
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UC-another",
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UC-websub-extra",
+            "https://www.youtube.com.evil.example/feeds/videos.xml?channel_id=UC-websub",
+            "https://evil.example/feeds/videos.xml?channel_id=UC-websub",
+            "https://user@www.youtube.com/feeds/videos.xml?channel_id=UC-websub",
+            "https://www.youtube.com:8443/feeds/videos.xml?channel_id=UC-websub",
+            "ftp://www.youtube.com/feeds/videos.xml?channel_id=UC-websub",
+            "https://www.youtube.com/other?channel_id=UC-websub",
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UC-websub&channel_id=UC-another",
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UC-websub&extra=1",
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UC-websub#fragment",
+            "https://www.youtube.com/feeds/videos.xml?channel_id=",
+            "https://www.youtube.com/feeds/videos.xml",
+            "not a URL",
+        ] {
+            assert!(!topic_matches_channel(topic, "UC-websub"), "{topic}");
+        }
+    }
+
     #[tokio::test]
     async fn hmac_accepts_correct_and_rejects_wrong_or_missing_signature() {
         let (_dir, db, service, _) = setup();
-        let body = atom(&channel_topic("UC-websub"));
+        let body = atom("http://www.youtube.com/feeds/videos.xml?channel_id=UC-websub");
         let request = |signature_header: Option<&str>| {
             let mut builder = Request::builder()
                 .method("POST")
@@ -630,12 +687,12 @@ mod tests {
     #[tokio::test]
     async fn verification_returns_challenge_and_records_lease() {
         let (_dir, db, service, id) = setup();
-        let topic = channel_topic("UC-websub");
+        let topic = "http://www.youtube.com/feeds/videos.xml?channel_id=UC-websub";
         let url = reqwest::Url::parse_with_params(
             &format!("http://localhost/websub/{CALLBACK_PATH}"),
             &[
                 ("hub.mode", "subscribe"),
-                ("hub.topic", topic.as_str()),
+                ("hub.topic", topic),
                 ("hub.challenge", "challenge-body"),
                 ("hub.lease_seconds", "432000"),
             ],
