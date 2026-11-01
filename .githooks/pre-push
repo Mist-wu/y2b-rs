@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Pushes to main get no CI run, so the checks run here; Gitleaks runs here so a secret never leaves the machine.
+# One-time setup per clone: git config core.hooksPath .githooks
+# Skip in an emergency: git push --no-verify
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+zero=0000000000000000000000000000000000000000
+while read -r _ local_sha _ remote_sha; do
+  [[ "$local_sha" == "$zero" ]] && continue
+  if [[ "$remote_sha" == "$zero" ]]; then range="$local_sha --not --remotes"; else range="$remote_sha..$local_sha"; fi
+  gitleaks git --no-banner --redact -i .github/workflows/gitleaksignore --log-opts="$range"
+done
+
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 -m unittest discover -s deploy/tests -p 'test_*.py'
+python3 -m unittest discover -s .github/workflows/tests -p 'test_*.py'
+shellcheck deploy/*.sh

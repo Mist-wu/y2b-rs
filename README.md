@@ -22,7 +22,7 @@
 - 调度与限流：RSS、Data API 和 WebSub 三路发现新视频。yt-dlp 回退有单频道冷却和全局熔断（10 分钟最多 3 次）。B 站返回限流码 `21566` 时，全局冷却 6 小时后自动重试。
 - LLM 翻译带游戏词库：从游戏客户端本地化资源提取官方译名，按“人工校订 > 数值模板 > 现行 > 历史”四层优先级注入。每次只注入字幕里实际出现的词条，控制 token 用量。
 - 进程与内存限制：外部命令独占 Unix 进程组，超时时清理整棵进程树，不留孤儿进程。systemd 限制 `MemoryMax=1600M`，准备、上传、字幕三个 worker 分开排队。
-- CI 门禁：`cargo fmt`、`clippy -D warnings`、测试、依赖漏洞审计和 Gitleaks 全历史扫描，任一失败就阻断合并。
+- 门禁：push 前本地 hook 跑 Gitleaks、`cargo fmt`、`clippy -D warnings` 和测试；PR 上 CI 再跑 clippy 和测试；依赖漏洞审计在 `Cargo.lock` 变动时和每周跑。详见 `docs/deploy.md`。
 
 ## 工作原理
 

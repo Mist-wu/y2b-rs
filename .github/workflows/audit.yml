@@ -1,0 +1,29 @@
+name: 依赖审计
+
+# Only when dependencies change, plus weekly for newly published advisories.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.lock
+  schedule:
+    - cron: '0 1 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      # Prebuilt binary, a few seconds instead of a 2–3 minute cargo install.
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-audit@0.22.2
+      # vulnerability fails the run; unmaintained/yanked warnings are only reported.
+      - run: cargo audit

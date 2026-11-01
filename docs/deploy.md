@@ -4,22 +4,13 @@
 
 ## 强失败质量门禁
 
-本地按改动范围跑对应的那几条就行，剩下的交给 CI：
+门禁以本地为主：`.githooks/pre-push` 在每次 push 前依次跑 Gitleaks（只扫这次要推的提交）、`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-features`、三组 Python 单元测试和 `shellcheck deploy/*.sh`，任一失败就不推。每个克隆执行一次 `git config core.hooksPath .githooks`；紧急时 `git push --no-verify`。Gitleaks 在本地拦截，密钥不会先到公开仓库；测试假 Key 只按 `.github/workflows/gitleaksignore` 里的 fingerprint 精确放行。
 
-```bash
-# 改 Rust
-cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test
-# 改 AI 策略/词库
-python3 -m unittest discover -s .github/workflows/tests -p 'test_*.py'
-# 改 scripts/
-python3 -m unittest discover -s scripts -p 'test_*.py'
-# 改 deploy/
-python3 -m unittest discover -s deploy/tests -p 'test_*.py' && shellcheck deploy/*.sh
-```
+CI 只在 PR 上跑（`.github/workflows/ci.yml`，一个 job，带 Rust 缓存）：clippy、测试、Python 测试和 shellcheck；纯文档改动不触发。push 到 main 不跑 CI。
 
-CI 只有一个工作流 `.github/workflows/ci.yml`，四个并行 job：Rust、脚本与配置、依赖审计、Gitleaks。格式、测试、脚本语法、Gitleaks 以及真正的 RustSec vulnerability 都是**强失败门禁**：任一命令非零退出就阻断合并和发布。Gitleaks 扫描完整历史，仓库中的测试假 Key 只按唯一 fingerprint 精确放行。
+依赖审计单独放在 `.github/workflows/audit.yml`：`Cargo.lock` 改动推到 main 时和每周一跑一次。
 
-`cargo audit` 的 vulnerability 会阻断 CI；unmaintained、yanked 等维护告警只提示。已移除 Pi extension 的 TypeScript/npm 工具链，Node 仅用于服务器上的 yt-dlp PO Token Provider。
+`cargo audit` 的 vulnerability 会让审计失败；unmaintained、yanked 等维护告警只提示。已移除 Pi extension 的 TypeScript/npm 工具链，Node 仅用于服务器上的 yt-dlp PO Token Provider。
 
 ## 部署
 
