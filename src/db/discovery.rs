@@ -519,7 +519,7 @@ impl Database {
     ) -> Result<Vec<VideoCandidate>> {
         let c = self.conn();
         let mut q = c.prepare(&format!(
-            "SELECT {CANDIDATE_COLUMNS} FROM video_candidates WHERE gate_state='pending' OR (gate_state='deferred' AND next_gate_at<=?) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=video_candidates.channel_id),0) DESC,discovered_at LIMIT ?"
+            "SELECT {CANDIDATE_COLUMNS} FROM video_candidates LEFT JOIN channels ON channels.id=video_candidates.channel_id WHERE gate_state='pending' OR (gate_state='deferred' AND next_gate_at<=?) ORDER BY CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END DESC,discovered_at LIMIT ?"
         ))?;
         Ok(q.query_map(
             params![format_timestamp(now), limit as i64],
