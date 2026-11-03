@@ -46,7 +46,8 @@ const YOUTUBE_EXTRACTOR_ARGS: &str = "youtube:player_client=web_creator";
 /// 加过，但那是误诊——真正的原因是部署机到 `74.125.0.0/16` 整段不可达，两个地址
 /// 族都连不上。而 `--force-ipv4`（实现上等价于 `--source-address 0.0.0.0`）在当前
 /// yt-dlp 版本下会让本来正常的域名解析报 `[Errno -9] Address family for hostname
-/// not supported`，属于净负面。
+/// not supported`，属于净负面。需要走 IPv4 时由 `deploy/bootstrap-server.sh`
+/// 在 `/etc/gai.conf` 里设置系统级优先级。
 pub(crate) fn ytdlp_command(config: &YoutubeConfig) -> Command {
     let mut cmd = Command::new(&config.yt_dlp);
     // 2026-08 起默认的 web_safari 客户端会在服务器账号上稳定返回

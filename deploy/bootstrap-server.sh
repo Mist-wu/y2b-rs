@@ -20,6 +20,12 @@ install -d /etc/sysctl.d
 printf 'vm.swappiness=10\n' >/etc/sysctl.d/99-y2b-swap.conf
 sysctl --system >/dev/null
 
+# 2026-11-02 起 YouTube 对部署机的 IPv6 地址返回 UNPLAYABLE（所有客户端、有无
+# cookies 都一样），IPv4 正常。在系统层面让 getaddrinfo 优先 IPv4，yt-dlp 和
+# reqwest 都会跟随，无需改代码；glibc 检测到 gai.conf 变化会自动重载，无需重启服务。
+gai_rule='precedence ::ffff:0:0/96  100'
+grep -qxF "$gai_rule" /etc/gai.conf 2>/dev/null || printf '%s\n' "$gai_rule" >>/etc/gai.conf
+
 if ! command -v node >/dev/null || [[ $(node -p 'Number(process.versions.node.split(".")[0])') -lt 24 ]]; then
   curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
   apt-get install -y nodejs
