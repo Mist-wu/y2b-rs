@@ -116,10 +116,10 @@ pub struct WebSubChannel {
 }
 
 const CHANNEL_COLUMNS: &str = "id,youtube_channel_id,name,url,enabled,transfer_mode,priority,last_checked_at,last_error,next_poll_at,consecutive_failures,uploads_playlist_id,next_data_api_poll_at,data_api_etag,websub_lease_expires_at,websub_last_received_at";
-const CANDIDATE_COLUMNS: &str = "video_id,channel_id,url,title,published_at,source,discovered_at,gate_state,gate_attempts,next_gate_at,last_error,source_language,source_language_mismatch";
+const CANDIDATE_COLUMNS: &str = "video_candidates.video_id,video_candidates.channel_id,video_candidates.url,video_candidates.title,video_candidates.published_at,video_candidates.source,video_candidates.discovered_at,video_candidates.gate_state,video_candidates.gate_attempts,video_candidates.next_gate_at,video_candidates.last_error,video_candidates.source_language,video_candidates.source_language_mismatch";
 const WEBSUB_CHANNEL_COLUMNS: &str = "id,youtube_channel_id,name,enabled,websub_lease_expires_at,websub_secret,websub_callback_path,websub_last_received_at";
 /// jobs 表业务列清单，供所有按 id/video_id/队列查询复用。
-const JOB_COLUMNS: &str = "id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,is_short,duration_seconds,width,height,bvid,provider,ai_model,thinking,attempt,error,subtitle_attempt";
+const JOB_COLUMNS: &str = "jobs.id,jobs.channel_id,jobs.video_id,jobs.url,jobs.title,jobs.status,jobs.transfer_mode,jobs.published_at,jobs.youtube_updated_at,jobs.discovered_at,jobs.is_short,jobs.duration_seconds,jobs.width,jobs.height,jobs.bvid,jobs.provider,jobs.ai_model,jobs.thinking,jobs.attempt,jobs.error,jobs.subtitle_attempt";
 /// ai_calls 用量聚合列，供全局/按任务/按频道汇总复用。
 const AI_USAGE_SELECT: &str = "COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(cache_read_tokens),0),COALESCE(SUM(cache_write_tokens),0),COALESCE(SUM(total_tokens),0),SUM(cost)";
 /// 原始调用与已归档汇总的统一用量数据源。
