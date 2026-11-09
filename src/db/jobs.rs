@@ -75,11 +75,12 @@ impl Database {
             (now - chrono::Duration::minutes(Self::LEGACY_RETRY_MINUTES)).to_rfc3339();
         let sql = format!(
             "UPDATE jobs SET status='inspecting',claim_kind='{PREPARE_CLAIM_KIND}',claim_owner=?1,claim_expires_at=?2,error=NULL,updated_at=?3 \
-             WHERE id=(SELECT id FROM jobs \
+             WHERE id=(SELECT jobs.id FROM jobs \
+               LEFT JOIN channels ON channels.id=jobs.channel_id \
                WHERE (status='queued' OR (status='retry_wait' AND ((retry_at IS NULL AND updated_at<=?4) OR retry_at<=?5))) \
                  AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?5) \
                  AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?5) \
-               ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1) \
+               ORDER BY CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END DESC,discovered_at LIMIT 1) \
              RETURNING {JOB_COLUMNS}"
         );
         self.job_opt(
@@ -244,7 +245,7 @@ impl Database {
         let due = Self::retry_due_clause("updated_at");
         self.job_opt(
             &format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE (status='queued' OR (status='retry_wait' AND ({due}))) AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1"
+                "SELECT {JOB_COLUMNS} FROM jobs LEFT JOIN channels ON channels.id=jobs.channel_id WHERE (status='queued' OR (status='retry_wait' AND ({due}))) AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?) ORDER BY CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END DESC,discovered_at LIMIT 1"
             ),
             params![legacy_before, &now, &now],
         )
@@ -255,7 +256,7 @@ impl Database {
         let due = Self::retry_due_clause("updated_at");
         self.job_opt(
             &format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE (status='ready_to_upload' OR (status='upload_retry_wait' AND ({due}))) AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?) ORDER BY COALESCE((SELECT CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END FROM channels WHERE channels.id=jobs.channel_id),0) DESC,discovered_at LIMIT 1"
+                "SELECT {JOB_COLUMNS} FROM jobs LEFT JOIN channels ON channels.id=jobs.channel_id WHERE (status='ready_to_upload' OR (status='upload_retry_wait' AND ({due}))) AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?) ORDER BY CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END DESC,discovered_at LIMIT 1"
             ),
             params![legacy_before, &now, &now],
         )
