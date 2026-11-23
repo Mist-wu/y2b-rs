@@ -440,7 +440,7 @@ impl FallbackLimiter {
     }
 }
 
-fn is_youtube_video_id(value: &str) -> bool {
+pub(crate) fn is_youtube_video_id(value: &str) -> bool {
     value.len() == 11
         && value
             .bytes()
@@ -868,11 +868,29 @@ impl Monitor {
 
     /// Data API 主发现：只读取每频道持久化调度中已经到期的频道。
     pub async fn poll_data_api(&self) -> Result<usize> {
+        let now = Utc::now();
+        let channels = self.db.list_due_data_api_channels(now)?;
+        self.poll_data_api_channels(channels, now, false).await
+    }
+
+    /// 立即用 Data API 同步单个指定频道，不顺带轮询其他频道。
+    ///
+    /// 停用频道也在范围内：显式指定和 RSS 的 `poll_channel` 一样，只处理这一条。
+    pub async fn poll_data_api_channel(&self, id: i64) -> Result<usize> {
+        let now = Utc::now();
+        let channel = self.db.channel(id)?;
+        self.poll_data_api_channels(vec![channel], now, true).await
+    }
+
+    async fn poll_data_api_channels(
+        &self,
+        channels: Vec<Channel>,
+        now: DateTime<Utc>,
+        single_channel: bool,
+    ) -> Result<usize> {
         let Some(api) = self.data_api.as_ref() else {
             return Ok(0);
         };
-        let now = Utc::now();
-        let channels = self.db.list_due_data_api_channels(now)?;
         if channels.is_empty() {
             return Ok(0);
         }
@@ -884,7 +902,8 @@ impl Monitor {
             }
             return Ok(0);
         }
-        if let Err(error) = self.refresh_upload_playlists(api).await {
+        let scoped = single_channel.then(|| channels.first().cloned()).flatten();
+        if let Err(error) = self.refresh_upload_playlists(api, scoped.as_ref()).await {
             let current_policy = api.quota_policy()?;
             for channel in channels {
                 if current_policy.degradation == QuotaDegradation::FallbackOnly {
@@ -1021,7 +1040,31 @@ impl Monitor {
         Ok(discovered)
     }
 
-    async fn refresh_upload_playlists(&self, api: &YoutubeDataApi) -> Result<()> {
+    async fn refresh_upload_playlists(
+        &self,
+        api: &YoutubeDataApi,
+        only: Option<&Channel>,
+    ) -> Result<()> {
+        if let Some(channel) = only {
+            // 单频道命令不推进全局刷新时间，也不为其他频道预扣 channels.list。
+            if channel.uploads_playlist_id.is_some() {
+                return Ok(());
+            }
+            let uploads = api
+                .channel_upload_playlists(std::slice::from_ref(&channel.youtube_channel_id))
+                .await?;
+            if let Some(playlist_id) = uploads.get(&channel.youtube_channel_id) {
+                self.db
+                    .set_channel_uploads_playlist(&channel.youtube_channel_id, playlist_id)?;
+            } else {
+                tracing::warn!(
+                    channel = %channel.name,
+                    youtube_channel_id = %channel.youtube_channel_id,
+                    "channels.list 未返回频道，可能是无效或不可访问频道"
+                );
+            }
+            return Ok(());
+        }
         let now = Utc::now();
         let refreshed_this_process = self.uploads_refreshed_this_process.load(Ordering::Acquire);
         let last_refresh = self
@@ -1129,6 +1172,8 @@ impl Monitor {
 
     /// Data API 正常时 RSS 仅作为低频探针；失败不立即拉起 yt-dlp。yt-dlp 深度
     /// 校对只在每日 API 深扫失败或 Data API 整体不可用时运行。
+    ///
+    /// 旧入口包含优先频道。新的普通探针请用 `poll_normal_rss_probes`。
     pub async fn poll_rss_probes(&self, limit: usize) -> Result<usize> {
         self.poll_rss_channels(self.db.list_due_channels(Utc::now())?, Some(limit))
             .await
@@ -1225,7 +1270,7 @@ impl Monitor {
             QuotaDegradation::Normal => {}
         }
 
-        if let Err(error) = self.refresh_upload_playlists(api).await {
+        if let Err(error) = self.refresh_upload_playlists(api, None).await {
             tracing::warn!(error = %error, "Data API 深扫初始化失败，回落到 yt-dlp 校对");
             return self.reconcile_all().await;
         }
@@ -1583,7 +1628,32 @@ impl Monitor {
 
     /// 处理一批到期候选。发现源只负责写表，所有元数据与策略判断都收敛在这里。
     pub async fn gate_pending_candidates(&self, limit: usize) -> Result<GateOutcome> {
-        let mut candidates = self.db.due_video_candidates(Utc::now(), limit)?;
+        self.gate_pending_candidates_scoped(None, limit).await
+    }
+
+    /// 只处理一个频道的到期候选。筛选发生在排序和 LIMIT 之前，
+    /// 避免其他频道的高优先级候选占满批次或被误入队。
+    pub async fn gate_pending_candidates_for_channel(
+        &self,
+        channel_id: i64,
+        limit: usize,
+    ) -> Result<GateOutcome> {
+        self.gate_pending_candidates_scoped(Some(channel_id), limit)
+            .await
+    }
+
+    async fn gate_pending_candidates_scoped(
+        &self,
+        channel_id: Option<i64>,
+        limit: usize,
+    ) -> Result<GateOutcome> {
+        let mut candidates = match channel_id {
+            Some(channel_id) => {
+                self.db
+                    .due_video_candidates_for_channel(channel_id, Utc::now(), limit)?
+            }
+            None => self.db.due_video_candidates(Utc::now(), limit)?,
+        };
         let processed = candidates.len();
         let mut promoted = 0;
         let mut pending = Vec::with_capacity(candidates.len());
@@ -3454,5 +3524,212 @@ esac
             rss_poll_interval(&disabled, &channel, now),
             Duration::from_secs(60)
         );
+    }
+
+    async fn record_youtube(
+        responses: usize,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 64 * 1024];
+                let size = socket.read(&mut request).await.unwrap();
+                let text = String::from_utf8_lossy(&request[..size]).into_owned();
+                recorded.lock().unwrap().push(text.clone());
+                let body = if text.contains("playlistItems") {
+                    r#"{"items":[]}"#
+                } else if text.contains("id=UC-target") {
+                    r#"{"items":[{"id":"UC-target","contentDetails":{"relatedPlaylists":{"uploads":"UU-target"}}}]}"#
+                } else {
+                    r#"{"items":[{"id":"UC-full-a","contentDetails":{"relatedPlaylists":{"uploads":"UU-full-a"}}},{"id":"UC-full-b","contentDetails":{"relatedPlaylists":{"uploads":"UU-full-b"}}}]}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{address}/youtube/v3"), seen, server)
+    }
+
+    #[tokio::test]
+    async fn single_channel_sync_does_not_refresh_or_gate_other_channels() {
+        let (base_url, seen, server) = record_youtube(2).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("single-sync.db")).unwrap();
+        let target = db
+            .add_channel(
+                "UC-target",
+                "target",
+                "https://www.youtube.com/@target",
+                "https://example.invalid/target",
+                TransferMode::Direct,
+            )
+            .unwrap();
+        db.set_channel_enabled(target, false).unwrap();
+        for index in 0..50 {
+            let id = db
+                .add_channel(
+                    &format!("UC-extra-{index:02}"),
+                    "extra",
+                    "https://www.youtube.com/@extra",
+                    "https://example.invalid/extra",
+                    TransferMode::Direct,
+                )
+                .unwrap();
+            db.set_channel_uploads_playlist(&format!("UC-extra-{index:02}"), "UU-existing")
+                .unwrap();
+            if index == 0 {
+                db.set_channel_enabled(id, false).unwrap();
+            }
+            if index == 1 {
+                db.set_channel_priority(id, ChannelPriority::Priority)
+                    .unwrap();
+                db.insert_video_candidate(NewVideoCandidate {
+                    video_id: "otherchan01",
+                    channel_id: Some(id),
+                    url: "https://www.youtube.com/watch?v=otherchan01",
+                    title: Some("other"),
+                    published_at: Some(Utc::now()),
+                    source: CandidateSource::Rss,
+                })
+                .unwrap();
+            }
+        }
+        db.set_discovery_state(API_UPLOADS_REFRESHED_AT_KEY, "sentinel-refresh")
+            .unwrap();
+        let monitor =
+            Monitor::new_with_data_api(Config::default(), db.clone(), Some("test-key"), &base_url)
+                .unwrap();
+        assert_eq!(monitor.poll_data_api_channel(target).await.unwrap(), 0);
+        let outcome = monitor
+            .gate_pending_candidates_for_channel(target, 20)
+            .await
+            .unwrap();
+        assert_eq!(outcome.processed, 0);
+        server.await.unwrap();
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[0].contains("id=UC-target"), "{}", requests[0]);
+        assert!(!requests[0].contains("UC-extra-"), "{}", requests[0]);
+        assert!(requests[1].contains("playlistItems"), "{}", requests[1]);
+        assert_eq!(
+            db.get_discovery_state("quota_used_today")
+                .unwrap()
+                .as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            db.get_discovery_state(API_UPLOADS_REFRESHED_AT_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("sentinel-refresh")
+        );
+        assert_eq!(
+            db.get_video_candidate("otherchan01")
+                .unwrap()
+                .unwrap()
+                .gate_state,
+            crate::model::GateState::Pending
+        );
+        assert!(db.get_job_by_video_id("otherchan01").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mapped_single_channel_skips_channels_list_and_full_sync_stays_global() {
+        let (base_url, seen, server) = record_youtube(1).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("mapped-sync.db")).unwrap();
+        let target = add_test_channel(&db, "https://example.invalid/feed", "target-mapped");
+        db.set_channel_uploads_playlist("UC-target-mapped", "UU-target-mapped")
+            .unwrap();
+        db.set_discovery_state(API_UPLOADS_REFRESHED_AT_KEY, "sentinel-refresh")
+            .unwrap();
+        let monitor =
+            Monitor::new_with_data_api(Config::default(), db.clone(), Some("test-key"), &base_url)
+                .unwrap();
+        assert_eq!(monitor.poll_data_api_channel(target).await.unwrap(), 0);
+        server.await.unwrap();
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("playlistItems"), "{}", requests[0]);
+        assert!(!requests[0].contains("/channels?"), "{}", requests[0]);
+        assert_eq!(
+            db.get_discovery_state("quota_used_today")
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            db.get_discovery_state(API_UPLOADS_REFRESHED_AT_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("sentinel-refresh")
+        );
+
+        let (base_url, seen, server) = record_youtube(3).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("full-sync.db")).unwrap();
+        add_test_channel(&db, "https://example.invalid/a", "full-a");
+        add_test_channel(&db, "https://example.invalid/b", "full-b");
+        db.set_discovery_state(API_UPLOADS_REFRESHED_AT_KEY, "sentinel-refresh")
+            .unwrap();
+        let monitor =
+            Monitor::new_with_data_api(Config::default(), db.clone(), Some("test-key"), &base_url)
+                .unwrap();
+        assert_eq!(monitor.poll_data_api().await.unwrap(), 0);
+        server.await.unwrap();
+        let requests = seen.lock().unwrap().clone();
+        assert!(
+            requests
+                .iter()
+                .any(|request| { request.contains("UC-full-a") && request.contains("UC-full-b") }),
+            "{requests:?}"
+        );
+        assert_ne!(
+            db.get_discovery_state(API_UPLOADS_REFRESHED_AT_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("sentinel-refresh")
+        );
+        let channels = db.list_channels().unwrap();
+        assert!(channels.iter().all(|channel| {
+            channel.uploads_playlist_id.as_deref() == Some("UU-full-a")
+                || channel.uploads_playlist_id.as_deref() == Some("UU-full-b")
+        }));
+    }
+
+    #[tokio::test]
+    async fn legacy_rss_probes_include_due_priority_channels() {
+        let body = r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>empty</title></feed>"#;
+        let (feed, server) = mock_response_sequence(vec![(200, body)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("rss-priority.db")).unwrap();
+        let priority = add_test_channel(&db, &feed, "rss-priority");
+        db.set_channel_priority(priority, ChannelPriority::Priority)
+            .unwrap();
+        let normal = add_test_channel(&db, "http://127.0.0.1:9/not-due", "rss-normal");
+        db.defer_channel_poll_until(normal, Utc::now() + chrono::Duration::hours(2))
+            .unwrap();
+        let monitor = Monitor::new(Config::default(), db.clone()).unwrap();
+        assert_eq!(monitor.poll_normal_rss_probes(5).await.unwrap(), 0);
+        assert_eq!(monitor.poll_rss_probes(5).await.unwrap(), 0);
+        server.await.unwrap();
+        let priority = db.channel(priority).unwrap();
+        assert!(priority.last_checked_at.is_some());
+        let normal = db.channel(normal).unwrap();
+        assert!(normal.last_checked_at.is_none());
     }
 }

@@ -134,7 +134,7 @@ const LEGACY_BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
 const LEGACY_BILIBILI_UPLOAD_HOLD_PREVIOUS: &str = "bilibili.upload_hold_previous";
 const LEGACY_BILIBILI_UPLOAD_HOLD_UNTIL: &str = "2099-12-31T23:59:59+00:00";
 /// 当前二进制能够完整理解的数据库迁移版本。
-pub const CURRENT_SCHEMA_VERSION: i64 = 23;
+pub const CURRENT_SCHEMA_VERSION: i64 = 24;
 
 mod discovery;
 mod jobs;

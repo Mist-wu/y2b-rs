@@ -96,9 +96,9 @@ fn handle_manual_key(input: &mut ManualInput, key: KeyCode) -> ManualAction {
     }
 }
 
-pub fn run(config_path: &Path, mut config: Config, db: Database) -> Result<()> {
+pub fn run(config_path: &Path, config: Config, db: Database) -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = app(&mut terminal, config_path, &mut config, &db);
+    let result = app(&mut terminal, config_path, &config, &db);
     ratatui::restore();
     result
 }
@@ -106,7 +106,7 @@ pub fn run(config_path: &Path, mut config: Config, db: Database) -> Result<()> {
 fn app(
     terminal: &mut DefaultTerminal,
     config_path: &Path,
-    config: &mut Config,
+    config: &Config,
     db: &Database,
 ) -> Result<()> {
     let tz: Tz = config
@@ -205,6 +205,7 @@ fn app(
             host.refresh();
         }
         let free = host.free_gib;
+        let today_tokens = db.ai_tokens_today().unwrap_or(0);
         let yt_auth = db
             .get_setting("auth.youtube")
             .unwrap_or(None)
@@ -258,9 +259,7 @@ fn app(
                 )),
                 Line::from(format!(
                     "选中任务 Tokens: {}   所属频道 Tokens: {}   今日 Tokens: {}",
-                    job_usage,
-                    channel_usage,
-                    db.ai_tokens_today().unwrap_or(0)
+                    job_usage, channel_usage, today_tokens
                 )),
                 Line::from(format!("认证: YouTube={}  Bilibili={}", yt_auth, bili_auth)),
             ];
@@ -415,10 +414,7 @@ fn app(
                         "选择模式 [1 direct无字幕] [2 translated翻译字幕]，方向键切换，Enter入队，Esc取消: {mode}  {url}"
                     ),
                     ManualInput::Submitting => "正在解析视频并加入后台队列…".into(),
-                    ManualInput::Idle => format!(
-                        "Tab任务/频道 ↑↓ | n新视频 r重试 p补字幕 Space暂停 m换模型 | a认证 y/YT导入 b/B站导入 | q退出   {}",
-                        notice
-                    ),
+                    ManualInput::Idle => format!("{TUI_IDLE_HELP}{notice}"),
                 }
             };
             f.render_widget(
@@ -530,11 +526,7 @@ fn app(
                         && let Some(i) = state.selected()
                         && let Some(j) = jobs.get(i)
                     {
-                        notice = format!(
-                            "{} 请用 y2b subtitle add {} 补 CC 字幕",
-                            j.video_id,
-                            j.bvid.as_deref().unwrap_or("<bvid>")
-                        );
+                        notice = subtitle_command_notice(j.bvid.as_deref());
                     }
                 }
                 KeyCode::Char(' ') => {
@@ -686,9 +678,28 @@ impl HostStats {
     }
 }
 
+const TUI_IDLE_HELP: &str = "Tab任务/频道 ↑↓ | n新视频 r重试 p查看补字幕命令 Space暂停 | a认证 y/YT导入 b/B站导入 | q退出   ";
+
+fn subtitle_command_notice(bvid: Option<&str>) -> String {
+    format!(
+        "查看补字幕命令: y2b subtitle add {}",
+        bvid.unwrap_or("<bvid>")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtitle_key_only_shows_the_backfill_command() {
+        assert!(TUI_IDLE_HELP.contains("p查看补字幕命令"));
+        assert!(!TUI_IDLE_HELP.contains("p补字幕"));
+        assert_eq!(
+            subtitle_command_notice(Some("BV1testtitle")),
+            "查看补字幕命令: y2b subtitle add BV1testtitle"
+        );
+    }
 
     #[test]
     fn manual_url_requires_value_and_can_select_direct() {

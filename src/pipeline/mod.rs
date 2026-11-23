@@ -37,59 +37,7 @@ pub use upload::NEXT_BILIBILI_SUBMIT_AT;
 /// YouTube 的整数秒元数据与容器时长会有轻微舍入差异；超过这个范围通常意味着
 /// HLS 分片被跳过或合并出的文件不完整。
 const MAX_VIDEO_DURATION_DRIFT_SECONDS: f64 = 3.0;
-const COVER_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const COVER_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const COVER_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const COVER_RESPONSE_BODY_LIMIT: usize = 8 * 1024 * 1024;
-
-fn cover_http_client_with_timeouts(
-    connect_timeout: Duration,
-    request_timeout: Duration,
-    read_timeout: Duration,
-) -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
-        .user_agent("y2b-rs/0.1")
-        .connect_timeout(connect_timeout)
-        .timeout(request_timeout)
-        .read_timeout(read_timeout)
-        .build()
-}
-
-fn cover_http_client() -> reqwest::Client {
-    cover_http_client_with_timeouts(
-        COVER_HTTP_CONNECT_TIMEOUT,
-        COVER_HTTP_REQUEST_TIMEOUT,
-        COVER_HTTP_READ_TIMEOUT,
-    )
-    .expect("固定封面 HTTP 客户端配置必须有效")
-}
-
-/// 流式读取封面响应；每次追加前先核对剩余额度，内存占用不会随超限正文增长。
-async fn read_cover_response_body(
-    mut response: reqwest::Response,
-    limit: usize,
-) -> Result<Vec<u8>> {
-    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit_u64)
-    {
-        bail!("封面响应体超过上限 {limit} 字节")
-    }
-    let capacity = response
-        .content_length()
-        .and_then(|length| usize::try_from(length).ok())
-        .unwrap_or_default()
-        .min(limit);
-    let mut body = Vec::with_capacity(capacity);
-    while let Some(chunk) = response.chunk().await? {
-        if chunk.len() > limit.saturating_sub(body.len()) {
-            bail!("封面响应体超过上限 {limit} 字节")
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct AiCircuitBreaker {
@@ -636,7 +584,8 @@ impl Pipeline {
             config,
             db,
             ai_circuit_breaker,
-            http: cover_http_client(),
+            http: crate::youtube_api::bounded_http_client("y2b-rs/0.1")
+                .expect("固定封面 HTTP 客户端配置必须有效"),
             ai_http: ai::http_client(),
             ai_policy: Arc::default(),
         }
@@ -861,11 +810,27 @@ impl Pipeline {
             return self.run_direct(job, &meta, &work).await;
         }
 
-        // 投稿失败重试（如 21566 冷却）：发布元数据已存在时复用完整原片和翻译
-        // 缓存，跳过重复翻译。仍须经过 download_video 的时长校验；此前只检查
-        // 文件名存在，会把 yt-dlp 跳过 HLS 分片后生成的残片直接上传。
-        if self.db.publication_metadata(&job.id)?.is_some() {
+        // 投稿失败重试（如 21566 冷却）：发布元数据已存在且能通过同一套校验时，
+        // 复用完整原片和翻译缓存，跳过重复翻译。无法修复的旧文案不走这条捷径。
+        // 仍须经过 download_video 的时长校验；此前只检查文件名存在，会把
+        // yt-dlp 跳过 HLS 分片后生成的残片直接上传。
+        let reusable_metadata = self
+            .db
+            .publication_metadata(&job.id)?
+            .as_ref()
+            .map(publication::accept_saved_publication)
+            .transpose()?
+            .flatten();
+        if let Some(metadata) = reusable_metadata {
             let video = self.download_video(&job.id, &job.url, &meta, &work).await?;
+            if metadata
+                != self
+                    .db
+                    .publication_metadata(&job.id)?
+                    .context("复用投稿文案时记录消失")?
+            {
+                self.db.save_publication_metadata(&job.id, &metadata)?;
+            }
             self.db.event(
                 Some(&job.id),
                 "info",
@@ -956,7 +921,6 @@ impl Pipeline {
         video: &Path,
         completion_status: JobStatus,
     ) -> Result<()> {
-        self.probe_media(&job.id, video, "original_probe").await?;
         let work = video.parent().context("视频文件没有工作目录")?;
         let cover = self.download_cover(&job.id, meta, work).await?;
         self.db.queue_claimed_prepared_upload(
@@ -978,7 +942,7 @@ impl Pipeline {
         work: &Path,
     ) -> Result<PathBuf> {
         let cover = work.join(format!("{}.youtube-cover.jpg", meta.id));
-        if cover.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        if cover.is_file() && cover.metadata().is_ok_and(|metadata| metadata.len() > 0) {
             return Ok(cover);
         }
         let thumbnail_url = meta
@@ -987,6 +951,7 @@ impl Pipeline {
             .context("YouTube 元数据缺少封面 URL")?;
         let mut stage = StageGuard::start(&self.db, job_id, "cover_download", None, None, None)?;
         let source = work.join(format!("{}.youtube-cover.source", meta.id));
+        let partial = work.join(format!("{}.youtube-cover.jpg.partial", meta.id));
         let result = async {
             let response = self
                 .http
@@ -994,21 +959,27 @@ impl Pipeline {
                 .send()
                 .await?
                 .error_for_status()?;
-            let bytes = read_cover_response_body(response, COVER_RESPONSE_BODY_LIMIT).await?;
+            let bytes = crate::youtube_api::read_response_body(response, COVER_RESPONSE_BODY_LIMIT)
+                .await
+                .context("读取 YouTube 封面失败")?;
             if bytes.is_empty() {
                 bail!("YouTube 封面为空")
             }
             tokio::fs::write(&source, bytes).await?;
+            let _ = tokio::fs::remove_file(&partial).await;
             let mut cmd = Command::new(&self.config.render.ffmpeg);
             cmd.arg("-y")
                 .arg("-i")
                 .arg(&source)
                 .args(["-frames:v", "1", "-q:v", "2", "-update", "1"])
-                .arg(&cover);
+                .arg(&partial);
             let output = run_monitored(cmd, Duration::from_secs(120)).await?;
-            if !cover.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+            if !partial.is_file() || !partial.metadata().is_ok_and(|metadata| metadata.len() > 0) {
                 bail!("FFmpeg 未生成 YouTube 封面")
             }
+            tokio::fs::rename(&partial, &cover)
+                .await
+                .context("替换 YouTube 封面失败")?;
             Ok::<u64, anyhow::Error>(output.peak_rss_kib)
         }
         .await;
@@ -1016,6 +987,12 @@ impl Pipeline {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(%error, "清理临时封面失败");
+        }
+        if result.is_err()
+            && let Err(error) = tokio::fs::remove_file(&partial).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "清理失败的封面残片失败");
         }
         let duration_ms = stage.elapsed_ms();
         match result {
@@ -1169,7 +1146,7 @@ impl Pipeline {
         Ok(path)
     }
 
-    async fn validate_downloaded_video(
+    pub(super) async fn validate_downloaded_video(
         &self,
         job_id: &str,
         path: &Path,
@@ -1225,30 +1202,6 @@ impl Pipeline {
             out.duration_ms,
             out.peak_rss_kib,
             Some(&detail),
-        )?;
-        Ok(())
-    }
-
-    async fn probe_media(&self, job_id: &str, path: &Path, label: &str) -> Result<()> {
-        let mut stage = StageGuard::start(&self.db, job_id, label, None, None, None)?;
-        let mut cmd = Command::new(&self.config.render.ffprobe);
-        cmd.args([
-            "-v",
-            "error",
-            "-show_entries",
-            "stream=index,codec_type,codec_name,width,height,r_frame_rate,pix_fmt:format=duration",
-            "-of",
-            "json",
-        ])
-        .arg(path);
-        let out = run_monitored(cmd, Duration::from_secs(60)).await?;
-        let probe = media_from_probe(&out.stdout)?;
-        validate_media(probe, None, self.config.youtube.max_pixels)?;
-        stage.finish(
-            "completed",
-            out.duration_ms,
-            out.peak_rss_kib,
-            Some(out.stdout.trim()),
         )?;
         Ok(())
     }
@@ -1424,75 +1377,6 @@ mod tests {
         };
         let error = validate_media(oversized, None, 921_600).unwrap_err();
         assert!(error.to_string().contains("max_pixels=921600"));
-    }
-
-    #[tokio::test]
-    async fn cover_client_times_out_when_server_stalls() {
-        use tokio::io::AsyncReadExt;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = socket.read(&mut request).await.unwrap();
-            std::future::pending::<()>().await;
-        });
-        let client = cover_http_client_with_timeouts(
-            Duration::from_millis(100),
-            Duration::from_millis(100),
-            Duration::from_secs(5),
-        )
-        .unwrap();
-        let started = Instant::now();
-        let error = client
-            .get(format!("http://{address}/stalled-cover"))
-            .send()
-            .await
-            .unwrap_err();
-        assert!(error.is_timeout(), "无响应封面服务应触发超时: {error}");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "封面 HTTP 超时没有及时中止"
-        );
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn oversized_cover_body_is_rejected_while_streaming() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = socket.read(&mut request).await.unwrap();
-            let payload = "x".repeat(65);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n{payload}\r\n0\r\n\r\n",
-                payload.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-        });
-        let client = cover_http_client_with_timeouts(
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        let response = client
-            .get(format!("http://{address}/large-cover"))
-            .send()
-            .await
-            .unwrap();
-        let error = read_cover_response_body(response, 64).await.unwrap_err();
-        assert!(
-            error.to_string().contains("封面响应体超过上限 64 字节"),
-            "超大封面响应未被流式限长: {error:#}"
-        );
-        server.await.unwrap();
     }
 
     #[test]
@@ -1717,5 +1601,85 @@ mod tests {
         .expect("branches did not run concurrently")
         .unwrap();
         assert_eq!(joined, ("video", "subtitle"));
+    }
+
+    #[tokio::test]
+    async fn failed_cover_conversion_is_not_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("fail-once");
+        std::fs::write(&marker, "1").unwrap();
+        let ffmpeg = directory.path().join("ffmpeg");
+        std::fs::write(
+            &ffmpeg,
+            format!(
+                "#!/bin/sh\nout=\"\"\nfor arg in \"$@\"; do out=\"$arg\"; done\nif [ -f '{}' ]; then\n  rm -f '{}'\n  printf 'BAD' > \"$out\"\n  exit 1\nfi\nprintf 'JPEGOK' > \"$out\"\nexit 0\n",
+                marker.display(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&ffmpeg).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ffmpeg, permissions).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = socket.read(&mut request).await.unwrap();
+                let body = "thumbnail-bytes";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let db = Database::open(&directory.path().join("state.db")).unwrap();
+        let job_id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "covervid001",
+                url: "https://youtu.be/covervid001",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+        let mut meta = crate::pipeline::testing::metadata();
+        meta.id = "covervid001".into();
+        meta.thumbnail_url = Some(format!("http://{address}/thumb.jpg"));
+        let mut config = Config::default();
+        config.render.ffmpeg = ffmpeg.to_string_lossy().into_owned();
+        let pipeline = Pipeline::new(config, db);
+        let work = directory.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let error = pipeline
+            .download_cover(&job_id, &meta, &work)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("封面"), "{error}");
+        let cover = work.join("covervid001.youtube-cover.jpg");
+        let partial = work.join("covervid001.youtube-cover.jpg.partial");
+        assert!(!cover.exists());
+        assert!(!partial.exists());
+        assert_eq!(
+            std::fs::read(
+                pipeline
+                    .download_cover(&job_id, &meta, &work)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            b"JPEGOK"
+        );
     }
 }

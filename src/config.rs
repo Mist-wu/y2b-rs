@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub const AI_PROVIDER: &str = "deepseek";
 pub const AI_MODEL: &str = "deepseek-flash";
@@ -322,6 +324,16 @@ pub(crate) fn matches_bcp47_source_lang(source: &str, language: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('-'))
 }
 
+fn regional_track_locales() -> &'static HashSet<String> {
+    static LOCALES: OnceLock<HashSet<String>> = OnceLock::new();
+    LOCALES.get_or_init(|| {
+        include_str!("track_locales.txt")
+            .lines()
+            .map(str::to_ascii_lowercase)
+            .collect()
+    })
+}
+
 pub(crate) fn matches_source_lang(source: &str, language: &str) -> bool {
     let language = language
         .strip_suffix("-orig")
@@ -334,9 +346,7 @@ pub(crate) fn matches_source_lang(source: &str, language: &str) -> bool {
         && suffix.len() == 2
         && suffix.bytes().all(|byte| byte.is_ascii_lowercase())
         && normalize_source_lang(suffix).is_ok()
-        && !include_str!("track_locales.txt")
-            .lines()
-            .any(|locale| locale.eq_ignore_ascii_case(&language))
+        && !regional_track_locales().contains(&language.to_ascii_lowercase())
     {
         return false;
     }
@@ -879,5 +889,18 @@ mod tests {
 
         config.monitor.data_api_max_results = 51;
         assert!(config.validate_discovery().is_err());
+    }
+
+    #[test]
+    fn zero_poll_seconds_loads_as_one_second_without_rewriting_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let raw = "# keep\n[monitor]\npoll_seconds = 0\n";
+        fs::write(&path, raw).unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.monitor.poll_seconds, 0);
+        assert_eq!(config.monitor.poll_seconds.max(1), 1);
+        assert_eq!(Config::default().monitor.poll_seconds, 60);
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw);
     }
 }

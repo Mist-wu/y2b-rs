@@ -71,9 +71,10 @@ y2b watch                # 常驻运行
 
 ```bash
 # 频道
-y2b channels add <URL> --mode direct|translated
+y2b channels add <URL> --mode direct|translated [--source-lang ja]
 y2b channels list | set-mode <ID> <MODE> | set-priority <ID> normal|priority
-y2b channels enable <ID> | disable <ID> | sync
+y2b channels set-lang <ID> [LANG] [--clear]
+y2b channels enable <ID> | disable <ID> | sync [ID]
 
 # 任务
 y2b run <URL> [--mode translated]   # 单个视频跑完整流程
@@ -94,9 +95,8 @@ TUI 用 `Tab` 切换任务和频道列表，`n` 输入单个 URL，`r` 重试失
 y2b-rs/
 ├── src/          # Rust 主程序：发现、队列、下载、投稿、字幕、TUI
 ├── pi/           # AI 提示词、翻译策略和荒野乱斗词库
-├── scripts/      # 词库审计脚本（Python）
-├── deploy/       # 服务器初始化、原子发布、恢复脚本和 systemd 单元
-└── tests/
+├── scripts/      # 词库审计与性能诊断脚本（Python）
+└── deploy/       # 服务器初始化、原子发布、恢复脚本和 systemd 单元
 ```
 
 ## 文档

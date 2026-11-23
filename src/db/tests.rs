@@ -1908,7 +1908,7 @@ fn finishing_upload_attempt_atomically_queues_translated_cc() {
     assert_eq!(attempt, ("succeeded".into(), Some("BV1uxE16ZE7e".into())));
     assert_eq!(
         db.get_setting(NEXT_BILIBILI_SUBMIT_AT).unwrap(),
-        Some(next_submit_at.to_rfc3339())
+        Some(format_timestamp(next_submit_at))
     );
 }
 
@@ -2295,7 +2295,7 @@ fn creator_reconciliation_confirms_uncertain_attempt_without_retrying() {
     assert!(subtitle_retry_at.is_some(), "核对成功后没有排入字幕队列");
     assert_eq!(
         db.get_setting(NEXT_BILIBILI_SUBMIT_AT).unwrap(),
-        Some(next_submit_at.to_rfc3339())
+        Some(format_timestamp(next_submit_at))
     );
 }
 
@@ -2842,4 +2842,450 @@ fn channel_language_migrates_and_falls_back_after_clear() {
     assert_eq!(db.effective_source_lang(Some(id), "ja").unwrap(), "pt-BR");
     db.set_channel_language(id, None).unwrap();
     assert_eq!(db.effective_source_lang(Some(id), "de").unwrap(), "de");
+}
+
+#[test]
+fn maintenance_hold_and_claim_timestamps_use_consistent_utc_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("ts.db")).unwrap();
+    let job_id = db
+        .create_job(NewJob {
+            channel_id: None,
+            video_id: "ts-format-vid",
+            url: "https://youtu.be/ts-format-vid",
+            title: Some("ts"),
+            published: None,
+            updated: None,
+            transfer_mode: TransferMode::Direct,
+        })
+        .unwrap()
+        .unwrap();
+
+    // 写入毫秒级 Z 结尾且刚刚过期的维护租约，确认不会被 `+00:00` 字典序错判为未过期。
+    db.acquire_maintenance_hold("deploy:ts", "deploy", 60)
+        .unwrap();
+    let expired_at = Utc::now() - chrono::Duration::milliseconds(50);
+    db.conn()
+        .execute(
+            "UPDATE maintenance_hold SET expires_at=? WHERE singleton=1",
+            [format_timestamp(expired_at)],
+        )
+        .unwrap();
+    let claimed = db
+        .claim_next_prepare_job()
+        .unwrap()
+        .expect("刚刚过期的维护租约不应阻塞任务领取");
+    assert_eq!(claimed.id, job_id);
+
+    // 确认 jobs.claim_expires_at 也采用固定毫秒 Z 结尾，与 maintenance_status 同格式比较。
+    let stored_expiry: String = db
+        .conn()
+        .query_row(
+            "SELECT claim_expires_at FROM jobs WHERE id=?",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored_expiry.ends_with('Z'),
+        "claim_expires_at 应使用固定毫秒 UTC Z 格式: {stored_expiry}"
+    );
+    let soon = Utc::now() + chrono::Duration::milliseconds(200);
+    db.conn()
+        .execute(
+            "UPDATE jobs SET claim_expires_at=? WHERE id=?",
+            params![format_timestamp(soon), &job_id],
+        )
+        .unwrap();
+    let status = db.maintenance_status(None).unwrap();
+    assert!(
+        status.blockers.iter().any(|b| b.kind == "active_claims"),
+        "未过期的同秒级租约必须被识别为 active_claims blocker: {:?}",
+        status.blockers
+    );
+}
+
+fn fixed_utc(stamp: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(stamp)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+fn claim_is_active(status: &MaintenanceStatus, id: &str) -> bool {
+    status.blockers.iter().any(|blocker| {
+        blocker.kind == "active_claims"
+            && blocker.details.iter().any(|detail| detail.starts_with(id))
+    })
+}
+
+#[test]
+fn legacy_timestamp_text_normalizes_before_lease_and_retry_sql() {
+    let now = fixed_utc("2026-06-15T12:00:00.123Z");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-time.db");
+    let offset_future;
+    let whole_second;
+    let micros;
+    let nanos;
+    let sqlite_future;
+    let positive_past;
+    let retry_due;
+    let null_expiry;
+    let subtitle_future;
+    let subtitle_past;
+    {
+        let db = Database::open(&path).unwrap();
+        let stamp = |id: &str, expires: Option<&str>| {
+            let job_id = maintenance_test_job(&db, id);
+            db.conn()
+                .execute(
+                    "UPDATE jobs SET status='inspecting',claim_kind='prepare',claim_owner='worker',claim_expires_at=? WHERE id=?",
+                    params![expires, job_id],
+                )
+                .unwrap();
+            job_id
+        };
+        offset_future = stamp("offset-future", Some("2026-06-15T05:30:00-07:00"));
+        whole_second = stamp("whole-second", Some("2026-06-15T12:00:00Z"));
+        micros = stamp("micros", Some("2026-06-15T12:00:00.123456+00:00"));
+        nanos = stamp("nanos", Some("2026-06-15T12:00:00.123456789Z"));
+        sqlite_future = stamp("sqlite-future", Some("2026-06-15 12:30:00"));
+        positive_past = stamp("positive-past", Some("2026-06-15T20:00:00+09:00"));
+        null_expiry = stamp("null-expiry", None);
+        retry_due = maintenance_test_job(&db, "retry-due");
+        db.conn()
+            .execute(
+                "UPDATE jobs SET status='retry_wait',retry_at=?,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL WHERE id=?",
+                params!["2026-06-15T21:00:00+09:00", &retry_due],
+            )
+            .unwrap();
+        let subtitle = |video_id: &str, bvid: &str, retry_at: &str| {
+            let job_id = maintenance_test_job(&db, video_id);
+            db.conn()
+                .execute(
+                    "UPDATE jobs SET status='uploaded_original_pending_subtitle',bvid=?,subtitle_attempt=0,subtitle_retry_at=?,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL WHERE id=?",
+                    params![bvid, retry_at, job_id],
+                )
+                .unwrap();
+            job_id
+        };
+        subtitle_future = subtitle("sub-future", "BV1future111", "2026-06-15T06:00:00-07:00");
+        subtitle_past = subtitle("sub-past", "BV1past11111", "2026-06-15 11:00:00");
+        db.conn()
+            .execute("DELETE FROM schema_migrations WHERE version=24", [])
+            .unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let stored = |id: &str, column: &str| -> String {
+        db.conn()
+            .query_row(
+                &format!("SELECT {column} FROM jobs WHERE id=?"),
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        stored(&offset_future, "claim_expires_at"),
+        "2026-06-15T12:30:00.000Z"
+    );
+    assert_eq!(
+        stored(&whole_second, "claim_expires_at"),
+        "2026-06-15T12:00:00.000Z"
+    );
+    assert_eq!(
+        stored(&micros, "claim_expires_at"),
+        "2026-06-15T12:00:00.124Z"
+    );
+    assert_eq!(
+        stored(&nanos, "claim_expires_at"),
+        "2026-06-15T12:00:00.124Z"
+    );
+    assert_eq!(
+        stored(&sqlite_future, "claim_expires_at"),
+        "2026-06-15T12:30:00.000Z"
+    );
+    assert_eq!(
+        stored(&positive_past, "claim_expires_at"),
+        "2026-06-15T11:00:00.000Z"
+    );
+    assert_eq!(stored(&retry_due, "retry_at"), "2026-06-15T12:00:00.000Z");
+    assert_eq!(
+        stored(&subtitle_future, "subtitle_retry_at"),
+        "2026-06-15T13:00:00.000Z"
+    );
+    assert_eq!(
+        stored(&subtitle_past, "subtitle_retry_at"),
+        "2026-06-15T11:00:00.000Z"
+    );
+    let null_stored: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT claim_expires_at FROM jobs WHERE id=?",
+            [&null_expiry],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(null_stored, None);
+
+    let status = db.maintenance_status_at(None, now).unwrap();
+    for id in [
+        &offset_future,
+        &micros,
+        &nanos,
+        &sqlite_future,
+        &null_expiry,
+    ] {
+        assert!(
+            claim_is_active(&status, id),
+            "{id} 应仍持有租约: {:?}",
+            status.blockers
+        );
+    }
+    for id in [&whole_second, &positive_past] {
+        assert!(
+            !claim_is_active(&status, id),
+            "{id} 应已到期: {:?}",
+            status.blockers
+        );
+    }
+
+    let claimed = db.claim_next_prepare_job_at(now).unwrap().unwrap();
+    assert_eq!(claimed.id, retry_due);
+
+    let recovered = db.recover_incomplete_jobs_at(now).unwrap();
+    assert_eq!(recovered, 3, "只恢复已到期或没有截止时间的准备租约");
+    for id in [&offset_future, &micros, &nanos, &sqlite_future] {
+        let status_text: String = db
+            .conn()
+            .query_row("SELECT status FROM jobs WHERE id=?", [id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(status_text, "inspecting");
+    }
+
+    let subtitle_job = db
+        .claim_next_pending_subtitle_job_at(16, now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(subtitle_job.id, subtitle_past);
+    assert!(
+        db.claim_next_pending_subtitle_job_at(16, now)
+            .unwrap()
+            .is_none()
+    );
+
+    let before = stored(&micros, "claim_expires_at");
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    let after: String = db
+        .conn()
+        .query_row(
+            "SELECT claim_expires_at FROM jobs WHERE id=?",
+            [&micros],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+
+    let cross_dir = tempfile::tempdir().unwrap();
+    let cross_path = cross_dir.path().join("cross-day.db");
+    let cross_id;
+    {
+        let db = Database::open(&cross_path).unwrap();
+        cross_id = maintenance_test_job(&db, "cross-day");
+        db.conn()
+            .execute(
+                "UPDATE jobs SET status='inspecting',claim_kind='prepare',claim_owner='worker',claim_expires_at=? WHERE id=?",
+                params!["2026-06-15T20:30:00-07:00", &cross_id],
+            )
+            .unwrap();
+        db.conn()
+            .execute("DELETE FROM schema_migrations WHERE version=24", [])
+            .unwrap();
+    }
+    let db = Database::open(&cross_path).unwrap();
+    let stored_cross: String = db
+        .conn()
+        .query_row(
+            "SELECT claim_expires_at FROM jobs WHERE id=?",
+            [&cross_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_cross, "2026-06-16T03:30:00.000Z");
+    let cross_now = fixed_utc("2026-06-16T03:00:00.000Z");
+    assert!(claim_is_active(
+        &db.maintenance_status_at(None, cross_now).unwrap(),
+        &cross_id
+    ));
+    assert!(db.recover_incomplete_jobs_at(cross_now).unwrap() == 0);
+}
+
+#[test]
+fn invalid_legacy_timestamp_rolls_back_without_looking_expired() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad-time.db");
+    let job_id;
+    {
+        let db = Database::open(&path).unwrap();
+        job_id = maintenance_test_job(&db, "bad-time");
+        db.conn()
+            .execute(
+                "UPDATE jobs SET status='inspecting',claim_kind='prepare',claim_owner='worker',claim_expires_at='not-a-time' WHERE id=?",
+                [&job_id],
+            )
+            .unwrap();
+        db.conn()
+            .execute("DELETE FROM schema_migrations WHERE version=24", [])
+            .unwrap();
+    }
+    let error = match Database::open(&path) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("坏时间戳不应被打开成可用数据库"),
+    };
+    assert!(error.contains("表 jobs"), "{error}");
+    assert!(error.contains("列 claim_expires_at"), "{error}");
+    assert!(error.contains(&job_id), "{error}");
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = raw
+        .query_row(
+            "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stored: String = raw
+        .query_row(
+            "SELECT claim_expires_at FROM jobs WHERE id=?",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 23);
+    assert_eq!(stored, "not-a-time");
+    drop(raw);
+
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "UPDATE jobs SET claim_expires_at='2026-06-15T12:30:00-07:00' WHERE id=?",
+        [&job_id],
+    )
+    .unwrap();
+    drop(raw);
+    let db = Database::open(&path).unwrap();
+    let stored: String = db
+        .conn()
+        .query_row(
+            "SELECT claim_expires_at FROM jobs WHERE id=?",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "2026-06-15T19:30:00.000Z");
+    assert_eq!(db.schema_version().unwrap(), 24);
+}
+
+#[test]
+fn same_millisecond_upload_attempts_reconcile_by_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("same-ms.db")).unwrap();
+    let started_at = "2026-06-15T12:00:00.123Z";
+    let discard_id = maintenance_test_job(&db, "discard-same-ms");
+    let confirm_id = maintenance_test_job(&db, "confirm-same-ms");
+    let ambiguous_id = maintenance_test_job(&db, "ambiguous-same-ms");
+    for (job_id, attempt_id, status) in [
+        (&discard_id, "discard-failed", "failed"),
+        (&discard_id, "discard-uncertain", "uncertain"),
+        (&confirm_id, "confirm-failed", "failed"),
+        (&confirm_id, "confirm-uncertain", "uncertain"),
+        (&ambiguous_id, "ambiguous-a", "uncertain"),
+        (&ambiguous_id, "ambiguous-b", "uncertain"),
+    ] {
+        db.conn()
+            .execute(
+                "INSERT INTO upload_attempts(id,job_id,status,started_at) VALUES(?,?,?,?)",
+                params![attempt_id, job_id, status, started_at],
+            )
+            .unwrap();
+    }
+    for job_id in [&discard_id, &confirm_id, &ambiguous_id] {
+        db.conn()
+            .execute(
+                "UPDATE jobs SET status='upload_uncertain' WHERE id=?",
+                [job_id],
+            )
+            .unwrap();
+    }
+
+    db.discard_uncertain_upload(&discard_id, "人工核对未落地")
+        .unwrap();
+    let discard_rows: Vec<(String, String)> = {
+        let connection = db.conn();
+        let mut query = connection
+            .prepare("SELECT id,status FROM upload_attempts WHERE job_id=? ORDER BY id")
+            .unwrap();
+        query
+            .query_map([&discard_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        discard_rows,
+        vec![
+            ("discard-failed".into(), "failed".into()),
+            ("discard-uncertain".into(), "failed".into()),
+        ]
+    );
+
+    db.confirm_uncertain_upload(
+        &confirm_id,
+        "BV1sameMillis",
+        JobStatus::Completed,
+        TransferMode::Direct,
+        UploadCompletionTiming {
+            subtitle_delay_seconds: 90,
+            next_submit_at: None,
+        },
+    )
+    .unwrap();
+    let confirm_status: String = db
+        .conn()
+        .query_row(
+            "SELECT status FROM upload_attempts WHERE id='confirm-uncertain'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let failed_status: String = db
+        .conn()
+        .query_row(
+            "SELECT status FROM upload_attempts WHERE id='confirm-failed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(confirm_status, "reconciled");
+    assert_eq!(failed_status, "failed");
+
+    let error = db
+        .discard_uncertain_upload(&ambiguous_id, "无法区分")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("无法区分"), "{error}");
+    let still_uncertain: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM upload_attempts WHERE job_id=? AND status='uncertain'",
+            [&ambiguous_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(still_uncertain, 2);
+    let started = db.uncertain_upload_started_at(&ambiguous_id).unwrap_err();
+    assert!(started.to_string().contains("无法区分"));
 }

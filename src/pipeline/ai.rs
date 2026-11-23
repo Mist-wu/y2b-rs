@@ -104,22 +104,15 @@ fn parse_usage(v: &Value) -> AiUsage {
     }
 }
 
-async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
-    if response
-        .content_length()
-        .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
-    {
-        bail!("DeepSeek 响应超过 {MAX_RESPONSE_BYTES} 字节上限");
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.without_url())? {
-        anyhow::ensure!(
-            chunk.len() <= MAX_RESPONSE_BYTES.saturating_sub(body.len()),
-            "DeepSeek 响应超过 {MAX_RESPONSE_BYTES} 字节上限"
-        );
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+async fn read_body(response: reqwest::Response) -> Result<Vec<u8>> {
+    crate::youtube_api::read_response_body(response, MAX_RESPONSE_BYTES)
+        .await
+        .map_err(|error| match error {
+            crate::youtube_api::ResponseBodyError::TooLarge { limit } => {
+                anyhow::anyhow!("DeepSeek 响应超过 {limit} 字节上限")
+            }
+            crate::youtube_api::ResponseBodyError::Request(err) => err.without_url().into(),
+        })
 }
 
 pub(super) fn provider_error(status: u16, body: &Value, key: &str) -> anyhow::Error {
@@ -325,6 +318,12 @@ impl Pipeline {
             &self.config.ai.model
         };
         let input_json = payload.to_string();
+        if input_json.len() > AI_MAX_PAYLOAD_BYTES {
+            bail!(
+                "AI 请求正文 {} 字节，超过上限 {AI_MAX_PAYLOAD_BYTES}",
+                input_json.len()
+            );
+        }
         let policy = self
             .ai_policy
             .get_or_try_init(|| async { PromptPolicy::load(&self.config.ai.policy) })

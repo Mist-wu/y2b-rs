@@ -3,8 +3,8 @@ use super::{rows::*, *};
 impl Database {
     pub fn create_job(&self, job: NewJob<'_>) -> Result<Option<String>> {
         let id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        let changed=self.conn().execute("INSERT OR IGNORE INTO jobs(id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)",params![id,job.channel_id,job.video_id,job.url,job.title,job.transfer_mode.to_string(),job.published.map(|x|x.to_rfc3339()),job.updated.map(|x|x.to_rfc3339()),now,now,now])?;
+        let now = format_timestamp(Utc::now());
+        let changed=self.conn().execute("INSERT OR IGNORE INTO jobs(id,channel_id,video_id,url,title,status,transfer_mode,published_at,youtube_updated_at,discovered_at,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)",params![id,job.channel_id,job.video_id,job.url,job.title,job.transfer_mode.to_string(),job.published.map(format_timestamp),job.updated.map(format_timestamp),now,now,now])?;
         Ok((changed == 1).then_some(id))
     }
 
@@ -51,7 +51,7 @@ impl Database {
              AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?) \
              ORDER BY discovered_at"
         ))?;
-        Ok(q.query_map([Utc::now().to_rfc3339()], job_from_row)?
+        Ok(q.query_map([format_timestamp(Utc::now())], job_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn list_jobs(&self, limit: usize) -> Result<Vec<Job>> {
@@ -64,15 +64,18 @@ impl Database {
     }
 
     pub(super) fn claim_deadline(now: DateTime<Utc>) -> String {
-        (now + chrono::Duration::seconds(CLAIM_LEASE_SECONDS)).to_rfc3339()
+        format_timestamp(now + chrono::Duration::seconds(CLAIM_LEASE_SECONDS))
     }
 
     /// 原子领取下一条准备任务，并直接切换到 `inspecting`。
     pub fn claim_next_prepare_job(&self) -> Result<Option<Job>> {
-        let now = Utc::now();
-        let now_text = now.to_rfc3339();
+        self.claim_next_prepare_job_at(Utc::now())
+    }
+
+    pub(crate) fn claim_next_prepare_job_at(&self, now: DateTime<Utc>) -> Result<Option<Job>> {
+        let now_text = format_timestamp(now);
         let legacy_before =
-            (now - chrono::Duration::minutes(Self::LEGACY_RETRY_MINUTES)).to_rfc3339();
+            format_timestamp(now - chrono::Duration::minutes(Self::LEGACY_RETRY_MINUTES));
         let sql = format!(
             "UPDATE jobs SET status='inspecting',claim_kind='{PREPARE_CLAIM_KIND}',claim_owner=?1,claim_expires_at=?2,error=NULL,updated_at=?3 \
              WHERE id=(SELECT jobs.id FROM jobs \
@@ -98,9 +101,9 @@ impl Database {
     /// 原子领取指定准备任务，供 `y2b run` 使用。
     pub fn claim_prepare_job(&self, id: &str) -> Result<Option<Job>> {
         let now = Utc::now();
-        let now_text = now.to_rfc3339();
+        let now_text = format_timestamp(now);
         let legacy_before =
-            (now - chrono::Duration::minutes(Self::LEGACY_RETRY_MINUTES)).to_rfc3339();
+            format_timestamp(now - chrono::Duration::minutes(Self::LEGACY_RETRY_MINUTES));
         let sql = format!(
             "UPDATE jobs SET status='inspecting',claim_kind='{PREPARE_CLAIM_KIND}',claim_owner=?1,claim_expires_at=?2,error=NULL,updated_at=?3 \
              WHERE id=?4 \
@@ -148,7 +151,12 @@ impl Database {
         let changed = self.conn().execute(
             "UPDATE jobs SET claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
              WHERE id=? AND claim_kind=? AND claim_owner=?",
-            params![Utc::now().to_rfc3339(), id, kind, self.claim_owner.as_ref()],
+            params![
+                format_timestamp(Utc::now()),
+                id,
+                kind,
+                self.claim_owner.as_ref()
+            ],
         )?;
         Ok(changed == 1)
     }
@@ -171,7 +179,7 @@ impl Database {
                 params![
                     status.to_string(),
                     error,
-                    Utc::now().to_rfc3339(),
+                    format_timestamp(Utc::now()),
                     id,
                     kind,
                     self.claim_owner.as_ref()
@@ -184,7 +192,7 @@ impl Database {
                 params![
                     status.to_string(),
                     error,
-                    Utc::now().to_rfc3339(),
+                    format_timestamp(Utc::now()),
                     id,
                     kind,
                     self.claim_owner.as_ref()
@@ -202,7 +210,12 @@ impl Database {
             .query_row(
                 "UPDATE jobs SET attempt=attempt+1,updated_at=? \
                  WHERE id=? AND claim_kind=? AND claim_owner=? RETURNING attempt",
-                params![Utc::now().to_rfc3339(), id, kind, self.claim_owner.as_ref()],
+                params![
+                    format_timestamp(Utc::now()),
+                    id,
+                    kind,
+                    self.claim_owner.as_ref()
+                ],
                 |row| row.get(0),
             )
             .optional()?
@@ -227,8 +240,8 @@ impl Database {
             params![
                 status.to_string(),
                 error,
-                (now + chrono::Duration::seconds(delay_seconds)).to_rfc3339(),
-                now.to_rfc3339(),
+                format_timestamp(now + chrono::Duration::seconds(delay_seconds)),
+                format_timestamp(now),
                 id,
                 kind,
                 self.claim_owner.as_ref()
@@ -282,8 +295,8 @@ impl Database {
             params![
                 status.to_string(),
                 error,
-                (now + chrono::Duration::seconds(delay_seconds)).to_rfc3339(),
-                now.to_rfc3339(),
+                format_timestamp(now + chrono::Duration::seconds(delay_seconds)),
+                format_timestamp(now),
                 id
             ],
         )?;
@@ -291,8 +304,12 @@ impl Database {
     }
 
     pub fn recover_incomplete_jobs(&self) -> Result<usize> {
+        self.recover_incomplete_jobs_at(Utc::now())
+    }
+
+    pub(crate) fn recover_incomplete_jobs_at(&self, now: DateTime<Utc>) -> Result<usize> {
         let c = self.conn();
-        let now = Utc::now().to_rfc3339();
+        let now = format_timestamp(now);
         // 状态串里保留 downloading/segmenting/translating/rendering：这些变体已从
         // JobStatus 移除（从未被构造），但旧数据库里可能还留着这样的行，恢复时要一并捞回。
         let mut recovered = c.execute(
@@ -344,7 +361,7 @@ impl Database {
         }
         self.conn().execute(
             "UPDATE jobs SET status=?,error=?,updated_at=? WHERE id=?",
-            params![status.to_string(), error, Utc::now().to_rfc3339(), id],
+            params![status.to_string(), error, format_timestamp(Utc::now()), id],
         )?;
         Ok(())
     }
@@ -358,7 +375,7 @@ impl Database {
         let changed = self.conn().execute(
             "UPDATE jobs SET status='paused',error='用户暂停',retry_at=NULL,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
              WHERE id=? AND status IN ('queued','retry_wait','inspecting','processing','ready_to_upload','upload_retry_wait')",
-            params![Utc::now().to_rfc3339(), id],
+            params![format_timestamp(Utc::now()), id],
         )?;
         if changed == 1 {
             return Ok(());
@@ -377,7 +394,7 @@ impl Database {
     pub fn begin_prepared_upload(&self, id: &str) -> Result<Option<String>> {
         let attempt_id = Uuid::new_v4().to_string();
         let now = Utc::now();
-        let now_text = now.to_rfc3339();
+        let now_text = format_timestamp(now);
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let maintenance_hold_active: bool = tx.query_row(
@@ -427,16 +444,10 @@ impl Database {
 
     /// 返回当前不确定投稿 attempt 的开始时间，供创作中心核对时间窗。
     pub fn uncertain_upload_started_at(&self, id: &str) -> Result<Option<DateTime<Utc>>> {
-        let started_at = self
-            .conn()
-            .query_row(
-                "SELECT started_at FROM upload_attempts \
-                 WHERE job_id=? AND status='uncertain' ORDER BY started_at DESC LIMIT 1",
-                [id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        started_at.map(parse).transpose().map_err(Into::into)
+        let Some((_, started_at)) = uncertain_upload_attempt(&self.conn(), id)? else {
+            return Ok(None);
+        };
+        Ok(Some(parse(started_at)?))
     }
 
     /// biliup 明确返回成功后，把 attempt、任务终态和投稿冷却放在同一事务提交。
@@ -463,9 +474,10 @@ impl Database {
             completion_status
         };
         let now = Utc::now();
-        let now_text = now.to_rfc3339();
-        let subtitle_retry_at = queue_subtitle
-            .then(|| (now + chrono::Duration::seconds(timing.subtitle_delay_seconds)).to_rfc3339());
+        let now_text = format_timestamp(now);
+        let subtitle_retry_at = queue_subtitle.then(|| {
+            format_timestamp(now + chrono::Duration::seconds(timing.subtitle_delay_seconds))
+        });
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let attempt_changed = tx.execute(
@@ -495,7 +507,7 @@ impl Database {
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
                 params![
                     NEXT_BILIBILI_SUBMIT_AT,
-                    next_submit_at.to_rfc3339(),
+                    format_timestamp(next_submit_at),
                     &now_text
                 ],
             )?;
@@ -506,7 +518,7 @@ impl Database {
 
     /// 平台明确拒绝、确定没有产生稿件时结束 attempt，任务仍由既有退避逻辑处理。
     pub fn fail_upload_attempt(&self, id: &str, attempt_id: &str, detail: &str) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
+        let now = format_timestamp(Utc::now());
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let attempt_changed = tx.execute(
@@ -533,7 +545,7 @@ impl Database {
         attempt_id: &str,
         detail: &str,
     ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
+        let now = format_timestamp(Utc::now());
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let attempt_changed = tx.execute(
@@ -570,14 +582,16 @@ impl Database {
     ///
     /// 调用方必须先拿到「创作中心没有这次投稿」的证据；这里只负责原子结算。
     pub fn discard_uncertain_upload(&self, id: &str, detail: &str) -> Result<JobStatus> {
-        let now_text = Utc::now().to_rfc3339();
+        let now_text = format_timestamp(Utc::now());
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some((attempt_id, _)) = uncertain_upload_attempt(&tx, id)? else {
+            anyhow::bail!("任务 {id} 不在有效的投稿结果不确定状态")
+        };
         let attempt_changed = tx.execute(
             "UPDATE upload_attempts SET status='failed',detail=?,finished_at=? \
-             WHERE id=(SELECT id FROM upload_attempts WHERE job_id=? ORDER BY started_at DESC LIMIT 1) \
-               AND status='uncertain'",
-            params![detail, &now_text, id],
+             WHERE id=? AND job_id=? AND status='uncertain'",
+            params![detail, &now_text, attempt_id, id],
         )?;
         // 上传计划还在就直接回到 ready_to_upload，和 retry_job 一致；否则从头重跑。
         let changed = tx.execute(
@@ -617,16 +631,19 @@ impl Database {
             completion_status
         };
         let now = Utc::now();
-        let now_text = now.to_rfc3339();
-        let subtitle_retry_at = queue_subtitle
-            .then(|| (now + chrono::Duration::seconds(timing.subtitle_delay_seconds)).to_rfc3339());
+        let now_text = format_timestamp(now);
+        let subtitle_retry_at = queue_subtitle.then(|| {
+            format_timestamp(now + chrono::Duration::seconds(timing.subtitle_delay_seconds))
+        });
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some((attempt_id, _)) = uncertain_upload_attempt(&tx, id)? else {
+            anyhow::bail!("任务 {id} 不在有效的投稿结果不确定状态")
+        };
         let attempt_changed = tx.execute(
             "UPDATE upload_attempts SET status='reconciled',bvid=?,detail='创作中心核对确认',finished_at=? \
-             WHERE id=(SELECT id FROM upload_attempts WHERE job_id=? ORDER BY started_at DESC LIMIT 1) \
-               AND status='uncertain'",
-            params![bvid, &now_text, id],
+             WHERE id=? AND job_id=? AND status='uncertain'",
+            params![bvid, &now_text, attempt_id, id],
         )?;
         let changed = tx.execute(
             "UPDATE jobs SET bvid=?,status=?,error=NULL,prepared_upload_json=NULL,retry_at=NULL,subtitle_attempt=0,subtitle_retry_at=?,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
@@ -648,7 +665,7 @@ impl Database {
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
                 params![
                     NEXT_BILIBILI_SUBMIT_AT,
-                    next_submit_at.to_rfc3339(),
+                    format_timestamp(next_submit_at),
                     &now_text
                 ],
             )?;
@@ -665,7 +682,7 @@ impl Database {
         width: Option<i64>,
         height: Option<i64>,
     ) -> Result<()> {
-        self.conn().execute("UPDATE jobs SET title=?,is_short=?,duration_seconds=?,width=?,height=?,updated_at=? WHERE id=?",params![title,is_short as i64,duration,width,height,Utc::now().to_rfc3339(),id])?;
+        self.conn().execute("UPDATE jobs SET title=?,is_short=?,duration_seconds=?,width=?,height=?,updated_at=? WHERE id=?",params![title,is_short as i64,duration,width,height,format_timestamp(Utc::now()),id])?;
         Ok(())
     }
     pub fn set_job_model(
@@ -677,7 +694,7 @@ impl Database {
     ) -> Result<()> {
         self.conn().execute(
             "UPDATE jobs SET provider=?,ai_model=?,thinking=?,updated_at=? WHERE id=?",
-            params![provider, model, thinking, Utc::now().to_rfc3339(), id],
+            params![provider, model, thinking, format_timestamp(Utc::now()), id],
         )?;
         Ok(())
     }
@@ -690,7 +707,7 @@ impl Database {
             "UPDATE jobs SET source_metadata_json=?,updated_at=? WHERE id=?",
             params![
                 serde_json::to_string(metadata)?,
-                Utc::now().to_rfc3339(),
+                format_timestamp(Utc::now()),
                 id
             ],
         )?;
@@ -714,7 +731,7 @@ impl Database {
         let changed = self.conn().execute(
             "UPDATE jobs SET prepared_upload_json=?,status='ready_to_upload',error=NULL,updated_at=? \
              WHERE id=? AND status IN ('queued','retry_wait','inspecting','processing','failed','dead_letter')",
-            params![serde_json::to_string(upload)?, Utc::now().to_rfc3339(), id],
+            params![serde_json::to_string(upload)?, format_timestamp(Utc::now()), id],
         )?;
         if changed == 0 {
             let current = self
@@ -731,7 +748,7 @@ impl Database {
              WHERE id=? AND claim_kind=? AND claim_owner=?",
             params![
                 serde_json::to_string(upload)?,
-                Utc::now().to_rfc3339(),
+                format_timestamp(Utc::now()),
                 id,
                 PREPARE_CLAIM_KIND,
                 self.claim_owner.as_ref()
@@ -756,4 +773,35 @@ impl Database {
             .map(|json| serde_json::from_str(&json).map_err(Into::into))
             .transpose()
     }
+}
+
+/// 核对只结算调用时能唯一识别的那条 `uncertain` attempt。
+///
+/// 只按 `started_at` 取最新一行时，同毫秒的旧 `failed` 记录可能被选中，
+/// 随后的状态条件更新 0 行，人工核对会一直卡住。
+fn uncertain_upload_attempt(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Option<(String, String)>> {
+    let mut query = connection.prepare(
+        "SELECT id, started_at FROM upload_attempts \
+         WHERE job_id=? AND status='uncertain' ORDER BY started_at DESC, id DESC",
+    )?;
+    let rows = query
+        .query_map([job_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let latest = &rows[0].1;
+    let tied = rows
+        .iter()
+        .filter(|(_, started_at)| started_at == latest)
+        .count();
+    if tied > 1 {
+        anyhow::bail!("任务 {job_id} 有 {tied} 条开始时间同为 {latest} 的未决投稿记录，无法区分");
+    }
+    Ok(Some(rows[0].clone()))
 }

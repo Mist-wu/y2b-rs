@@ -179,6 +179,48 @@ pub(super) fn parse_publication_metadata(value: &Value) -> Result<PublicationMet
 }
 
 /// 对已落库的元数据重新跑一遍解析期的清洗，尽量把它救回可投稿状态。
+/// 已落库文案能直接用就用，能清洗就先落库；两边都失败时返回 `None`，调用方重新准备。
+pub(super) fn accept_saved_publication(
+    metadata: &PublicationMetadata,
+) -> Result<Option<PublicationMetadata>> {
+    if validate_publication_metadata(metadata).is_ok() {
+        return Ok(Some(metadata.clone()));
+    }
+    let repaired = repair_publication_metadata(metadata);
+    if validate_publication_metadata(&repaired).is_ok() {
+        return Ok(Some(repaired));
+    }
+    Ok(None)
+}
+
+pub(super) fn payload_with_feedback(base: &Value, feedback: &str, budget: usize) -> Value {
+    if feedback.is_empty() {
+        return base.clone();
+    }
+    let mut with_feedback = base.clone();
+    with_feedback["feedback"] = json!(feedback);
+    if publication_payload_fits(&with_feedback, budget) {
+        return with_feedback;
+    }
+    let chars = feedback.chars().collect::<Vec<_>>();
+    let mut low = 0;
+    let mut high = chars.len();
+    let mut best = base.clone();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let truncated = chars.iter().take(mid).collect::<String>();
+        let mut candidate = base.clone();
+        candidate["feedback"] = json!(truncated);
+        if publication_payload_fits(&candidate, budget) {
+            best = candidate;
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    best
+}
+
 pub(super) fn repair_publication_metadata(metadata: &PublicationMetadata) -> PublicationMetadata {
     PublicationMetadata {
         title: shorten_to_chinese_width(
@@ -463,15 +505,13 @@ impl Pipeline {
         cues: Option<&[Cue]>,
     ) -> Result<PublicationMetadata> {
         if let Some(saved) = self.db.publication_metadata(job_id)? {
-            if validate_publication_metadata(&saved).is_ok() {
-                return Ok(saved);
-            }
             // 已落库的元数据可能是在清洗/校验规则收紧之前写入的。能就地清洗就复用，
             // 否则丢弃重新生成——否则每次重试都拿同一份坏数据失败，直到进死信。
-            let repaired = repair_publication_metadata(&saved);
-            if validate_publication_metadata(&repaired).is_ok() {
-                self.db.save_publication_metadata(job_id, &repaired)?;
-                return Ok(repaired);
+            if let Some(accepted) = accept_saved_publication(&saved)? {
+                if accepted != saved {
+                    self.db.save_publication_metadata(job_id, &accepted)?;
+                }
+                return Ok(accepted);
             }
             tracing::warn!(job_id, "已保存的投稿元数据无法清洗通过校验，重新生成");
         }
@@ -484,11 +524,23 @@ impl Pipeline {
             Some(&self.config.ai.model),
             Some(&self.config.ai.thinking),
         )?;
+        let base_payload = build_publication_payload(mode, meta, cues, budget)?;
         let mut feedback: Option<String> = None;
         for attempt in 0..=PUBLICATION_FEEDBACK_RETRIES {
-            let mut payload = build_publication_payload(mode, meta, cues, budget)?;
-            if let Some(message) = &feedback {
-                payload["feedback"] = json!(message);
+            let payload = match feedback.as_deref() {
+                Some(message) => payload_with_feedback(&base_payload, message, budget),
+                None => base_payload.clone(),
+            };
+            if !publication_payload_fits(&payload, budget) {
+                return Err(stage.fail(
+                    anyhow::anyhow!(
+                        "投稿元数据请求超过预算: estimated_tokens={}, bytes={}",
+                        estimate_publication_tokens(&payload),
+                        payload.to_string().len()
+                    ),
+                    stage.elapsed_ms(),
+                    0,
+                ));
             }
             let r = match self.call_ai(job_id, stage.id(), payload).await {
                 Ok(result) => result,
@@ -549,6 +601,8 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::db::{Database, NewJob};
     use crate::pipeline::testing::{cue, metadata};
 
     #[test]
@@ -874,5 +928,83 @@ mod tests {
         assert!(description.starts_with("来源：https://www.youtube.com/watch?v=video\n"));
         assert!(description.contains("处理工具：https://github.com/Mist-wu/y2b-rs"));
         assert!(!description.contains("处理方式"));
+    }
+
+    #[test]
+    fn feedback_payload_stays_inside_byte_and_token_budgets() {
+        let mut payload = json!({"task":"publish_metadata","note":""});
+        let room = AI_MAX_PAYLOAD_BYTES - payload.to_string().len() - 48;
+        payload["note"] = json!("a".repeat(room));
+        let base_len = payload.to_string().len();
+        assert!(base_len <= AI_MAX_PAYLOAD_BYTES);
+        assert!(base_len + 80 > AI_MAX_PAYLOAD_BYTES);
+        let feedback = "上一轮输出被拒绝：动态含引导互动内容。请修正后重新输出。".repeat(8);
+        let mut raw = payload.clone();
+        raw["feedback"] = json!(feedback);
+        assert!(raw.to_string().len() > AI_MAX_PAYLOAD_BYTES);
+        let fitted = payload_with_feedback(&payload, &feedback, 10_000_000);
+        assert!(fitted.to_string().len() <= AI_MAX_PAYLOAD_BYTES);
+        assert!(publication_payload_fits(&fitted, 10_000_000));
+
+        let token_budget = estimate_publication_tokens(&payload);
+        let token_fitted = payload_with_feedback(&payload, &feedback, token_budget);
+        assert!(publication_payload_fits(&token_fitted, token_budget));
+    }
+
+    #[tokio::test]
+    async fn publication_feedback_retry_does_not_exceed_the_request_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let recorded = seen.clone();
+        let mut config = Config::default();
+        config.ai.safe_context_tokens = 200_000;
+        config.ai.context_window_tokens = 200_000;
+        crate::pipeline::testing::mock_ai(&mut config, directory.path(), move |request| {
+            let content = request["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            recorded.lock().unwrap().push(content.len());
+            let payload: Value = serde_json::from_str(&content).unwrap();
+            assert!(content.len() <= AI_MAX_PAYLOAD_BYTES, "{}", content.len());
+            assert!(publication_payload_fits(&payload, 200_000));
+            (
+                axum::http::StatusCode::OK,
+                crate::pipeline::testing::completion(json!({
+                    "title": "排位赛翻盘",
+                    "dynamic": "关注我。",
+                    "tags": ["荒野乱斗"]
+                })),
+            )
+        })
+        .await;
+        let db = Database::open(&directory.path().join("state.db")).unwrap();
+        let job_id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "budget-video",
+                url: "https://youtu.be/budget-video",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        let mut cues = Vec::new();
+        for index in 0..400 {
+            let mut cue = cue(index, &"subtitle sentence ".repeat(30));
+            cue.translation = Some("中文字幕".repeat(20));
+            cues.push(cue);
+        }
+        let pipeline = Pipeline::new(config, db);
+        let error = pipeline
+            .publish_metadata(&job_id, TransferMode::Translated, &metadata(), Some(&cues))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("引导互动") || error.to_string().contains("校验"));
+        let lengths = seen.lock().unwrap().clone();
+        assert!(lengths.len() >= 2, "{lengths:?}");
+        assert!(lengths.iter().all(|length| *length <= AI_MAX_PAYLOAD_BYTES));
     }
 }

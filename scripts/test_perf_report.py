@@ -127,6 +127,13 @@ class OperationalArgumentTests(unittest.TestCase):
             GLOSSARY_AUDIT.parse_args,
             ["--shard-index", "1", "--shard-count", "1"],
         )
+
+    def test_glossary_language_pair_accepts_missing_canonical_and_old_alias(self):
+        canonical = GLOSSARY_AUDIT.canonical_language_pair
+        self.assertEqual(canonical(None), "en-CN")
+        self.assertEqual(canonical(""), "en-CN")
+        self.assertEqual(canonical("en-CN"), "en-CN")
+        self.assertEqual(canonical("en->zh-CN"), "en-CN")
         self.assert_parse_error(GLOSSARY_AUDIT.parse_args, ["--timeout"])
 
 

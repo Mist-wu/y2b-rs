@@ -4,6 +4,43 @@ pub(super) fn format_timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// 把旧库里参与 SQL 比较的时间收成与新写入相同的毫秒 UTC `Z` 文本。
+///
+/// `ceil_submillis` 用于租约和重试截止时间：亚毫秒余量向上进到下一毫秒，
+/// 避免 `.123456+00:00` 在收成三位小数后被同一毫秒的比较时刻提前判到期。
+pub(super) fn canonical_sql_timestamp(raw: &str, ceil_submillis: bool) -> Result<String, String> {
+    let parsed = parse_legacy_timestamp(raw)?;
+    Ok(format_sql_instant(parsed, ceil_submillis))
+}
+
+fn parse_legacy_timestamp(raw: &str) -> Result<DateTime<Utc>, String> {
+    if let Ok(value) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(value.with_timezone(&Utc));
+    }
+    // 早期迁移和 SQLite `CURRENT_TIMESTAMP` 使用空格分隔的 UTC 时间，可带小数。
+    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f") {
+        return Ok(value.and_utc());
+    }
+    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
+        return Ok(value.and_utc());
+    }
+    Err(format!("无法解析时间戳 {raw:?}"))
+}
+
+fn format_sql_instant(value: DateTime<Utc>, ceil_submillis: bool) -> String {
+    let value = if ceil_submillis {
+        let remainder = value.timestamp_subsec_nanos() % 1_000_000;
+        if remainder == 0 {
+            value
+        } else {
+            value + chrono::Duration::nanoseconds(i64::from(1_000_000 - remainder))
+        }
+    } else {
+        value
+    };
+    format_timestamp(value)
+}
+
 pub(super) fn maintenance_hold_from_row(
     r: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<MaintenanceHold> {

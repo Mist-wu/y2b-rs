@@ -23,7 +23,7 @@ impl Database {
         let source_lang = source_lang
             .map(crate::config::normalize_source_lang)
             .transpose()?;
-        let now = Utc::now().to_rfc3339();
+        let now = format_timestamp(Utc::now());
         let c = self.conn();
         c.execute("INSERT INTO channels(youtube_channel_id,name,url,feed_url,transfer_mode,baseline_at,created_at,source_lang) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(youtube_channel_id) DO UPDATE SET name=excluded.name,url=excluded.url,feed_url=excluded.feed_url,transfer_mode=excluded.transfer_mode,source_lang=COALESCE(excluded.source_lang,channels.source_lang)", params![channel_id,name,url,feed_url,transfer_mode.to_string(),now,now,source_lang])?;
         Ok(c.query_row(
@@ -362,7 +362,7 @@ impl Database {
     pub fn mark_channel_checked(&self, id: i64, error: Option<&str>) -> Result<()> {
         self.conn().execute(
             "UPDATE channels SET last_checked_at=?,last_error=? WHERE id=?",
-            params![Utc::now().to_rfc3339(), error, id],
+            params![format_timestamp(Utc::now()), error, id],
         )?;
         Ok(())
     }
@@ -552,15 +552,51 @@ impl Database {
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<VideoCandidate>> {
+        self.due_video_candidates_filtered(None, now, limit)
+    }
+
+    pub fn due_video_candidates_for_channel(
+        &self,
+        channel_id: i64,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<VideoCandidate>> {
+        self.due_video_candidates_filtered(Some(channel_id), now, limit)
+    }
+
+    fn due_video_candidates_filtered(
+        &self,
+        channel_id: Option<i64>,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<VideoCandidate>> {
         let c = self.conn();
-        let mut q = c.prepare(&format!(
-            "SELECT {CANDIDATE_COLUMNS} FROM video_candidates LEFT JOIN channels ON channels.id=video_candidates.channel_id WHERE gate_state='pending' OR (gate_state='deferred' AND next_gate_at<=?) ORDER BY CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END DESC,discovered_at LIMIT ?"
-        ))?;
-        Ok(q.query_map(
-            params![format_timestamp(now), limit as i64],
-            candidate_from_row,
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
+        let (sql, params): (String, Vec<rusqlite::types::Value>) = match channel_id {
+            Some(channel_id) => (
+                format!(
+                    "SELECT {CANDIDATE_COLUMNS} FROM video_candidates LEFT JOIN channels ON channels.id=video_candidates.channel_id WHERE video_candidates.channel_id=? AND (gate_state='pending' OR (gate_state='deferred' AND next_gate_at<=?)) ORDER BY CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END DESC,discovered_at LIMIT ?"
+                ),
+                vec![
+                    rusqlite::types::Value::Integer(channel_id),
+                    rusqlite::types::Value::Text(format_timestamp(now)),
+                    rusqlite::types::Value::Integer(limit as i64),
+                ],
+            ),
+            None => (
+                format!(
+                    "SELECT {CANDIDATE_COLUMNS} FROM video_candidates LEFT JOIN channels ON channels.id=video_candidates.channel_id WHERE gate_state='pending' OR (gate_state='deferred' AND next_gate_at<=?) ORDER BY CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END DESC,discovered_at LIMIT ?"
+                ),
+                vec![
+                    rusqlite::types::Value::Text(format_timestamp(now)),
+                    rusqlite::types::Value::Integer(limit as i64),
+                ],
+            ),
+        };
+        let mut q = c.prepare(&sql)?;
+        Ok(
+            q.query_map(rusqlite::params_from_iter(params), candidate_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        )
     }
 
     pub fn get_video_candidate(&self, video_id: &str) -> Result<Option<VideoCandidate>> {
@@ -669,7 +705,7 @@ impl Database {
     pub fn mark_channel_reconciled(&self, id: i64, error: Option<&str>) -> Result<()> {
         self.conn().execute(
             "UPDATE channels SET last_reconcile_at=?,last_error=? WHERE id=?",
-            params![Utc::now().to_rfc3339(), error, id],
+            params![format_timestamp(Utc::now()), error, id],
         )?;
         Ok(())
     }
@@ -698,7 +734,7 @@ impl Database {
         limit_seconds: u64,
         detail: &str,
     ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
+        let now = format_timestamp(Utc::now());
         self.conn().execute(
             "INSERT INTO over_duration_videos(video_id,channel_id,limit_seconds,detail,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(video_id) DO UPDATE SET channel_id=excluded.channel_id,limit_seconds=excluded.limit_seconds,detail=excluded.detail,updated_at=excluded.updated_at",
             params![video_id, channel_id, limit_seconds, detail, now, now],
