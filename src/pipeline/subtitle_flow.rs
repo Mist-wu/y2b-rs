@@ -448,6 +448,35 @@ pub(super) fn subtitle_language_tag(path: &Path, video_id: &str) -> String {
         .to_string()
 }
 
+fn is_translated_caption_url(url: &str) -> bool {
+    let Some((_, query)) = url.split_once('?') else {
+        return false;
+    };
+    let query = query.split('#').next().unwrap_or(query);
+    query.split('&').any(|pair| {
+        pair.split_once('=')
+            .is_some_and(|(key, value)| key == "tlang" && !value.is_empty())
+    })
+}
+
+/// 根据 yt-dlp 返回的轨道 URL 判断是否为自动翻译轨道：
+/// - `Some(true)`：至少一个格式 URL 含 `tlang=`，确认是自动翻译轨；
+/// - `Some(false)`：存在格式 URL 且均不含 `tlang=`，确认是原语轨；
+/// - `None`：元数据未提供 URL，交由标签启发式规则判断。
+fn track_translation_signal(formats: &[Value]) -> Option<bool> {
+    let mut saw_url = false;
+    for format in formats {
+        let Some(url) = format.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        saw_url = true;
+        if is_translated_caption_url(url) {
+            return Some(true);
+        }
+    }
+    saw_url.then_some(false)
+}
+
 fn best_track(
     source: &str,
     metadata: &Value,
@@ -459,10 +488,17 @@ fn best_track(
         .as_object()?
         .iter()
         .filter(|(language, formats)| {
-            matches_track(language, source)
-                && formats
-                    .as_array()
-                    .is_some_and(|formats| !formats.is_empty())
+            let Some(formats) = formats.as_array() else {
+                return false;
+            };
+            if formats.is_empty() {
+                return false;
+            }
+            match track_translation_signal(formats) {
+                Some(true) => false,
+                Some(false) => crate::config::matches_bcp47_source_lang(source, language),
+                None => matches_track(language, source),
+            }
         })
         .map(|(language, _)| language.clone())
         .collect::<Vec<_>>();
@@ -1434,6 +1470,9 @@ mod tests {
             ("PT-br", "pt-BR", true),
             ("zh", "zh-Hant-TW", true),
             ("zh-Hant", "zh-Hant-TW", true),
+            ("en", "en-DE", true),
+            ("en", "en-de", false),
+            ("en", "en-fr", false),
             ("ja", "ja-en", false),
             ("en", "en-ar", false),
             ("en", "en-zh-Hans", false),
@@ -1460,6 +1499,45 @@ mod tests {
                 "{tag}"
             );
         }
+    }
+
+    #[test]
+    fn subtitle_track_selection_uses_format_url_to_disambiguate_translations() {
+        let translated_en_de = serde_json::json!({
+            "automatic_captions": {
+                "en-de": [{
+                    "ext": "vtt",
+                    "url": "https://www.youtube.com/api/timedtext?v=abc&lang=en&tlang=de"
+                }]
+            }
+        });
+        assert!(select_subtitle_track(&translated_en_de, "en").is_none());
+
+        let translated_fr_ca = serde_json::json!({
+            "automatic_captions": {
+                "fr-ca": [{
+                    "ext": "vtt",
+                    "url": "https://www.youtube.com/api/timedtext?v=abc&lang=fr&tlang=ca"
+                }]
+            }
+        });
+        assert!(select_subtitle_track(&translated_fr_ca, "fr").is_none());
+
+        let native_en_de = serde_json::json!({
+            "subtitles": {
+                "en-de": [{
+                    "ext": "vtt",
+                    "url": "https://www.youtube.com/api/timedtext?v=abc&lang=en-DE"
+                }]
+            }
+        });
+        assert_eq!(
+            select_subtitle_track(&native_en_de, "en"),
+            Some(SubtitleTrack {
+                language: "en-de".into(),
+                kind: SubtitleTrackKind::Manual,
+            })
+        );
     }
     #[test]
     fn configured_language_selects_its_original_track() {

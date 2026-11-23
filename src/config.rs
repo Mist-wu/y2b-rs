@@ -302,24 +302,11 @@ pub fn validate_source_lang(lang: &str) -> Result<()> {
     normalize_source_lang(lang).map(drop)
 }
 
-pub(crate) fn matches_source_lang(source: &str, language: &str) -> bool {
+pub(crate) fn matches_bcp47_source_lang(source: &str, language: &str) -> bool {
     let language = language
         .strip_suffix("-orig")
         .unwrap_or(language)
         .replace('_', "-");
-    // YouTube also uses source-target keys. For ambiguous lowercase pairs,
-    // recognize regional locales and official languages from CLDR 48.1
-    // (availableLocales and supplemental/territoryInfo).
-    if let Some((_, suffix)) = language.split_once('-')
-        && suffix.len() == 2
-        && suffix.bytes().all(|byte| byte.is_ascii_lowercase())
-        && normalize_source_lang(suffix).is_ok()
-        && !include_str!("track_locales.txt")
-            .lines()
-            .any(|locale| locale.eq_ignore_ascii_case(&language))
-    {
-        return false;
-    }
     let (Ok(actual), Ok(expected)) = (
         normalize_source_lang(&language),
         normalize_source_lang(source),
@@ -333,6 +320,27 @@ pub(crate) fn matches_source_lang(source: &str, language: &str) -> bool {
         || expected
             .strip_prefix(&actual)
             .is_some_and(|rest| rest.starts_with('-'))
+}
+
+pub(crate) fn matches_source_lang(source: &str, language: &str) -> bool {
+    let language = language
+        .strip_suffix("-orig")
+        .unwrap_or(language)
+        .replace('_', "-");
+    // YouTube also uses source-target keys (e.g. `en-de`, `en-ar`, `ja-en`).
+    // When track URL metadata is unavailable, reject ambiguous lowercase
+    // two-letter suffixes unless the pair is a curated regional official locale.
+    if let Some((_, suffix)) = language.split_once('-')
+        && suffix.len() == 2
+        && suffix.bytes().all(|byte| byte.is_ascii_lowercase())
+        && normalize_source_lang(suffix).is_ok()
+        && !include_str!("track_locales.txt")
+            .lines()
+            .any(|locale| locale.eq_ignore_ascii_case(&language))
+    {
+        return false;
+    }
+    matches_bcp47_source_lang(source, &language)
 }
 impl Config {
     /// 严格读取配置，文件不存在也返回错误。
