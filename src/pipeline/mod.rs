@@ -483,21 +483,25 @@ fn quarantine_invalid_vtt_caches(work: &Path, video_id: &str) -> Result<Vec<Path
     Ok(quarantined)
 }
 
-/// 任务重试退避基数与上限：第 n 次失败后等待 `min(5min × 2^n, 1h)`。
-///
-/// n=1 恰好是迁移前的固定 10 分钟，所以首次重试的时机没变；之后逐步拉长，
-/// 避免持续故障（YouTube 限流、网络抖动）时在 max_attempts 内密集重试——
-/// 每次重试都要重新走一遍下载。
+/// 首次失败在 10–15 分钟后重试，保留旧的 10 分钟下限。
+/// 后续重试的基准时间逐次翻倍，至多 1 小时；到达上限后仍向下抖动。
 const RETRY_BASE_SECONDS: i64 = 300;
 const RETRY_CAP_SECONDS: i64 = 3600;
 /// 已入队的直播/预约每 30 分钟复查一次，直到完整回放可用。
 const LIVE_RETRY_SECONDS: i64 = 30 * 60;
 
 fn retry_delay_seconds(attempt: i64) -> i64 {
+    let jitter = crate::retry::random_jitter_factor();
+    // 将首次重试的 [0.5, 1.5] 线性映射到 [1.0, 1.5]。
+    let jitter = if attempt == 1 {
+        0.75 + jitter / 2.0
+    } else {
+        jitter
+    };
     crate::retry::jittered_backoff(
         Duration::from_secs(RETRY_BASE_SECONDS as u64),
         attempt.clamp(0, 16) as u32,
-        crate::retry::random_jitter_factor(),
+        jitter,
         Duration::from_secs(RETRY_CAP_SECONDS as u64),
     )
     .as_secs()
