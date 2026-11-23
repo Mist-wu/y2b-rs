@@ -1593,7 +1593,7 @@ fn rejected_subtitle_attempt_allows_policy_retry() {
     assert_ne!(first_attempt, second_attempt);
     let statuses: Vec<String> = db
         .conn()
-        .prepare("SELECT status FROM subtitle_attempts WHERE job_id=? ORDER BY started_at,id")
+        .prepare("SELECT status FROM subtitle_attempts WHERE job_id=? ORDER BY rowid")
         .unwrap()
         .query_map([&id], |row| row.get(0))
         .unwrap()
