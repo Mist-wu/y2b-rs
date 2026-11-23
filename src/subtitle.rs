@@ -24,12 +24,21 @@ const INLINE_ATOM_MAX_CHARS: usize = 40;
 const INLINE_ATOM_MAX_WORDS: usize = 8;
 
 pub fn parse_vtt(path: &Path) -> Result<Vec<Cue>> {
+    static TIMING_RE: OnceLock<Regex> = OnceLock::new();
+    static TAGS_RE: OnceLock<Regex> = OnceLock::new();
+    static INLINE_TIMING_RE: OnceLock<Regex> = OnceLock::new();
+
     let raw = fs::read_to_string(path)?;
-    let timing = Regex::new(
-        r"^(?<start>(?:\d{2,}:)?\d{2}:\d{2}\.\d{3})[ \t]+-->[ \t]+(?<end>(?:\d{2,}:)?\d{2}:\d{2}\.\d{3})(?:[ \t]+.*)?$",
-    )?;
-    let tags = Regex::new(r"<[^>]+>")?;
-    let inline_timing = Regex::new(r"<(?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3}>")?;
+    let timing = TIMING_RE.get_or_init(|| {
+        Regex::new(
+            r"^(?<start>(?:\d{2,}:)?\d{2}:\d{2}\.\d{3})[ \t]+-->[ \t]+(?<end>(?:\d{2,}:)?\d{2}:\d{2}\.\d{3})(?:[ \t]+.*)?$",
+        )
+        .expect("固定 VTT 时间轴正则必须有效")
+    });
+    let tags = TAGS_RE.get_or_init(|| Regex::new(r"<[^>]+>").expect("固定 VTT 标签正则必须有效"));
+    let inline_timing = INLINE_TIMING_RE.get_or_init(|| {
+        Regex::new(r"<(?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3}>").expect("固定 VTT 内联时间正则必须有效")
+    });
     let mut blocks = Vec::new();
     for block in raw.replace("\r\n", "\n").split("\n\n") {
         let lines: Vec<_> = block.lines().collect();
@@ -43,7 +52,7 @@ pub fn parse_vtt(path: &Path) -> Result<Vec<Cue>> {
         let start = parse_ts(&captures["start"])?;
         let end = parse_ts(&captures["end"])?;
         let raw_source = lines[i + 1..].join("\n");
-        let source = clean_vtt_text(&raw_source, &tags);
+        let source = clean_vtt_text(&raw_source, tags);
         if !source.is_empty() {
             blocks.push(VttBlock {
                 cue: Cue {
@@ -52,7 +61,7 @@ pub fn parse_vtt(path: &Path) -> Result<Vec<Cue>> {
                     source,
                     translation: None,
                 },
-                inline_parts: parse_inline_parts(&raw_source, start, end, &tags, &inline_timing)?,
+                inline_parts: parse_inline_parts(&raw_source, start, end, tags, inline_timing)?,
             });
         }
     }
@@ -412,33 +421,6 @@ fn group_inline_atoms(cues: Vec<Cue>) -> Vec<Cue> {
     output
 }
 
-/// YouTube 自动字幕按“滚动窗口”生成：每条 cue 重复上一条的尾部文本再追加新词，
-/// 相邻 cue 间存在大量前缀/后缀重叠。这里把每条 cue 裁剪为“相对上一条新增的内容”，
-/// 使每个句子只出现一次，避免分句/翻译 token 浪费和译文重复结巴。
-#[cfg(test)]
-fn dedup_rolling(c: &mut Vec<Cue>) {
-    const MIN_OVERLAP_CHARS: usize = 10;
-    if c.len() < 2 {
-        return;
-    }
-    let mut carry = String::new();
-    let mut out = Vec::with_capacity(c.len());
-    for cue in c.drain(..) {
-        let original = cue.source.trim().to_string();
-        let stripped = strip_rolling_overlap(&carry, &original, MIN_OVERLAP_CHARS);
-        // carry 始终取“原始滚动窗口”文本，而不是裁剪后的，保证后续重叠检测正确。
-        carry = original;
-        if stripped.is_empty() {
-            continue;
-        }
-        out.push(Cue {
-            source: stripped,
-            ..cue
-        });
-    }
-    *c = out;
-}
-
 /// 若 `text` 以 `carry` 的一个“词边界对齐”的后缀开头（即文本滚动重叠），
 /// 则裁掉该重叠前缀，只返回新增内容；无重叠时原样返回。
 fn strip_rolling_overlap(carry: &str, text: &str, min_chars: usize) -> String {
@@ -691,8 +673,14 @@ Brown noise and chill music.
                 translation: None,
             },
         ];
-        let mut deduped = cues.clone();
-        dedup_rolling(&mut deduped);
+        let deduped = refine_rolling_blocks(
+            cues.into_iter()
+                .map(|cue| VttBlock {
+                    cue,
+                    inline_parts: Vec::new(),
+                })
+                .collect(),
+        );
         let texts: Vec<&str> = deduped.iter().map(|c| c.source.as_str()).collect();
         assert_eq!(
             texts,
@@ -720,8 +708,14 @@ Brown noise and chill music.
                 translation: None,
             },
         ];
-        let mut deduped = cues.clone();
-        dedup_rolling(&mut deduped);
+        let deduped = refine_rolling_blocks(
+            cues.into_iter()
+                .map(|cue| VttBlock {
+                    cue,
+                    inline_parts: Vec::new(),
+                })
+                .collect(),
+        );
         assert_eq!(deduped.len(), 2);
         assert_eq!(deduped[0].source, "Hello everyone");
         assert_eq!(deduped[1].source, "Welcome back to the channel");
@@ -747,21 +741,28 @@ Brown noise and chill music.
             ),
             "folks"
         );
-        let mut cues = vec![
-            Cue {
-                start: 0.0,
-                end: 1.0,
-                source: "♪ so I’m gonna show you the new brawler".into(),
-                translation: None,
-            },
-            Cue {
-                start: 1.1,
-                end: 2.0,
-                source: "so I’m gonna show you the new brawler today ♪".into(),
-                translation: None,
-            },
-        ];
-        dedup_rolling(&mut cues);
+        let cues = refine_rolling_blocks(
+            vec![
+                Cue {
+                    start: 0.0,
+                    end: 1.0,
+                    source: "♪ so I’m gonna show you the new brawler".into(),
+                    translation: None,
+                },
+                Cue {
+                    start: 1.1,
+                    end: 2.0,
+                    source: "so I’m gonna show you the new brawler today ♪".into(),
+                    translation: None,
+                },
+            ]
+            .into_iter()
+            .map(|cue| VttBlock {
+                cue,
+                inline_parts: Vec::new(),
+            })
+            .collect(),
+        );
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[1].source, "today ♪");
     }

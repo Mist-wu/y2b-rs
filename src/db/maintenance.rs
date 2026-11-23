@@ -160,7 +160,15 @@ impl Database {
     /// 返回维护所需的完整空闲快照。`owner` 可排除调用方自己持有的维护锁；
     /// 其他持有者（尤其 live_once）仍会作为明确阻塞项返回。
     pub fn maintenance_status(&self, owner: Option<&str>) -> Result<MaintenanceStatus> {
-        let checked_at = Utc::now();
+        self.maintenance_status_at(owner, Utc::now())
+    }
+
+    /// 用固定比较时刻检查空闲状态，供迁移后的时间回归使用。
+    pub(crate) fn maintenance_status_at(
+        &self,
+        owner: Option<&str>,
+        checked_at: DateTime<Utc>,
+    ) -> Result<MaintenanceStatus> {
         let now_text = format_timestamp(checked_at);
         let connection = self.conn();
         let mut blockers = Vec::new();

@@ -42,8 +42,9 @@ pub(super) fn is_upload_uncertain(error: &anyhow::Error) -> bool {
 }
 
 fn valid_bvid(value: &str) -> bool {
-    Regex::new(r"^BV[0-9A-Za-z]{10}$")
-        .expect("固定 BVID 正则必须有效")
+    static BVID_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    BVID_RE
+        .get_or_init(|| Regex::new(r"^BV[0-9A-Za-z]{10}$").expect("固定 BVID 正则必须有效"))
         .is_match(value)
 }
 
@@ -79,16 +80,22 @@ fn response_from_json_line(line: &str) -> Option<BiliupSubmissionResponse> {
 }
 
 fn response_from_debug_line(line: &str) -> Option<BiliupSubmissionResponse> {
-    let response =
+    static RESPONSE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static DEBUG_BVID_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let response = RESPONSE_RE.get_or_init(|| {
         Regex::new(r#"ResponseData\s*\{\s*code:\s*(-?\d+),\s*data:\s*(.*),\s*message:\s*"#)
-            .expect("固定 ResponseData 正则必须有效");
+            .expect("固定 ResponseData 正则必须有效")
+    });
     let captures = response.captures(line)?;
     let code = captures.get(1)?.as_str().parse::<i64>().ok()?;
     if code != 0 {
         return Some(BiliupSubmissionResponse::Rejected(code));
     }
-    let bvid = Regex::new(r#""bvid":\s*String\("(BV[0-9A-Za-z]{10})"\)"#)
-        .expect("固定 biliup Debug BVID 正则必须有效")
+    let bvid = DEBUG_BVID_RE
+        .get_or_init(|| {
+            Regex::new(r#""bvid":\s*String\("(BV[0-9A-Za-z]{10})"\)"#)
+                .expect("固定 biliup Debug BVID 正则必须有效")
+        })
         .captures(captures.get(2)?.as_str())
         .and_then(|captures| captures.get(1))
         .map(|value| value.as_str().to_string());
@@ -222,8 +229,8 @@ fn reconciliation_bvid(
 }
 
 pub(super) fn ensure_prepared_file(path: &Path, label: &str) -> Result<()> {
-    if !path.metadata().is_ok_and(|metadata| metadata.len() > 0) {
-        bail!("待上传{label}不存在或为空: {}", path.display())
+    if !path.is_file() || !path.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+        bail!("待上传{label}不是非空普通文件: {}", path.display())
     }
     Ok(())
 }
@@ -372,123 +379,102 @@ impl Pipeline {
         {
             bail!("Bilibili 认证失效，暂停上传并保留现有文件")
         }
-        let prepared = self
+        let PreparedUpload::Submission {
+            video_path,
+            cover_path,
+            mode,
+            completion_status,
+        } = self
             .db
             .prepared_upload(&job.id)?
             .with_context(|| format!("待上传任务 {} 缺少持久化上传计划", job.id))?;
-        let subtitle_queued = match prepared {
-            PreparedUpload::Submission {
-                video_path,
-                cover_path,
-                mode,
-                completion_status,
-            } => {
-                if !matches!(
-                    completion_status,
-                    JobStatus::Completed | JobStatus::UploadedOriginalPendingSubtitle
-                ) {
-                    bail!("待上传任务 {} 的完成状态无效: {completion_status}", job.id)
-                }
-                let video = PathBuf::from(video_path);
-                let cover = PathBuf::from(cover_path);
-                ensure_prepared_file(&video, "视频")?;
-                ensure_prepared_file(&cover, "封面")?;
-                let publication = self
-                    .db
-                    .publication_metadata(&job.id)?
-                    .with_context(|| format!("待上传任务 {} 缺少投稿元数据", job.id))?;
-                let meta = self
-                    .db
-                    .source_metadata(&job.id)?
-                    .with_context(|| format!("待上传任务 {} 缺少来源元数据", job.id))?;
-                if !self.wait_for_bilibili_submission(&job.id).await? {
-                    return Ok(());
-                }
-                let Some(attempt_id) = self.db.begin_prepared_upload(&job.id)? else {
-                    return Ok(());
-                };
-                let execution = self
-                    .run_with_claim_heartbeat(
-                        &job.id,
-                        crate::db::UPLOAD_CLAIM_KIND,
-                        self.upload(&job.id, &video, &publication, &meta, Some(&cover)),
-                    )
-                    .await;
-                let bvid = match execution {
-                    Ok(bvid) => bvid,
-                    Err(error) if error.downcast_ref::<BiliupRejectedError>().is_some() => {
-                        self.db
-                            .fail_upload_attempt(&job.id, &attempt_id, &error.to_string())?;
-                        return Err(error);
-                    }
-                    Err(error) => {
-                        let detail = format!(
-                            "投稿结果不确定（attempt={attempt_id}），请用 jobs reconcile-upload 核对创作中心后再处理: {error:#}"
-                        );
-                        let marked =
-                            self.db
-                                .mark_upload_attempt_uncertain(&job.id, &attempt_id, &detail);
-                        let detail = match marked {
-                            Ok(()) => detail,
-                            Err(mark_error) => {
-                                format!("{detail}；写入不确定状态失败: {mark_error:#}")
-                            }
-                        };
-                        return Err(UploadUncertainError { detail }.into());
-                    }
-                };
-                let next_submit_at = match self
-                    .bilibili_submission_deadline(self.config.bilibili.submit_interval_seconds)
-                {
-                    Ok(next_submit_at) => next_submit_at,
-                    Err(error) => {
-                        let detail = format!(
-                            "Bilibili 已返回成功 {bvid}，但计算本地冷却时间失败（attempt={attempt_id}）: {error:#}"
-                        );
-                        let detail = match self.db.mark_upload_attempt_uncertain(
-                            &job.id,
-                            &attempt_id,
-                            &detail,
-                        ) {
-                            Ok(()) => detail,
-                            Err(mark_error) => {
-                                format!("{detail}；写入不确定状态失败: {mark_error:#}")
-                            }
-                        };
-                        return Err(UploadUncertainError { detail }.into());
-                    }
-                };
-                match self.db.finish_upload_attempt(
-                    &job.id,
-                    &attempt_id,
-                    &bvid,
-                    completion_status,
-                    mode,
-                    UploadCompletionTiming {
-                        subtitle_delay_seconds: CC_INITIAL_DELAY_SECONDS,
-                        next_submit_at,
-                    },
-                ) {
-                    Ok(subtitle_queued) => subtitle_queued,
-                    Err(error) => {
-                        let detail = format!(
-                            "Bilibili 已返回成功 {bvid}，但本地确认失败（attempt={attempt_id}）: {error:#}"
-                        );
-                        let detail = match self.db.mark_upload_attempt_uncertain(
-                            &job.id,
-                            &attempt_id,
-                            &detail,
-                        ) {
-                            Ok(()) => detail,
-                            Err(mark_error) => {
-                                format!("{detail}；写入不确定状态失败: {mark_error:#}")
-                            }
-                        };
-                        return Err(UploadUncertainError { detail }.into());
-                    }
-                }
+        if !matches!(
+            completion_status,
+            JobStatus::Completed | JobStatus::UploadedOriginalPendingSubtitle
+        ) {
+            bail!("待上传任务 {} 的完成状态无效: {completion_status}", job.id)
+        }
+        let video = PathBuf::from(video_path);
+        let cover = PathBuf::from(cover_path);
+        ensure_prepared_file(&video, "视频")?;
+        ensure_prepared_file(&cover, "封面")?;
+        let saved = self
+            .db
+            .publication_metadata(&job.id)?
+            .with_context(|| format!("待上传任务 {} 缺少投稿元数据", job.id))?;
+        let Some(publication) = super::publication::accept_saved_publication(&saved)? else {
+            bail!("待上传任务 {} 的投稿文案无法修复，需要重新准备", job.id)
+        };
+        if publication != saved {
+            self.db.save_publication_metadata(&job.id, &publication)?;
+        }
+        let meta = self
+            .db
+            .source_metadata(&job.id)?
+            .with_context(|| format!("待上传任务 {} 缺少来源元数据", job.id))?;
+        if !self.wait_for_bilibili_submission(&job.id).await? {
+            return Ok(());
+        }
+        ensure_prepared_file(&video, "视频")?;
+        ensure_prepared_file(&cover, "封面")?;
+        self.validate_downloaded_video(&job.id, &video, meta.duration, "upload_boundary_probe")
+            .await?;
+        let Some(attempt_id) = self.db.begin_prepared_upload(&job.id)? else {
+            return Ok(());
+        };
+        let execution = self
+            .run_with_claim_heartbeat(
+                &job.id,
+                crate::db::UPLOAD_CLAIM_KIND,
+                self.upload(&job.id, &video, &publication, &meta, &cover),
+            )
+            .await;
+        let uncertain = |detail: String| {
+            let detail = match self
+                .db
+                .mark_upload_attempt_uncertain(&job.id, &attempt_id, &detail)
+            {
+                Ok(()) => detail,
+                Err(error) => format!("{detail}；写入不确定状态失败: {error:#}"),
+            };
+            UploadUncertainError { detail }
+        };
+        let bvid = match execution {
+            Ok(bvid) => bvid,
+            Err(error) if error.downcast_ref::<BiliupRejectedError>().is_some() => {
+                self.db
+                    .fail_upload_attempt(&job.id, &attempt_id, &error.to_string())?;
+                return Err(error);
+            }
+            Err(error) => {
+                return Err(uncertain(format!(
+                    "投稿结果不确定（attempt={attempt_id}），请用 jobs reconcile-upload 核对创作中心后再处理: {error:#}"
+                )).into());
             }
         };
+        let next_submit_at = self
+            .bilibili_submission_deadline(self.config.bilibili.submit_interval_seconds)
+            .map_err(|error| uncertain(format!(
+                "Bilibili 已返回成功 {bvid}，但计算本地冷却时间失败（attempt={attempt_id}）: {error:#}"
+            )))?;
+        let subtitle_queued = self
+            .db
+            .finish_upload_attempt(
+                &job.id,
+                &attempt_id,
+                &bvid,
+                completion_status,
+                mode,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: CC_INITIAL_DELAY_SECONDS,
+                    next_submit_at,
+                },
+            )
+            .map_err(|error| {
+                uncertain(format!(
+                    "Bilibili 已返回成功 {bvid}，但本地确认失败（attempt={attempt_id}）: {error:#}"
+                ))
+            })?;
         // 投稿 attempt、任务终态和全局冷却已经由 finish_upload_attempt 同事务持久化。
         // CC 字幕状态和首次到期时间也在同一事务写入，不占用上传 worker。
         if subtitle_queued {
@@ -496,13 +482,7 @@ impl Pipeline {
                 .event(Some(&job.id), "info", "已投稿，等待自动补交中文 CC 字幕")?;
         }
         let (raw, _, _) = self.db.job_paths(&job.id)?;
-        let paths = [raw]
-            .into_iter()
-            .flatten()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
-        let path_refs = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
-        if let Err(error) = self.after_upload(&job.id, &path_refs) {
+        if let Err(error) = self.after_upload(&job.id, raw.as_deref().map(Path::new)) {
             tracing::warn!(job_id = %job.id, error = %error, "上传成功后的文件清理失败");
             self.db.event(
                 Some(&job.id),
@@ -513,13 +493,13 @@ impl Pipeline {
         Ok(())
     }
 
-    pub(super) async fn upload(
+    async fn upload(
         &self,
         job_id: &str,
         video: &Path,
         publication: &PublicationMetadata,
         meta: &VideoMetadata,
-        cover: Option<&Path>,
+        cover: &Path,
     ) -> Result<String> {
         let mut stage = StageGuard::start(&self.db, job_id, "upload", None, None, None)?;
         let mut cmd = Command::new(&self.config.bilibili.biliup);
@@ -527,10 +507,9 @@ impl Pipeline {
             .arg(&self.config.bilibili.cookies)
             .arg("upload")
             .arg(video)
-            .args(build_upload_args(publication, meta));
-        if let Some(c) = cover {
-            cmd.arg("--cover").arg(c);
-        }
+            .args(build_upload_args(publication, meta))
+            .arg("--cover")
+            .arg(cover);
         match run_monitored(cmd, Duration::from_secs(14400)).await {
             Ok(output) => {
                 let merged = output.stdout.clone() + "\n" + &output.stderr;
@@ -895,5 +874,189 @@ mod tests {
                 .to_string()
                 .contains("投稿冷却时间无效")
         );
+    }
+
+    fn executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn ready_job(
+        db: &Database,
+        directory: &std::path::Path,
+        video_id: &str,
+    ) -> (String, crate::model::Job) {
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id,
+                url: &format!("https://youtu.be/{video_id}"),
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Translated,
+            })
+            .unwrap()
+            .unwrap();
+        let mut meta = crate::pipeline::testing::metadata();
+        meta.id = video_id.into();
+        meta.duration = Some(120.0);
+        db.save_source_metadata(&id, &meta).unwrap();
+        let video = directory.join(format!("{video_id}.mp4"));
+        let cover = directory.join(format!("{video_id}.jpg"));
+        std::fs::write(&video, b"not a video but non-empty").unwrap();
+        std::fs::write(&cover, b"cover-bytes").unwrap();
+        db.queue_prepared_upload(
+            &id,
+            &PreparedUpload::Submission {
+                video_path: video.to_string_lossy().into_owned(),
+                cover_path: cover.to_string_lossy().into_owned(),
+                mode: TransferMode::Translated,
+                completion_status: JobStatus::Completed,
+            },
+        )
+        .unwrap();
+        let job = db.get_job(&id).unwrap().unwrap();
+        (id, job)
+    }
+
+    #[tokio::test]
+    async fn resumed_upload_repairs_old_metadata_and_rejects_a_replaced_bad_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("biliup.log");
+        let biliup = directory.path().join("biliup");
+        executable(
+            &biliup,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' '{{\"code\":0,\"data\":{{\"bvid\":\"BV1testtitle\"}}}}'\n",
+                log.display()
+            ),
+        );
+        let ffprobe = directory.path().join("ffprobe");
+        executable(
+            &ffprobe,
+            r#"#!/bin/sh
+printf '%s\n' '{"streams":[{"codec_type":"video","width":1280,"height":720},{"codec_type":"audio"}],"format":{"duration":"120"}}'
+"#,
+        );
+        let db = Database::open(&directory.path().join("state.db")).unwrap();
+        let (id, job) = ready_job(&db, directory.path(), "repair-meta");
+        db.save_publication_metadata(
+            &id,
+            &crate::model::PublicationMetadata {
+                title: "#bad cached title".into(),
+                dynamic: "最后一局上演极限翻盘。".into(),
+                tags: Vec::new(),
+                tid: 172,
+                raw_json: "{}".into(),
+            },
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.bilibili.biliup = biliup.to_string_lossy().into_owned();
+        config.render.ffprobe = ffprobe.to_string_lossy().into_owned();
+        let pipeline = crate::pipeline::Pipeline::new(config, db.clone());
+        pipeline.upload_prepared_job(job).await.unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("--title=cached title"), "{logged}");
+        assert!(!logged.contains("#bad"), "{logged}");
+        let saved = db.publication_metadata(&id).unwrap().unwrap();
+        assert_eq!(saved.title, "cached title");
+        assert_eq!(saved.tags.first().map(String::as_str), Some("荒野乱斗"));
+
+        let broken = directory.path().join("ffprobe-fail");
+        executable(&broken, "#!/bin/sh\nprintf 'BAD' >&2\nexit 1\n");
+        let (bad_id, bad_job) = ready_job(&db, directory.path(), "bad-file");
+        db.save_publication_metadata(
+            &bad_id,
+            &crate::model::PublicationMetadata {
+                title: "排位赛翻盘".into(),
+                dynamic: "最后一局上演极限翻盘。".into(),
+                tags: vec!["荒野乱斗".into()],
+                tid: 172,
+                raw_json: "{}".into(),
+            },
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("bad-file.mp4"), b"BAD").unwrap();
+        db.set_setting(NEXT_BILIBILI_SUBMIT_AT, "2000-01-01T00:00:00.000Z")
+            .unwrap();
+        let mut config = Config::default();
+        config.bilibili.biliup = biliup.to_string_lossy().into_owned();
+        config.render.ffprobe = broken.to_string_lossy().into_owned();
+        let before = std::fs::read_to_string(&log).unwrap();
+        let pipeline = crate::pipeline::Pipeline::new(config.clone(), db.clone());
+        assert!(pipeline.upload_prepared_job(bad_job).await.is_err());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+        let attempts = upload_attempt_count(directory.path().join("state.db"), &bad_id);
+        assert_eq!(attempts, 0);
+
+        let (dir_id, dir_job) = ready_job(&db, directory.path(), "dir-file");
+        db.save_publication_metadata(
+            &dir_id,
+            &crate::model::PublicationMetadata {
+                title: "排位赛翻盘".into(),
+                dynamic: "最后一局上演极限翻盘。".into(),
+                tags: vec!["荒野乱斗".into()],
+                tid: 172,
+                raw_json: "{}".into(),
+            },
+        )
+        .unwrap();
+        db.set_setting(NEXT_BILIBILI_SUBMIT_AT, "2000-01-01T00:00:00.000Z")
+            .unwrap();
+        let video = directory.path().join("dir-file.mp4");
+        std::fs::remove_file(&video).unwrap();
+        std::fs::create_dir(&video).unwrap();
+        let pipeline = crate::pipeline::Pipeline::new(config, db.clone());
+        let error = pipeline.upload_prepared_job(dir_job).await.unwrap_err();
+        assert!(error.to_string().contains("普通文件"), "{error}");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn unrepairable_cached_metadata_stops_before_the_uploader() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("biliup.log");
+        let biliup = directory.path().join("biliup");
+        executable(
+            &biliup,
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        );
+        let db = Database::open(&directory.path().join("state.db")).unwrap();
+        let (id, job) = ready_job(&db, directory.path(), "unrepairable");
+        db.save_publication_metadata(
+            &id,
+            &crate::model::PublicationMetadata {
+                title: "https://youtu.be/abc".into(),
+                dynamic: "https://example.com".into(),
+                tags: Vec::new(),
+                tid: 172,
+                raw_json: "{}".into(),
+            },
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.bilibili.biliup = biliup.to_string_lossy().into_owned();
+        let pipeline = crate::pipeline::Pipeline::new(config, db.clone());
+        let error = pipeline.upload_prepared_job(job).await.unwrap_err();
+        assert!(error.to_string().contains("重新准备"), "{error}");
+        assert!(!log.exists());
+        let attempts = upload_attempt_count(directory.path().join("state.db"), &id);
+        assert_eq!(attempts, 0);
+    }
+
+    fn upload_attempt_count(database: std::path::PathBuf, job_id: &str) -> i64 {
+        let connection = rusqlite::Connection::open(database).unwrap();
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM upload_attempts WHERE job_id=?",
+                [job_id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 }

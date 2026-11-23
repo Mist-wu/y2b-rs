@@ -1,16 +1,17 @@
-use super::*;
+use super::{rows::format_timestamp, *};
 
 impl Database {
     /// 投稿成功后把任务交给 CC 字幕队列：`delay_seconds` 之后才允许领取，
     /// 因为 B站稿件刚上传时查询 bvid 会短暂返回 -404。
     pub fn queue_pending_subtitle(&self, id: &str, delay_seconds: i64) -> Result<()> {
-        let retry_at = Utc::now() + chrono::Duration::seconds(delay_seconds);
+        let now = Utc::now();
+        let retry_at = now + chrono::Duration::seconds(delay_seconds);
         let changed = self.conn().execute(
             "UPDATE jobs SET status=?,subtitle_attempt=0,subtitle_retry_at=?,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? WHERE id=?",
             params![
                 JobStatus::UploadedOriginalPendingSubtitle.to_string(),
-                retry_at.to_rfc3339(),
-                Utc::now().to_rfc3339(),
+                format_timestamp(retry_at),
+                format_timestamp(now),
                 id
             ],
         )?;
@@ -24,6 +25,7 @@ impl Database {
     ///
     /// `subtitle_retry_at IS NULL` 是 v8 之前就停在待补状态的旧行，视为立即到期。
     pub fn next_pending_subtitle_job(&self, max_attempts: i64) -> Result<Option<Job>> {
+        let now = format_timestamp(Utc::now());
         self.job_opt(
             &format!(
                 "SELECT {JOB_COLUMNS} FROM jobs WHERE status='uploaded_original_pending_subtitle' \
@@ -33,19 +35,21 @@ impl Database {
                  AND NOT EXISTS(SELECT 1 FROM maintenance_hold WHERE singleton=1 AND expires_at>?) \
                  ORDER BY discovered_at LIMIT 1"
             ),
-            params![
-                max_attempts,
-                Utc::now().to_rfc3339(),
-                Utc::now().to_rfc3339(),
-                Utc::now().to_rfc3339()
-            ],
+            params![max_attempts, &now, &now, &now],
         )
     }
 
     /// 原子领取下一条到期的 CC 字幕任务。状态保持 pending，领取权由租约区分。
     pub fn claim_next_pending_subtitle_job(&self, max_attempts: i64) -> Result<Option<Job>> {
-        let now = Utc::now();
-        let now_text = now.to_rfc3339();
+        self.claim_next_pending_subtitle_job_at(max_attempts, Utc::now())
+    }
+
+    pub(crate) fn claim_next_pending_subtitle_job_at(
+        &self,
+        max_attempts: i64,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Job>> {
+        let now_text = format_timestamp(now);
         let sql = format!(
             "UPDATE jobs SET claim_kind='{SUBTITLE_CLAIM_KIND}',claim_owner=?1,claim_expires_at=?2,updated_at=?3 \
              WHERE id=(SELECT id FROM jobs WHERE status='uploaded_original_pending_subtitle' \
@@ -70,7 +74,7 @@ impl Database {
     /// 手工补字幕也先领取，避免与自动 worker 或另一条手工命令重复提交。
     pub fn claim_subtitle_job_now(&self, id: &str) -> Result<Option<Job>> {
         let now = Utc::now();
-        let now_text = now.to_rfc3339();
+        let now_text = format_timestamp(now);
         let sql = format!(
             "UPDATE jobs SET claim_kind='{SUBTITLE_CLAIM_KIND}',claim_owner=?1,claim_expires_at=?2,updated_at=?3 \
              WHERE id=?4 AND bvid IS NOT NULL AND bvid<>'' \
@@ -117,7 +121,7 @@ impl Database {
         bvid: &str,
     ) -> Result<SubtitleAttemptDecision> {
         let attempt_id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
+        let now = format_timestamp(Utc::now());
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let claim_valid: bool = tx.query_row(
@@ -168,7 +172,7 @@ impl Database {
         let changed = self.conn().execute(
             "UPDATE subtitle_attempts SET status='rejected',detail=?,finished_at=? \
              WHERE id=? AND job_id=? AND status='started'",
-            params![detail, Utc::now().to_rfc3339(), attempt_id, id],
+            params![detail, format_timestamp(Utc::now()), attempt_id, id],
         )?;
         if changed != 1 {
             anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} 已失效")
@@ -186,7 +190,7 @@ impl Database {
         let changed = self.conn().execute(
             "UPDATE subtitle_attempts SET status='uncertain',detail=?,finished_at=? \
              WHERE id=? AND job_id=? AND status IN('started','uncertain')",
-            params![detail, Utc::now().to_rfc3339(), attempt_id, id],
+            params![detail, format_timestamp(Utc::now()), attempt_id, id],
         )?;
         if changed != 1 {
             anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} 已失效")
@@ -201,31 +205,15 @@ impl Database {
         attempt_id: &str,
         mark_completed: bool,
     ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        let mut connection = self.conn();
-        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let attempt_changed = tx.execute(
-            "UPDATE subtitle_attempts SET status='confirmed',detail='Bilibili 明确返回字幕提交成功',finished_at=? \
-             WHERE id=? AND job_id=? AND status='started'",
-            params![&now, attempt_id, id],
-        )?;
-        let job_changed = tx.execute(
-            "UPDATE jobs SET status=CASE WHEN ? THEN 'completed' ELSE status END,error=NULL,subtitle_retry_at=CASE WHEN ? THEN NULL ELSE subtitle_retry_at END,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
-             WHERE id=? AND claim_kind=? AND claim_owner=?",
-            params![
-                mark_completed,
-                mark_completed,
-                &now,
-                id,
-                SUBTITLE_CLAIM_KIND,
-                self.claim_owner.as_ref()
-            ],
-        )?;
-        if attempt_changed != 1 || job_changed != 1 {
-            anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} 已失效")
-        }
-        tx.commit()?;
-        Ok(())
+        self.settle_subtitle_attempt(
+            id,
+            attempt_id,
+            mark_completed,
+            "confirmed",
+            "Bilibili 明确返回字幕提交成功",
+            "status='started'",
+            "已失效",
+        )
     }
 
     /// 查询到平台已有 zh 字幕后，把不确定 attempt 核对为 reconciled 并完成任务。
@@ -235,13 +223,37 @@ impl Database {
         attempt_id: &str,
         mark_completed: bool,
     ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
+        self.settle_subtitle_attempt(
+            id,
+            attempt_id,
+            mark_completed,
+            "reconciled",
+            "查询到平台已有 zh 字幕",
+            "status IN('started','uncertain')",
+            "无法核对",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn settle_subtitle_attempt(
+        &self,
+        id: &str,
+        attempt_id: &str,
+        mark_completed: bool,
+        target_status: &str,
+        detail: &str,
+        allowed_status_sql: &str,
+        failure_reason: &str,
+    ) -> Result<()> {
+        let now = format_timestamp(Utc::now());
         let mut connection = self.conn();
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let attempt_changed = tx.execute(
-            "UPDATE subtitle_attempts SET status='reconciled',detail='查询到平台已有 zh 字幕',finished_at=? \
-             WHERE id=? AND job_id=? AND status IN('started','uncertain')",
-            params![&now, attempt_id, id],
+            &format!(
+                "UPDATE subtitle_attempts SET status=?,detail=?,finished_at=? \
+                 WHERE id=? AND job_id=? AND {allowed_status_sql}"
+            ),
+            params![target_status, detail, &now, attempt_id, id],
         )?;
         let job_changed = tx.execute(
             "UPDATE jobs SET status=CASE WHEN ? THEN 'completed' ELSE status END,error=NULL,subtitle_retry_at=CASE WHEN ? THEN NULL ELSE subtitle_retry_at END,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
@@ -256,7 +268,7 @@ impl Database {
             ],
         )?;
         if attempt_changed != 1 || job_changed != 1 {
-            anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} 无法核对")
+            anyhow::bail!("任务 {id} 的字幕 attempt {attempt_id} {failure_reason}")
         }
         tx.commit()?;
         Ok(())
@@ -269,9 +281,9 @@ impl Database {
         self.conn().execute(
             "UPDATE jobs SET subtitle_attempt=subtitle_attempt+1,subtitle_retry_at=?,error=?,updated_at=? WHERE id=?",
             params![
-                (now + chrono::Duration::seconds(delay_seconds)).to_rfc3339(),
+                format_timestamp(now + chrono::Duration::seconds(delay_seconds)),
                 error,
-                now.to_rfc3339(),
+                format_timestamp(now),
                 id
             ],
         )?;
@@ -289,9 +301,9 @@ impl Database {
             "UPDATE jobs SET subtitle_attempt=subtitle_attempt+1,subtitle_retry_at=?,error=?,claim_kind=NULL,claim_owner=NULL,claim_expires_at=NULL,updated_at=? \
              WHERE id=? AND claim_kind=? AND claim_owner=?",
             params![
-                (now + chrono::Duration::seconds(delay_seconds)).to_rfc3339(),
+                format_timestamp(now + chrono::Duration::seconds(delay_seconds)),
                 error,
-                now.to_rfc3339(),
+                format_timestamp(now),
                 id,
                 SUBTITLE_CLAIM_KIND,
                 self.claim_owner.as_ref()
@@ -308,7 +320,7 @@ impl Database {
     pub fn exhaust_pending_subtitle(&self, id: &str, max_attempts: i64, error: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE jobs SET subtitle_attempt=?,subtitle_retry_at=NULL,error=?,updated_at=? WHERE id=?",
-            params![max_attempts, error, Utc::now().to_rfc3339(), id],
+            params![max_attempts, error, format_timestamp(Utc::now()), id],
         )?;
         Ok(())
     }
@@ -325,7 +337,7 @@ impl Database {
             params![
                 max_attempts,
                 error,
-                Utc::now().to_rfc3339(),
+                format_timestamp(Utc::now()),
                 id,
                 SUBTITLE_CLAIM_KIND,
                 self.claim_owner.as_ref()
@@ -343,7 +355,7 @@ impl Database {
              WHERE id=? AND claim_kind=? AND claim_owner=?",
             params![
                 mark_completed,
-                Utc::now().to_rfc3339(),
+                format_timestamp(Utc::now()),
                 id,
                 SUBTITLE_CLAIM_KIND,
                 self.claim_owner.as_ref()
@@ -357,16 +369,12 @@ impl Database {
 
     /// 重新武装 CC 字幕队列：清空计数并立即到期。
     pub fn rearm_pending_subtitle(&self, id: &str) -> Result<()> {
+        let now = format_timestamp(Utc::now());
         let changed = self.conn().execute(
             "UPDATE jobs SET subtitle_attempt=0,subtitle_retry_at=?,error=NULL,updated_at=? \
              WHERE id=? AND status='uploaded_original_pending_subtitle' \
                AND (claim_owner IS NULL OR claim_expires_at IS NULL OR claim_expires_at<=?)",
-            params![
-                Utc::now().to_rfc3339(),
-                Utc::now().to_rfc3339(),
-                id,
-                Utc::now().to_rfc3339()
-            ],
+            params![&now, &now, id, &now],
         )?;
         if changed == 0 {
             anyhow::bail!("任务不在待补字幕状态: {id}")

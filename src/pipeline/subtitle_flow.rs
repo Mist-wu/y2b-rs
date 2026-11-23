@@ -6,7 +6,7 @@ use super::ai::{
     segment_cue_tokens, translation_cue_tokens,
 };
 use super::{Pipeline, StageGuard};
-use crate::config::BatchMode;
+use crate::config::{BatchMode, matches_source_lang};
 use crate::model::Job;
 use crate::model::VideoMetadata;
 use crate::monitor::ytdlp_command;
@@ -19,11 +19,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::sleep;
-
-#[derive(Debug)]
-pub(super) struct PreparedSubtitle {
-    pub(super) cues: Vec<Cue>,
-}
 
 /// DeepSeek 负责选择语义边界，但这些可读性限制必须由程序兜底，不能只依赖提示词。
 pub(super) const SEGMENT_REQUIRED_GAP_SECONDS: f64 = 0.8;
@@ -385,22 +380,19 @@ pub(super) fn pick_subtitle_file(
     video_id: &str,
     source: &str,
 ) -> Result<Option<PathBuf>> {
-    let mut candidates = fs::read_dir(work)?
+    Ok(fs::read_dir(work)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             path.extension().is_some_and(|ext| ext == "vtt")
                 && path.metadata().is_ok_and(|metadata| metadata.len() > 0)
         })
-        .map(|path| (subtitle_language_tag(&path, video_id), path))
-        .filter(|(language, _)| matches_track(language, source))
-        .collect::<Vec<_>>();
-    candidates.sort_by(|(left_lang, left_path), (right_lang, right_path)| {
-        subtitle_language_rank(left_lang, source)
-            .cmp(&subtitle_language_rank(right_lang, source))
-            .then_with(|| left_lang.cmp(right_lang))
-            .then_with(|| left_path.cmp(right_path))
-    });
-    Ok(candidates.into_iter().next().map(|(_, path)| path))
+        .filter_map(|path| {
+            let language = subtitle_language_tag(&path, video_id);
+            matches_source_lang(source, &language)
+                .then(|| (subtitle_language_rank(&language, source), language, path))
+        })
+        .min()
+        .map(|(_, _, path)| path))
 }
 
 fn pick_subtitle_file_for_language(
@@ -408,16 +400,14 @@ fn pick_subtitle_file_for_language(
     video_id: &str,
     language: &str,
 ) -> Result<Option<PathBuf>> {
-    let mut candidates = fs::read_dir(work)?
+    Ok(fs::read_dir(work)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             path.extension().is_some_and(|ext| ext == "vtt")
                 && path.metadata().is_ok_and(|metadata| metadata.len() > 0)
                 && subtitle_language_tag(path, video_id) == language
         })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    Ok(candidates.into_iter().next())
+        .min())
 }
 
 /// 优先精确标签，其次为原始自动字幕，最后选择同语言变体。
@@ -430,10 +420,6 @@ fn subtitle_language_rank(language: &str, source: &str) -> u8 {
         2
     }
 }
-fn matches_track(language: &str, source: &str) -> bool {
-    crate::config::matches_source_lang(source, language)
-}
-
 /// 从 `<video_id>.<language>.vtt` 取出语言标签；yt-dlp 重复追加语言时取最后一段。
 pub(super) fn subtitle_language_tag(path: &Path, video_id: &str) -> String {
     path.file_name()
@@ -497,7 +483,7 @@ fn best_track(
             match track_translation_signal(formats) {
                 Some(true) => false,
                 Some(false) => crate::config::matches_bcp47_source_lang(source, language),
-                None => matches_track(language, source),
+                None => matches_source_lang(source, language),
             }
         })
         .map(|(language, _)| language.clone())
@@ -550,24 +536,14 @@ fn subtitle_download_args(track: &SubtitleTrack) -> Vec<String> {
 }
 
 impl Pipeline {
+    /// 完整缓存可直接复用；只有允许补齐时才下载字幕或续传缺失的翻译批次。
     pub(super) async fn prepare_translated_subtitle(
         &self,
         job: &Job,
         meta: &VideoMetadata,
         work: &Path,
-    ) -> Result<Option<PreparedSubtitle>> {
-        self.prepare_translated_subtitle_with_download(job, meta, work, true)
-            .await
-    }
-
-    /// 完整缓存可直接复用；只有允许补齐时才下载字幕或续传缺失的翻译批次。
-    pub(super) async fn prepare_translated_subtitle_with_download(
-        &self,
-        job: &Job,
-        meta: &VideoMetadata,
-        work: &Path,
         redownload_if_missing: bool,
-    ) -> Result<Option<PreparedSubtitle>> {
+    ) -> Result<Option<Vec<Cue>>> {
         let (segmented, translated, _) =
             super::translation_cache_paths(work, &meta.id, &self.config.translation.source_lang);
 
@@ -599,7 +575,7 @@ impl Pipeline {
                     "info",
                     &format!("复用翻译缓存: {} cues", cached.len()),
                 )?;
-                return Ok(Some(PreparedSubtitle { cues: cached }));
+                return Ok(Some(cached));
             }
             Ok(Some(partial)) => {
                 if !redownload_if_missing {
@@ -638,7 +614,7 @@ impl Pipeline {
         };
         self.translate_and_save(&job.id, &mut cues, &translated)
             .await?;
-        Ok(Some(PreparedSubtitle { cues }))
+        Ok(Some(cues))
     }
 
     /// 无缓存时完整跑一遍：下载字幕 → 解析 VTT → 分句 → 落盘。

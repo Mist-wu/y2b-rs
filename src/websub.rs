@@ -2,6 +2,7 @@ use crate::{
     config::WebSubConfig,
     db::{Database, NewVideoCandidate, WebSubChannel},
     model::CandidateSource,
+    monitor::is_youtube_video_id,
     youtube_api::bounded_http_client_with_timeouts,
 };
 use anyhow::{Context, Result};
@@ -221,7 +222,7 @@ impl WebSubService {
         );
         let topic = channel_topic(&channel.youtube_channel_id);
         let lease_seconds = WEBSUB_LEASE_SECONDS.to_string();
-        let response = self
+        let mut response = self
             .client
             .post(&self.hub_url)
             .form(&[
@@ -238,7 +239,17 @@ impl WebSubService {
         if !status.is_success() {
             // hub 的 503 正文是 "Transient error; please try again later"，
             // 只有把它带出来才能区分「hub 自己挂了」和「我们的回调有问题」。
-            let body = response.text().await.unwrap_or_default();
+            // 流式限长读取前 4 KiB，避免异常响应把正文全部读入内存。
+            const MAX_ERROR_READ_BYTES: usize = 4 * 1024;
+            let mut raw = Vec::new();
+            while let Ok(Some(chunk)) = response.chunk().await {
+                let remaining = MAX_ERROR_READ_BYTES.saturating_sub(raw.len());
+                raw.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if raw.len() >= MAX_ERROR_READ_BYTES {
+                    break;
+                }
+            }
+            let body = String::from_utf8_lossy(&raw);
             let body = body.trim();
             let detail: String = body.chars().take(WEBSUB_HUB_ERROR_BODY_LIMIT).collect();
             anyhow::bail!(
@@ -524,13 +535,6 @@ fn parse_atom_notification(
             })
         })
         .collect())
-}
-
-fn is_youtube_video_id(value: &str) -> bool {
-    value.len() == 11
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 #[cfg(test)]

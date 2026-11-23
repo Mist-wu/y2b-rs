@@ -23,6 +23,15 @@ from typing import Any
 API_ROOT = "https://api.brawlapi.com"
 USER_AGENT = "y2b-rs-glossary-audit/2.0"
 AI_MODEL = "deepseek-flash"
+CANONICAL_LANGUAGE_PAIR = "en-CN"
+LANGUAGE_PAIR_ALIASES = {"en->zh-CN": CANONICAL_LANGUAGE_PAIR}
+
+
+def canonical_language_pair(value: object) -> str:
+    """生成 v2 词库时把已知旧别名收成当前契约，缺省也使用同一值。"""
+    if not isinstance(value, str) or not value.strip():
+        return CANONICAL_LANGUAGE_PAIR
+    return LANGUAGE_PAIR_ALIASES.get(value, value)
 PATTERN_RULES = [
     {
         "id": "numeric-gems",
@@ -511,7 +520,7 @@ def build_production_glossary(
             == source_metadata["localization_generated_at"]
             else None
         ),
-        "language_pair": previous.get("language_pair", "en->zh-CN"),
+        "language_pair": canonical_language_pair(previous.get("language_pair")),
         "source": {
             "kind": "Brawl Stars client localization mirror",
             "api": source_metadata["api_root"],

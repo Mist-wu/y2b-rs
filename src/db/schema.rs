@@ -560,10 +560,12 @@ impl Database {
             tx.execute("ALTER TABLE channels ADD COLUMN source_lang TEXT", [])?;
         }
         tx.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,CURRENT_TIMESTAMP)",
-            [CURRENT_SCHEMA_VERSION],
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(23,CURRENT_TIMESTAMP)",
+            [],
         )?;
         tx.commit()?;
+        // v24 单独成事务：旧时间文本规范化失败时回滚，已提交的 v23 结构保持不变。
+        normalize_sql_timestamps(&mut connection)?;
         Ok(())
     }
 
@@ -581,8 +583,8 @@ impl Database {
     pub(super) fn retry_due_params() -> (String, String) {
         let now = Utc::now();
         (
-            (now - chrono::Duration::minutes(Self::LEGACY_RETRY_MINUTES)).to_rfc3339(),
-            now.to_rfc3339(),
+            format_timestamp(now - chrono::Duration::minutes(Self::LEGACY_RETRY_MINUTES)),
+            format_timestamp(now),
         )
     }
 
@@ -612,4 +614,63 @@ impl Database {
             |r| r.get(0),
         )?)
     }
+}
+
+fn normalize_sql_timestamps(connection: &mut Connection) -> Result<()> {
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let version: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if version >= 24 {
+        return Ok(());
+    }
+    // 表、主键、时间列、是否为须向上取整的截止时间。
+    for (table, id, column, deadline) in [
+        ("jobs", "id", "claim_expires_at", true),
+        ("jobs", "id", "retry_at", true),
+        ("jobs", "id", "subtitle_retry_at", true),
+        ("jobs", "id", "updated_at", false),
+        ("jobs", "id", "discovered_at", false),
+        ("maintenance_hold", "singleton", "expires_at", true),
+        ("channels", "id", "next_poll_at", true),
+        ("channels", "id", "next_data_api_poll_at", true),
+        ("channels", "id", "websub_lease_expires_at", true),
+        ("video_candidates", "video_id", "next_gate_at", true),
+        ("video_candidates", "video_id", "discovered_at", false),
+        ("stage_runs", "id", "started_at", false),
+        ("upload_attempts", "id", "started_at", false),
+        ("subtitle_attempts", "id", "started_at", false),
+    ] {
+        let mut query = tx.prepare(&format!(
+            "SELECT CAST({id} AS TEXT), {column} FROM {table} WHERE {column} IS NOT NULL"
+        ))?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(query);
+        let mut update = tx.prepare(&format!("UPDATE {table} SET {column}=? WHERE {id}=?"))?;
+        for (row_id, raw) in rows {
+            let canonical = canonical_sql_timestamp(&raw, deadline).with_context(|| {
+                format!(
+                    "迁移 v24 失败：表 {table} 列 {column} 行 {row_id} 的时间戳无法规范化: {raw:?}"
+                )
+            })?;
+            if canonical != raw {
+                anyhow::ensure!(
+                    update.execute(params![canonical, row_id])? == 1,
+                    "迁移 v24 失败：表 {table} 列 {column} 行 {row_id} 未能写回规范化时间"
+                );
+            }
+        }
+    }
+    tx.execute(
+        "INSERT INTO schema_migrations(version,applied_at) VALUES(24,CURRENT_TIMESTAMP)",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
 }

@@ -88,13 +88,14 @@ pub enum GateState {
 
 serde_enum_display_fromstr!(GateState);
 
+serde_enum_display_fromstr!(JobStatus);
+
 impl JobStatus {
+    /// 不再自动流转的终态。保留给已有外部调用方。
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::DeadLetter | Self::Failed)
     }
 }
-
-serde_enum_display_fromstr!(JobStatus);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {

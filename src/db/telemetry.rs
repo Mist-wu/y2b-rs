@@ -4,14 +4,14 @@ impl Database {
     pub fn set_job_paths(&self, id: &str, raw: Option<&str>) -> Result<()> {
         self.conn().execute(
             "UPDATE jobs SET raw_video_path=COALESCE(?,raw_video_path),updated_at=? WHERE id=?",
-            params![raw, Utc::now().to_rfc3339(), id],
+            params![raw, format_timestamp(Utc::now()), id],
         )?;
         Ok(())
     }
     pub fn set_job_bvid(&self, id: &str, bvid: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE jobs SET bvid=?,updated_at=? WHERE id=?",
-            params![bvid, Utc::now().to_rfc3339(), id],
+            params![bvid, format_timestamp(Utc::now()), id],
         )?;
         Ok(())
     }
@@ -46,7 +46,7 @@ impl Database {
         job_id: &str,
         metadata: &PublicationMetadata,
     ) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
+        let now = format_timestamp(Utc::now());
         let tags_json = serde_json::to_string(&metadata.tags)?;
         self.conn().execute(
             "INSERT INTO publication_metadata(job_id,title,dynamic,tags_json,tid,raw_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET title=excluded.title,dynamic=excluded.dynamic,tags_json=excluded.tags_json,tid=excluded.tid,raw_json=excluded.raw_json,updated_at=excluded.updated_at",
@@ -68,7 +68,7 @@ impl Database {
     pub fn increment_attempt(&self, id: &str) -> Result<i64> {
         Ok(self.conn().query_row(
             "UPDATE jobs SET attempt=attempt+1,updated_at=? WHERE id=? RETURNING attempt",
-            params![Utc::now().to_rfc3339(), id],
+            params![format_timestamp(Utc::now()), id],
             |r| r.get(0),
         )?)
     }
@@ -77,7 +77,7 @@ impl Database {
         let changed = self.conn().execute(
             "UPDATE jobs SET status=CASE WHEN prepared_upload_json IS NOT NULL THEN 'ready_to_upload' ELSE 'queued' END,attempt=0,error=NULL,retry_at=NULL,updated_at=? \
              WHERE id=? AND (status IN ('dead_letter','failed') OR (status='paused' AND error IS NOT ?))",
-            params![Utc::now().to_rfc3339(), id, UNCERTAIN_UPLOAD_RECOVERY_ERROR],
+            params![format_timestamp(Utc::now()), id, UNCERTAIN_UPLOAD_RECOVERY_ERROR],
         )?;
         if changed == 0 {
             let current = self
@@ -104,7 +104,7 @@ impl Database {
         thinking: Option<&str>,
     ) -> Result<i64> {
         let c = self.conn();
-        c.execute("INSERT INTO stage_runs(job_id,stage,status,started_at,provider,model,thinking) VALUES(?,?,'running',?,?,?,?)",params![job_id,stage,Utc::now().to_rfc3339(),provider,model,thinking])?;
+        c.execute("INSERT INTO stage_runs(job_id,stage,status,started_at,provider,model,thinking) VALUES(?,?,'running',?,?,?,?)",params![job_id,stage,format_timestamp(Utc::now()),provider,model,thinking])?;
         Ok(c.last_insert_rowid())
     }
     pub fn finish_stage(
@@ -115,7 +115,7 @@ impl Database {
         peak_rss_kib: u64,
         detail: Option<&str>,
     ) -> Result<()> {
-        self.conn().execute("UPDATE stage_runs SET status=?,finished_at=?,duration_ms=?,peak_rss_kib=?,detail=? WHERE id=?",params![status,Utc::now().to_rfc3339(),duration_ms,peak_rss_kib as i64,detail,id])?;
+        self.conn().execute("UPDATE stage_runs SET status=?,finished_at=?,duration_ms=?,peak_rss_kib=?,detail=? WHERE id=?",params![status,format_timestamp(Utc::now()),duration_ms,peak_rss_kib as i64,detail,id])?;
         Ok(())
     }
     pub fn list_stages(&self, job_id: &str) -> Result<Vec<StageRun>> {
@@ -153,7 +153,7 @@ impl Database {
         let c = self.conn();
         c.execute(
             "INSERT INTO ai_calls(job_id,stage_run_id,task,provider,model,thinking,status,input_json,created_at) VALUES(?,?,?,?,?,?,'started',?,?)",
-            params![job_id,stage_id,task,provider,model,thinking,input_json,Utc::now().to_rfc3339()],
+            params![job_id,stage_id,task,provider,model,thinking,input_json,format_timestamp(Utc::now())],
         )?;
         Ok(c.last_insert_rowid())
     }
@@ -170,7 +170,7 @@ impl Database {
     ) -> Result<()> {
         self.conn().execute(
             "UPDATE ai_calls SET status=?,error=?,input_tokens=?,output_tokens=?,reasoning_tokens=?,cache_read_tokens=?,cache_write_tokens=?,total_tokens=?,cost=?,duration_ms=?,output_json=?,finished_at=? WHERE id=?",
-            params![status,error,usage.input,usage.output,usage.reasoning,usage.cache_read,usage.cache_write,usage.total,usage.cost,duration_ms,output_json,Utc::now().to_rfc3339(),id],
+            params![status,error,usage.input,usage.output,usage.reasoning,usage.cache_read,usage.cache_write,usage.total,usage.cost,duration_ms,output_json,format_timestamp(Utc::now()),id],
         )?;
         Ok(())
     }
@@ -178,7 +178,7 @@ impl Database {
     pub fn interrupt_ai_call(&self, id: i64, error: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE ai_calls SET status='interrupted',error=?,finished_at=? WHERE id=? AND status='started'",
-            params![error,Utc::now().to_rfc3339(),id],
+            params![error,format_timestamp(Utc::now()),id],
         )?;
         Ok(())
     }
@@ -214,12 +214,12 @@ impl Database {
     pub fn event(&self, job_id: Option<&str>, level: &str, message: &str) -> Result<()> {
         self.conn().execute(
             "INSERT INTO events(job_id,level,message,created_at) VALUES(?,?,?,?)",
-            params![job_id, level, message, Utc::now().to_rfc3339()],
+            params![job_id, level, message, format_timestamp(Utc::now())],
         )?;
         Ok(())
     }
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        self.conn().execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![key,value,Utc::now().to_rfc3339()])?;
+        self.conn().execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![key,value,format_timestamp(Utc::now())])?;
         Ok(())
     }
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -266,7 +266,7 @@ impl Database {
             }
         }
         let now = Utc::now();
-        self.set_setting(KEY, &now.to_rfc3339())?;
+        self.set_setting(KEY, &format_timestamp(now))?;
         Ok(now)
     }
 
@@ -281,8 +281,8 @@ impl Database {
     /// 清理超过保留期的审计/事件/阶段记录，防止 state.db 无限增长。
     /// 返回 (ai_calls, events, stage_runs) 各删除的行数。
     pub fn prune_history(&self, keep_days: i64) -> Result<(usize, usize, usize)> {
-        let cutoff = (Utc::now() - chrono::Duration::days(keep_days)).to_rfc3339();
-        let now = Utc::now().to_rfc3339();
+        let cutoff = format_timestamp(Utc::now() - chrono::Duration::days(keep_days));
+        let now = format_timestamp(Utc::now());
         let mut c = self.conn();
         let tx = c.transaction()?;
         tx.execute(
