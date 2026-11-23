@@ -848,11 +848,21 @@ impl Monitor {
         })
     }
 
-    pub async fn add_channel(&self, url: &str, transfer_mode: TransferMode) -> Result<i64> {
+    pub async fn add_channel(
+        &self,
+        url: &str,
+        transfer_mode: TransferMode,
+        source_lang: Option<&str>,
+    ) -> Result<i64> {
         let r = self.resolve_channel(url).await?;
-        let id = self
-            .db
-            .add_channel(&r.channel_id, &r.name, &r.url, &r.feed_url, transfer_mode)?;
+        let id = self.db.add_channel_with_language(
+            &r.channel_id,
+            &r.name,
+            &r.url,
+            &r.feed_url,
+            transfer_mode,
+            source_lang,
+        )?;
         self.poll_channel(id, false).await?;
         Ok(id)
     }
@@ -1673,13 +1683,13 @@ impl Monitor {
         candidate: &VideoCandidate,
         metadata: VideoMetadata,
     ) -> Result<bool> {
-        let source_language_mismatch =
-            metadata
-                .default_audio_language
-                .as_deref()
-                .is_some_and(|actual| {
-                    !source_language_matches(&self.config.translation.source_lang, actual)
-                });
+        let expected = self
+            .db
+            .effective_source_lang(candidate.channel_id, &self.config.translation.source_lang)?;
+        let source_language_mismatch = metadata
+            .default_audio_language
+            .as_deref()
+            .is_some_and(|actual| !source_language_matches(&expected, actual));
         self.db.mark_video_candidate_source_language(
             &candidate.video_id,
             metadata.default_audio_language.as_deref(),
@@ -1744,7 +1754,7 @@ impl Monitor {
                 .expect("mismatch=true 时必有语言值");
             tracing::warn!(
                 video_id = %candidate.video_id,
-                expected = %self.config.translation.source_lang,
+                expected = %expected,
                 actual,
                 hard_gate = self.config.translation.enforce_source_lang,
                 "即将入队的视频默认音频语言与配置源语言不符"
@@ -1754,7 +1764,7 @@ impl Monitor {
                     &candidate.video_id,
                     &format!(
                         "源语言不匹配: defaultAudioLanguage={actual}, expected={}",
-                        self.config.translation.source_lang
+                        expected
                     ),
                 )?;
                 return Ok(false);
@@ -3219,11 +3229,17 @@ esac
 
     #[tokio::test]
     async fn source_language_mismatch_warns_and_marks_but_does_not_block_by_default() {
+        verify_gate_language(None, true).await;
+        verify_gate_language(Some("ja-JP"), false).await;
+    }
+
+    async fn verify_gate_language(source: Option<&str>, mismatch: bool) {
         let videos = r#"{"items":[{"id":"language001","snippet":{"title":"language","publishedAt":"2035-01-01T00:00:00Z","channelId":"UC-language","liveBroadcastContent":"none","defaultAudioLanguage":"ja"},"contentDetails":{"duration":"PT10S"},"status":{"privacyStatus":"public"}}]}"#;
         let (base_url, server) = mock_json_sequence(vec![(200, videos)]).await;
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("language.db")).unwrap();
         let channel_id = add_test_channel(&db, "https://example.invalid/feed", "language");
+        db.set_channel_language(channel_id, source).unwrap();
         db.insert_video_candidate(NewVideoCandidate {
             video_id: "language001",
             channel_id: Some(channel_id),
@@ -3246,7 +3262,7 @@ esac
         assert!(db.get_job_by_video_id("language001").unwrap().is_some());
         let candidate = db.get_video_candidate("language001").unwrap().unwrap();
         assert_eq!(candidate.source_language.as_deref(), Some("ja"));
-        assert!(candidate.source_language_mismatch);
+        assert_eq!(candidate.source_language_mismatch, mismatch);
         assert!(source_language_matches("en", "en-GB"));
     }
 

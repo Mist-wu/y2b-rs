@@ -286,6 +286,18 @@ impl Default for WebSubConfig {
         }
     }
 }
+pub fn validate_source_lang(lang: &str) -> anyhow::Result<()> {
+    let mut parts = lang.split('-');
+    let primary = parts.next().unwrap_or_default();
+    anyhow::ensure!(
+        (2..=8).contains(&primary.len())
+            && primary.bytes().all(|b| b.is_ascii_alphabetic())
+            && parts.all(|part| (1..=8).contains(&part.len())
+                && part.bytes().all(|b| b.is_ascii_alphanumeric())),
+        "source_lang 无效: {lang}"
+    );
+    Ok(())
+}
 impl Config {
     /// 严格读取配置，文件不存在也返回错误。
     pub fn load(path: &Path) -> Result<Self> {
@@ -417,8 +429,8 @@ impl Config {
             "translation.target_lang 不能为空"
         );
         anyhow::ensure!(
-            self.translation.source_lang == "en" && self.translation.target_lang == "zh-CN",
-            "翻译语言必须固定为 source_lang=en, target_lang=zh-CN；当前为 source_lang={}, target_lang={}",
+            self.translation.target_lang == "zh-CN",
+            "目标语言必须为 target_lang=zh-CN；当前为 source_lang={}, target_lang={}",
             self.translation.source_lang,
             self.translation.target_lang
         );
@@ -500,10 +512,7 @@ impl Config {
             self.monitor.reconcile_limit > 0,
             "monitor.reconcile_limit 必须大于 0"
         );
-        anyhow::ensure!(
-            !self.translation.source_lang.trim().is_empty(),
-            "translation.source_lang 不能为空"
-        );
+        validate_source_lang(&self.translation.source_lang)?;
         Ok(())
     }
 }
@@ -689,7 +698,7 @@ mod tests {
         assert_invalid(&config, "target_lang");
 
         let mut config = Config::default();
-        config.translation.source_lang = "ja".into();
+        config.translation.source_lang = "../ja".into();
         assert_invalid(&config, "source_lang");
 
         let mut config = Config::default();

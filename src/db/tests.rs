@@ -2815,3 +2815,21 @@ fn prune_history_removes_only_rows_older_than_retention() {
     assert_eq!(after_second_prune.total, before.total);
     assert_eq!(after_second_prune.cost, before.cost);
 }
+
+#[test]
+fn channel_language_migrates_and_falls_back_after_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.db");
+    let db = Database::open(&path).unwrap();
+    let id = db
+        .add_channel("UC", "name", "url", "feed", TransferMode::Translated)
+        .unwrap();
+    db.conn().execute_batch("ALTER TABLE channels DROP COLUMN source_lang; DELETE FROM schema_migrations WHERE version=23;").unwrap();
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.effective_source_lang(Some(id), "ja").unwrap(), "ja");
+    db.set_channel_language(id, Some("pt-BR")).unwrap();
+    assert_eq!(db.effective_source_lang(Some(id), "ja").unwrap(), "pt-BR");
+    db.set_channel_language(id, None).unwrap();
+    assert_eq!(db.effective_source_lang(Some(id), "de").unwrap(), "de");
+}

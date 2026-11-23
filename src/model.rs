@@ -98,6 +98,7 @@ serde_enum_display_fromstr!(JobStatus);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
+    pub source_lang: Option<String>,
     pub id: i64,
     pub youtube_channel_id: String,
     pub name: String,

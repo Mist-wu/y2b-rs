@@ -14,11 +14,11 @@ pub const CC_INITIAL_DELAY_SECONDS: i64 = 90;
 ///
 /// 每次都会先检查 B站是否已生成中文字幕；配合下面的退避，`-404` 的覆盖窗口
 /// 约 10 小时、其余失败约 11.5 小时。线上观察到 B站自动字幕曾在投稿约 8 小时
-/// 后才出现，因此窗口必须留出余量。上游没有英文字幕轨的情况不走这个上限，
+/// 后才出现，因此窗口必须留出余量。上游没有源语言字幕轨的情况不走这个上限，
 /// 见 `CC_MISSING_MATERIAL_MAX_ATTEMPTS`。
 pub const CC_MAX_ATTEMPTS: i64 = 16;
 
-/// 上游暂无英文字幕轨时的独立探测次数。
+/// 上游暂无源语言字幕轨时的独立探测次数。
 ///
 /// 线上 14 天数据：约一半新视频投稿时 YouTube ASR 字幕还没生成，但绝大多数
 /// 在 30～90 分钟内出现；剩下几条（频道关闭自动字幕、非英语口播）按通用
@@ -222,7 +222,7 @@ pub(super) fn is_missing_subtitle_material(error: &anyhow::Error) -> bool {
 impl Pipeline {
     /// 给已投稿视频补中文 CC 字幕（B站软字幕，提交后走平台审核）。
     ///
-    /// 素材优先复用下载目录里的翻译缓存；缺失时重新下载英文字幕、分句并请求 DeepSeek
+    /// 素材优先复用下载目录里的翻译缓存；缺失时重新下载源语言字幕、分句并请求 DeepSeek
     /// 翻译。返回给人看的说明文字。
     pub async fn backfill_cc_subtitle(&self, bvid: &str) -> Result<String> {
         let job = self
@@ -339,7 +339,7 @@ impl Pipeline {
         }
     }
 
-    /// 上游暂无英文字幕轨：按稀疏计划继续探测；探测耗尽说明这条视频就是没有
+    /// 上游暂无源语言字幕轨：按稀疏计划继续探测；探测耗尽说明这条视频就是没有
     /// 字幕，原视频已经投稿，直接按无字幕完成，不留异常。之后若上游补了字幕，
     /// `y2b subtitle add` 仍可对已完成任务手动补交。
     async fn defer_or_complete_without_material(
@@ -352,7 +352,7 @@ impl Pipeline {
         if attempt >= CC_MISSING_MATERIAL_MAX_ATTEMPTS {
             let bvid = job.bvid.as_deref().unwrap_or_default();
             let message = format!(
-                "上游在 {attempt} 次检查后仍无英文字幕轨，原视频已投稿，按无字幕完成；若之后出现字幕可手动执行 y2b subtitle add {bvid}"
+                "上游在 {attempt} 次检查后仍无源语言字幕轨，原视频已投稿，按无字幕完成；若之后出现字幕可手动执行 y2b subtitle add {bvid}"
             );
             self.db.finish_subtitle_claim(&job.id, true)?;
             self.db.event(Some(&job.id), "info", &message)?;
@@ -360,14 +360,14 @@ impl Pipeline {
             return Ok(());
         }
         let delay = cc_missing_material_delay_seconds(attempt);
-        let retry_detail = format!("等待上游英文字幕轨: {detail}");
+        let retry_detail = format!("等待上游源语言字幕轨: {detail}");
         self.db
             .defer_claimed_pending_subtitle(&job.id, &retry_detail, delay)?;
         tracing::info!(
             job_id = %job.id,
             attempt,
             delay,
-            "上游暂无英文字幕轨，稍后再探测"
+            "上游暂无源语言字幕轨，稍后再探测"
         );
         self.db.event(
             Some(&job.id),
@@ -388,6 +388,7 @@ impl Pipeline {
     ) -> Result<Vec<CcCue>> {
         let work = self.config.runtime.download_dir.join(&meta.id);
         let Some(subtitle) = self
+            .for_channel(job.channel_id)?
             .prepare_translated_subtitle_with_download(job, meta, &work, redownload_if_missing)
             .await?
         else {
@@ -619,6 +620,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_language_reaches_translation_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pipeline, mut job, meta) = cache_test_pipeline(directory.path()).await;
+        job.channel_id = Some(
+            pipeline
+                .db
+                .add_channel_with_language(
+                    "UC",
+                    "name",
+                    "url",
+                    "feed",
+                    crate::model::TransferMode::Translated,
+                    Some("ja"),
+                )
+                .unwrap(),
+        );
+        let work = pipeline.config.runtime.download_dir.join(&meta.id);
+        let (segmented, _, _) = super::super::translation_cache_paths(&work, &meta.id, "ja");
+        subtitle::save_json(&[cue(0, "First")], &segmented).unwrap();
+        pipeline
+            .prepare_cc_cues(&job, &meta, 10.0, true)
+            .await
+            .unwrap();
+        let calls = fs::read_to_string(directory.path().join("calls")).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(calls.trim()).unwrap();
+        assert_eq!(payload["source_lang"], "ja");
+    }
+
+    #[tokio::test]
     async fn cc_cache_retries_interrupted_translation_before_producing_submission_cues() {
         let directory = tempfile::tempdir().unwrap();
         let (pipeline, job, meta) = cache_test_pipeline(directory.path()).await;
@@ -778,7 +808,7 @@ mod tests {
             "缺少翻译素材，跳过自动 CC 提交（可手动执行 y2b subtitle add BV1x）",
             // 自动重试重新下载后，上游仍无字幕轨时走的分支：必须仍然归到
             // 「素材缺失」，否则达到上限时的提示看不出需要人工补交。
-            "缺少翻译素材，跳过自动 CC 提交：上游暂无英文字幕轨（可手动执行 y2b subtitle add BV1x）",
+            "缺少翻译素材，跳过自动 CC 提交：上游暂无源语言字幕轨（可手动执行 y2b subtitle add BV1x）",
             "翻译结果为空，没有可提交的中文字幕",
         ] {
             let error = anyhow::anyhow!(message.to_string()).context("submit failed");

@@ -9,9 +9,23 @@ impl Database {
         feed_url: &str,
         transfer_mode: TransferMode,
     ) -> Result<i64> {
+        self.add_channel_with_language(channel_id, name, url, feed_url, transfer_mode, None)
+    }
+    pub fn add_channel_with_language(
+        &self,
+        channel_id: &str,
+        name: &str,
+        url: &str,
+        feed_url: &str,
+        transfer_mode: TransferMode,
+        source_lang: Option<&str>,
+    ) -> Result<i64> {
+        if let Some(lang) = source_lang {
+            crate::config::validate_source_lang(lang)?;
+        }
         let now = Utc::now().to_rfc3339();
         let c = self.conn();
-        c.execute("INSERT INTO channels(youtube_channel_id,name,url,feed_url,transfer_mode,baseline_at,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(youtube_channel_id) DO UPDATE SET name=excluded.name,url=excluded.url,feed_url=excluded.feed_url,transfer_mode=excluded.transfer_mode", params![channel_id,name,url,feed_url,transfer_mode.to_string(),now,now])?;
+        c.execute("INSERT INTO channels(youtube_channel_id,name,url,feed_url,transfer_mode,baseline_at,created_at,source_lang) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(youtube_channel_id) DO UPDATE SET name=excluded.name,url=excluded.url,feed_url=excluded.feed_url,transfer_mode=excluded.transfer_mode,source_lang=COALESCE(excluded.source_lang,channels.source_lang)", params![channel_id,name,url,feed_url,transfer_mode.to_string(),now,now,source_lang])?;
         Ok(c.query_row(
             "SELECT id FROM channels WHERE youtube_channel_id=?",
             [channel_id],
@@ -19,6 +33,26 @@ impl Database {
         )?)
     }
 
+    pub fn effective_source_lang(&self, channel_id: Option<i64>, fallback: &str) -> Result<String> {
+        Ok(channel_id
+            .map(|id| self.channel(id))
+            .transpose()?
+            .and_then(|channel| channel.source_lang)
+            .unwrap_or_else(|| fallback.to_owned()))
+    }
+    pub fn set_channel_language(&self, id: i64, lang: Option<&str>) -> Result<()> {
+        if let Some(lang) = lang {
+            crate::config::validate_source_lang(lang)?;
+        }
+        anyhow::ensure!(
+            self.conn().execute(
+                "UPDATE channels SET source_lang=? WHERE id=?",
+                params![lang, id]
+            )? == 1,
+            "频道 {id} 不存在"
+        );
+        Ok(())
+    }
     pub fn list_channels(&self) -> Result<Vec<Channel>> {
         let c = self.conn();
         let mut q = c.prepare(&format!(

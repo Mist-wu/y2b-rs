@@ -64,6 +64,7 @@ pub(super) fn channel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Channe
         rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, error.into())
     })?;
     Ok(Channel {
+        source_lang: r.get(16)?,
         id: r.get(0)?,
         youtube_channel_id: r.get(1)?,
         name: r.get(2)?,
