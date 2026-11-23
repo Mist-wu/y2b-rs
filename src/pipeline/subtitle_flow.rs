@@ -1471,10 +1471,7 @@ mod tests {
             ("zh", "zh-Hant-TW", true),
             ("zh-Hant", "zh-Hant-TW", true),
             ("en", "en-DE", true),
-            ("en", "en-de", false),
-            ("en", "en-fr", false),
             ("ja", "ja-en", false),
-            ("en", "en-ar", false),
             ("en", "en-zh-Hans", false),
             ("en", "en-zh", false),
         ] {
@@ -1497,6 +1494,32 @@ mod tests {
                     .is_some(),
                 matches,
                 "{tag}"
+            );
+        }
+
+        // 音频语言按纯 BCP-47 大小写无关匹配（en-de / en-DE 均认可），
+        // 无 URL 字幕与本地缓存仍排除易与 YouTube 翻译轨混淆的小写 en-* 标签。
+        for tag in ["en-de", "en-fr", "en-ar"] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(format!("vid.{tag}.vtt")), "WEBVTT").unwrap();
+            let metadata = serde_json::json!({"automatic_captions":{(tag):[{}]}});
+            assert!(
+                crate::monitor::source_language_matches("en", tag),
+                "audio {tag}"
+            );
+            assert!(
+                crate::monitor::source_language_matches("en", &tag.to_ascii_uppercase()),
+                "audio upper {tag}"
+            );
+            assert!(
+                select_subtitle_track(&metadata, "en").is_none(),
+                "online {tag}"
+            );
+            assert!(
+                pick_subtitle_file(dir.path(), "vid", "en")
+                    .unwrap()
+                    .is_none(),
+                "cache {tag}"
             );
         }
     }

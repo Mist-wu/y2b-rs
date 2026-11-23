@@ -378,7 +378,8 @@ pub(crate) fn source_language_matches(expected: &str, actual: &str) -> bool {
     if is_unknown_language(actual) {
         return true;
     }
-    crate::config::matches_source_lang(expected, actual)
+    // defaultAudioLanguage 是标准 BCP-47 音频标签，不含 YouTube 字幕翻译轨键。
+    crate::config::matches_bcp47_source_lang(expected, actual)
 }
 
 impl FeedFetchError {
