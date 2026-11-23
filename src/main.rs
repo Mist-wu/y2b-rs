@@ -122,13 +122,13 @@ enum MaintenanceCmd {
 enum ChannelCmd {
     SetLang {
         id: i64,
-        #[arg(conflicts_with = "clear",value_parser=y2b_rs::config::normalize_source_lang)]
+        #[arg(conflicts_with = "clear", value_parser = y2b_rs::config::normalize_source_lang)]
         source_lang: Option<String>,
         #[arg(long)]
         clear: bool,
     },
     Add {
-        #[arg(long,value_parser=y2b_rs::config::normalize_source_lang)]
+        #[arg(long, value_parser = y2b_rs::config::normalize_source_lang)]
         source_lang: Option<String>,
         url: String,
         #[arg(long, value_enum)]

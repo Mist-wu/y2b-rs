@@ -295,21 +295,6 @@ pub fn normalize_source_lang(lang: &str) -> Result<String> {
         tag.primary_language().len() >= 2,
         "source_lang 无效: {lang}"
     );
-    // A lowercase suffix can be both a country and a translation language.
-    // Resolve ambiguous pairs using the region's likely language (CLDR).
-    // Explicit uppercase regions always retain their BCP-47 meaning.
-    if let Some(region) = tag.region()
-        && let Some(raw) = lang.split('-').nth(1)
-        && raw == region.to_ascii_lowercase()
-        && LanguageTag::parse(raw).is_ok_and(|language| language.validate().is_ok())
-    {
-        let mut locale: icu_locale::LanguageIdentifier = format!("und-{region}").parse()?;
-        icu_locale::LocaleExpander::new_common().maximize(&mut locale);
-        anyhow::ensure!(
-            locale.language.as_str() == tag.primary_language(),
-            "source_lang 无效: {lang}"
-        );
-    }
     Ok(tag.to_string())
 }
 
@@ -322,6 +307,19 @@ pub(crate) fn matches_source_lang(source: &str, language: &str) -> bool {
         .strip_suffix("-orig")
         .unwrap_or(language)
         .replace('_', "-");
+    // YouTube also uses source-target keys. For ambiguous lowercase pairs,
+    // recognize regional locales and official languages from CLDR 48.1
+    // (availableLocales and supplemental/territoryInfo).
+    if let Some((_, suffix)) = language.split_once('-')
+        && suffix.len() == 2
+        && suffix.bytes().all(|byte| byte.is_ascii_lowercase())
+        && normalize_source_lang(suffix).is_ok()
+        && !include_str!("track_locales.txt")
+            .lines()
+            .any(|locale| locale.eq_ignore_ascii_case(&language))
+    {
+        return false;
+    }
     let (Ok(actual), Ok(expected)) = (
         normalize_source_lang(&language),
         normalize_source_lang(source),
@@ -574,6 +572,14 @@ mod tests {
                 Config::load(&path).unwrap().translation.source_lang,
                 expected
             );
+        }
+        for (raw, expected) in [
+            ("fr-ca", "fr-CA"),
+            ("pt-br", "pt-BR"),
+            ("zh-hant-tw", "zh-Hant-TW"),
+            ("en-in", "en-IN"),
+        ] {
+            assert_eq!(normalize_source_lang(raw).unwrap(), expected);
         }
         assert!(validate_source_lang("en-zh").is_err());
     }

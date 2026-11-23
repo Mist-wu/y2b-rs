@@ -1420,6 +1420,16 @@ mod tests {
     #[test]
     fn language_matching_agrees_across_discovery_and_subtitles() {
         for (source, tag, matches) in [
+            ("fr-ca", "fr-ca", true),
+            ("fr-ca", "fr-CA", true),
+            ("fr-CA", "fr-ca", true),
+            ("fr-CA", "fr-CA", true),
+            ("fr-ch", "fr-ch", true),
+            ("fr-be", "fr-be", true),
+            ("zh-sg", "zh-sg", true),
+            ("ca-es", "ca-es", true),
+            ("ga-ie", "ga-ie", true),
+            ("en-in", "en-in", true),
             ("pt", "pt-br", true),
             ("PT-br", "pt-BR", true),
             ("zh", "zh-Hant-TW", true),
