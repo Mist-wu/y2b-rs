@@ -109,6 +109,7 @@ impl AiCircuitBreaker {
 #[cfg(test)]
 pub(crate) mod testing;
 
+#[derive(Clone)]
 pub struct Pipeline {
     pub config: Config,
     pub db: Database,
@@ -117,7 +118,7 @@ pub struct Pipeline {
     /// `reqwest::Client` 会重建 TLS 配置和连接池，没有必要。
     http: reqwest::Client,
     ai_http: reqwest::Client,
-    ai_policy: tokio::sync::OnceCell<ai_prompt::PromptPolicy>,
+    ai_policy: Arc<tokio::sync::OnceCell<ai_prompt::PromptPolicy>>,
 }
 
 /// `stage_runs` 行的 RAII 句柄。
@@ -376,10 +377,12 @@ struct TranslationCacheProvenance {
     policy_sha256: Option<String>,
 }
 
-fn translation_cache_paths(work: &Path, video_id: &str) -> (PathBuf, PathBuf, PathBuf) {
-    let segmented = work.join(format!("{video_id}.en.segmented.json"));
-    let translated = work.join(format!("{video_id}.en-zh-CN.translated.json"));
-    let provenance = work.join(format!("{video_id}.en-zh-CN.translated.provenance.json"));
+fn translation_cache_paths(work: &Path, video_id: &str, lang: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let segmented = work.join(format!("{video_id}.{lang}.segmented.json"));
+    let translated = work.join(format!("{video_id}.{lang}-zh-CN.translated.json"));
+    let provenance = work.join(format!(
+        "{video_id}.{lang}-zh-CN.translated.provenance.json"
+    ));
     (segmented, translated, provenance)
 }
 
@@ -423,7 +426,8 @@ fn write_translation_provenance(
 }
 
 fn validate_translation_cache(config: &Config, video_id: &str, work: &Path) -> Result<()> {
-    let (segmented, translated, provenance_path) = translation_cache_paths(work, video_id);
+    let (segmented, translated, provenance_path) =
+        translation_cache_paths(work, video_id, &config.translation.source_lang);
     let source =
         subtitle_flow::load_segmented_cache(&segmented)?.context("翻译缓存缺少有效分句来源")?;
     let provenance: TranslationCacheProvenance =
@@ -470,9 +474,9 @@ fn quarantine_cache(path: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(quarantined))
 }
 
-fn quarantine_invalid_vtt_caches(work: &Path, video_id: &str) -> Result<Vec<PathBuf>> {
+fn quarantine_invalid_vtt_caches(work: &Path, video_id: &str, lang: &str) -> Result<Vec<PathBuf>> {
     let mut quarantined = Vec::new();
-    while let Some(path) = subtitle_flow::pick_subtitle_file(work, video_id)? {
+    while let Some(path) = subtitle_flow::pick_subtitle_file(work, video_id, lang)? {
         if crate::subtitle::parse_vtt(&path).is_ok() {
             break;
         }
@@ -634,7 +638,7 @@ impl Pipeline {
             ai_circuit_breaker,
             http: cover_http_client(),
             ai_http: ai::http_client(),
-            ai_policy: tokio::sync::OnceCell::new(),
+            ai_policy: Arc::default(),
         }
     }
 
@@ -678,12 +682,24 @@ impl Pipeline {
         Ok(())
     }
 
+    fn for_channel(&self, channel: Option<i64>) -> Result<Self> {
+        let mut pipeline = self.clone();
+        pipeline.config.translation.source_lang = self
+            .db
+            .effective_source_lang(channel, &self.config.translation.source_lang)?;
+        Ok(pipeline)
+    }
+
     pub async fn prepare_job(&self, job: Job) -> Result<()> {
         if !self.db.owns_job_claim(&job.id, PREPARE_CLAIM_KIND)? {
             bail!("任务 {} 没有当前进程持有的准备领取权", job.id)
         }
         let result = self
-            .run_with_claim_heartbeat(&job.id, PREPARE_CLAIM_KIND, self.prepare_job_inner(&job))
+            .run_with_claim_heartbeat(&job.id, PREPARE_CLAIM_KIND, async {
+                self.for_channel(job.channel_id)?
+                    .prepare_job_inner(&job)
+                    .await
+            })
             .await;
         if let Err(e) = &result {
             // 租约已经被其他执行者接管时，旧 worker 只能退出，不能覆盖新状态。
@@ -874,7 +890,8 @@ impl Pipeline {
         let video_fut = self.download_video(&job.id, &job.url, &meta, &work);
         let subtitle_fut = async {
             let result = self.prepare_translated_subtitle(job, &meta, &work).await;
-            let (_, translated, provenance_path) = translation_cache_paths(&work, &meta.id);
+            let (_, translated, provenance_path) =
+                translation_cache_paths(&work, &meta.id, &self.config.translation.source_lang);
             if translated.exists() {
                 let provenance = expected_translation_provenance(&self.config, &meta.id);
                 if let Err(error) = write_translation_provenance(&provenance_path, &provenance) {
@@ -1011,7 +1028,9 @@ impl Pipeline {
     }
 
     fn validate_subtitle_caches(&self, job_id: &str, video_id: &str, work: &Path) -> Result<()> {
-        for quarantined in quarantine_invalid_vtt_caches(work, video_id)? {
+        for quarantined in
+            quarantine_invalid_vtt_caches(work, video_id, &self.config.translation.source_lang)?
+        {
             self.db.event(
                 Some(job_id),
                 "warn",
@@ -1019,7 +1038,8 @@ impl Pipeline {
             )?;
         }
 
-        let (segmented, translated, provenance) = translation_cache_paths(work, video_id);
+        let (segmented, translated, provenance) =
+            translation_cache_paths(work, video_id, &self.config.translation.source_lang);
         if segmented.exists()
             && let Err(error) = subtitle_flow::load_segmented_cache(&segmented)
         {
@@ -1481,12 +1501,12 @@ mod tests {
         let corrupt = temp.path().join("vid.en.vtt");
         std::fs::write(&corrupt, "WEBVTT\n\nnot a cue\n").unwrap();
 
-        let quarantined = quarantine_invalid_vtt_caches(temp.path(), "vid").unwrap();
+        let quarantined = quarantine_invalid_vtt_caches(temp.path(), "vid", "en").unwrap();
         assert_eq!(quarantined.len(), 1);
         assert!(!corrupt.exists());
         assert!(quarantined[0].exists());
         assert_eq!(
-            subtitle_flow::pick_subtitle_file(temp.path(), "vid").unwrap(),
+            subtitle_flow::pick_subtitle_file(temp.path(), "vid", "en").unwrap(),
             None,
             "隔离后必须走 yt-dlp 重新下载"
         );
@@ -1498,7 +1518,8 @@ mod tests {
         let mut config = Config::default();
         config.ai.policy = temp.path().join("policy.json");
         std::fs::write(&config.ai.policy, "{}\n").unwrap();
-        let (segmented, translated, provenance_path) = translation_cache_paths(temp.path(), "vid");
+        let (segmented, translated, provenance_path) =
+            translation_cache_paths(temp.path(), "vid", "en");
         let source = vec![cue(0, "hello")];
         crate::subtitle::save_json(&source, &segmented).unwrap();
         let mut completed = source;
@@ -1522,6 +1543,32 @@ mod tests {
         );
         std::fs::remove_file(&provenance_path).unwrap();
         assert!(validate_translation_cache(&config, "vid", temp.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_channel_records_prepare_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "stage-guard",
+                url: "https://youtu.be/stage-guard",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+
+        let mut job = db.claim_prepare_job(&id).unwrap().unwrap();
+        job.channel_id = Some(i64::MAX);
+        let pipeline = Pipeline::new(Config::default(), db.clone());
+        assert!(pipeline.prepare_job(job).await.is_err());
+        let stored = db.get_job(&id).unwrap().unwrap();
+        assert_eq!(stored.status, JobStatus::RetryWait);
+        assert_eq!(stored.attempt, 1);
     }
 
     #[test]

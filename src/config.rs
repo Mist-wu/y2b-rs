@@ -286,6 +286,62 @@ impl Default for WebSubConfig {
         }
     }
 }
+pub fn normalize_source_lang(lang: &str) -> Result<String> {
+    use language_tags::LanguageTag;
+    let tag = LanguageTag::parse(lang).with_context(|| format!("source_lang 无效: {lang}"))?;
+    tag.validate()
+        .with_context(|| format!("source_lang 无效: {lang}"))?;
+    anyhow::ensure!(
+        tag.primary_language().len() >= 2,
+        "source_lang 无效: {lang}"
+    );
+    Ok(tag.to_string())
+}
+
+pub fn validate_source_lang(lang: &str) -> Result<()> {
+    normalize_source_lang(lang).map(drop)
+}
+
+pub(crate) fn matches_bcp47_source_lang(source: &str, language: &str) -> bool {
+    let language = language
+        .strip_suffix("-orig")
+        .unwrap_or(language)
+        .replace('_', "-");
+    let (Ok(actual), Ok(expected)) = (
+        normalize_source_lang(&language),
+        normalize_source_lang(source),
+    ) else {
+        return false;
+    };
+    actual == expected
+        || actual
+            .strip_prefix(&expected)
+            .is_some_and(|rest| rest.starts_with('-'))
+        || expected
+            .strip_prefix(&actual)
+            .is_some_and(|rest| rest.starts_with('-'))
+}
+
+pub(crate) fn matches_source_lang(source: &str, language: &str) -> bool {
+    let language = language
+        .strip_suffix("-orig")
+        .unwrap_or(language)
+        .replace('_', "-");
+    // YouTube also uses source-target keys (e.g. `en-de`, `en-ar`, `ja-en`).
+    // When track URL metadata is unavailable, reject ambiguous lowercase
+    // two-letter suffixes unless the pair is a curated regional official locale.
+    if let Some((_, suffix)) = language.split_once('-')
+        && suffix.len() == 2
+        && suffix.bytes().all(|byte| byte.is_ascii_lowercase())
+        && normalize_source_lang(suffix).is_ok()
+        && !include_str!("track_locales.txt")
+            .lines()
+            .any(|locale| locale.eq_ignore_ascii_case(&language))
+    {
+        return false;
+    }
+    matches_bcp47_source_lang(source, &language)
+}
 impl Config {
     /// 严格读取配置，文件不存在也返回错误。
     pub fn load(path: &Path) -> Result<Self> {
@@ -298,7 +354,7 @@ impl Config {
     }
 
     fn load_inner(path: &Path, allow_missing: bool) -> Result<Self> {
-        let config = match fs::read_to_string(path) {
+        let mut config = match fs::read_to_string(path) {
             Ok(raw) => toml::from_str(&raw)
                 .map_err(|error| anyhow::anyhow!("配置格式无效: {}: {error}", path.display()))?,
             Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
@@ -308,6 +364,7 @@ impl Config {
                 return Err(error).with_context(|| format!("读取配置失败: {}", path.display()));
             }
         };
+        config.translation.source_lang = normalize_source_lang(&config.translation.source_lang)?;
         config.validate()?;
         Ok(config)
     }
@@ -417,8 +474,8 @@ impl Config {
             "translation.target_lang 不能为空"
         );
         anyhow::ensure!(
-            self.translation.source_lang == "en" && self.translation.target_lang == "zh-CN",
-            "翻译语言必须固定为 source_lang=en, target_lang=zh-CN；当前为 source_lang={}, target_lang={}",
+            self.translation.target_lang == "zh-CN",
+            "目标语言必须为 target_lang=zh-CN；当前为 source_lang={}, target_lang={}",
             self.translation.source_lang,
             self.translation.target_lang
         );
@@ -500,10 +557,7 @@ impl Config {
             self.monitor.reconcile_limit > 0,
             "monitor.reconcile_limit 必须大于 0"
         );
-        anyhow::ensure!(
-            !self.translation.source_lang.trim().is_empty(),
-            "translation.source_lang 不能为空"
-        );
+        validate_source_lang(&self.translation.source_lang)?;
         Ok(())
     }
 }
@@ -512,6 +566,31 @@ impl Config {
 mod tests {
     use super::*;
 
+    #[test]
+    fn load_normalizes_configured_language_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (input, expected) in [
+            ("PT-br", "pt-BR"),
+            ("ZH-hant-tw", "zh-Hant-TW"),
+            ("es-419", "es-419"),
+        ] {
+            fs::write(&path, format!("[translation]\nsource_lang = '{input}'\n")).unwrap();
+            assert_eq!(
+                Config::load(&path).unwrap().translation.source_lang,
+                expected
+            );
+        }
+        for (raw, expected) in [
+            ("fr-ca", "fr-CA"),
+            ("pt-br", "pt-BR"),
+            ("zh-hant-tw", "zh-Hant-TW"),
+            ("en-in", "en-IN"),
+        ] {
+            assert_eq!(normalize_source_lang(raw).unwrap(), expected);
+        }
+        assert!(validate_source_lang("en-zh").is_err());
+    }
     #[test]
     fn parses_batch_modes_and_256k_defaults() {
         let adaptive: AiConfig = toml::from_str("batch_mode = \"adaptive\"").unwrap();
@@ -689,7 +768,7 @@ mod tests {
         assert_invalid(&config, "target_lang");
 
         let mut config = Config::default();
-        config.translation.source_lang = "ja".into();
+        config.translation.source_lang = "../ja".into();
         assert_invalid(&config, "source_lang");
 
         let mut config = Config::default();

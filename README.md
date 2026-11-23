@@ -31,7 +31,7 @@ YouTube 频道 ──RSS / Data API / WebSub──> 发现新视频 ──> SQLi
                                                           │
                 ┌─────────────────────────────────────────┘
                 ▼
-   准备 worker：下载原片 ∥ 下载英文字幕 → DeepSeek 分句 → DeepSeek 翻译 → 生成中文标题、简介、标签
+   准备 worker：下载原片 ∥ 下载源语言字幕 → DeepSeek 分句 → DeepSeek 翻译 → 生成中文标题、简介、标签
                 │
                 ▼
    上传 worker：biliup 投稿原片（严格串行，默认间隔 30 分钟）
@@ -45,7 +45,9 @@ YouTube 频道 ──RSS / Data API / WebSub──> 发现新视频 ──> SQLi
 | 模式 | 流程 | 字幕 |
 | --- | --- | --- |
 | `direct` | 下载视频，用 DeepSeek 生成中文标题、简介和标签 | 不处理字幕 |
-| `translated` | 英文字幕 → DeepSeek 分句 → DeepSeek 翻译 → 上传原片 → 提交中文 CC | B 站软字幕，观众可开关 |
+| `translated` | 源语言字幕 → DeepSeek 分句 → DeepSeek 翻译 → 上传原片 → 提交中文 CC | B 站软字幕，观众可开关 |
+
+频道默认使用 `translation.source_lang`。添加频道时可传 `--source-lang ja`，已有频道使用 `y2b channels set-lang <id> ja` 设置。省略语言可查看当前值，传 `--clear` 则恢复全局配置。
 
 `video_id` 全局唯一，同一个视频不会重复入队或重复投稿。优先频道单独按 60 秒轮询，在各个队列里都排在普通频道前面。
 

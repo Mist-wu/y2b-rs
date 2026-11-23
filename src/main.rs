@@ -120,7 +120,16 @@ enum MaintenanceCmd {
 
 #[derive(Subcommand)]
 enum ChannelCmd {
+    SetLang {
+        id: i64,
+        #[arg(conflicts_with = "clear", value_parser = y2b_rs::config::normalize_source_lang)]
+        source_lang: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
     Add {
+        #[arg(long, value_parser = y2b_rs::config::normalize_source_lang)]
+        source_lang: Option<String>,
         url: String,
         #[arg(long, value_enum)]
         mode: TransferMode,
@@ -405,20 +414,45 @@ async fn main() -> Result<()> {
             );
         }
         Cmd::Channels(c) => match c {
-            ChannelCmd::Add { url, mode } => {
-                let id = Monitor::new(config, db)?.add_channel(&url, mode).await?;
+            ChannelCmd::Add {
+                url,
+                mode,
+                source_lang,
+            } => {
+                let id = Monitor::new(config, db)?
+                    .add_channel(&url, mode, source_lang.as_deref())
+                    .await?;
                 println!("已添加频道 id={id} mode={mode}，当前视频已作为基线");
+            }
+            ChannelCmd::SetLang {
+                id,
+                source_lang,
+                clear,
+            } => {
+                if clear || source_lang.is_some() {
+                    db.set_channel_language(id, source_lang.as_deref())?;
+                }
+                let channel = db.channel(id)?;
+                println!(
+                    "频道 {id} source_lang={}，生效语言={}",
+                    channel.source_lang.as_deref().unwrap_or("NULL"),
+                    channel
+                        .source_lang
+                        .as_deref()
+                        .unwrap_or(&config.translation.source_lang)
+                );
             }
             ChannelCmd::List => {
                 for c in db.list_channels()? {
                     println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         c.id,
                         if c.enabled { "on" } else { "off" },
                         c.transfer_mode,
                         c.priority,
                         c.name,
-                        c.youtube_channel_id
+                        c.youtube_channel_id,
+                        c.source_lang.as_deref().unwrap_or("-")
                     )
                 }
             }
@@ -1301,6 +1335,20 @@ mod tests {
         assert!(service.contains("/opt/y2b/current/pi/policy.json"));
     }
 
+    #[test]
+    fn channel_language_commands_parse() {
+        for args in [
+            vec!["add", "url", "--mode", "translated", "--source-lang", "ja"],
+            vec!["set-lang", "1", "de-DE"],
+            vec!["set-lang", "1", "--clear"],
+            vec!["set-lang", "1"],
+        ] {
+            Cli::try_parse_from(["y2b", "channels"].into_iter().chain(args)).unwrap();
+        }
+        assert!(
+            Cli::try_parse_from(["y2b", "channels", "set-lang", "1", "ja", "--clear"]).is_err()
+        );
+    }
     #[test]
     fn maintenance_status_command_uses_an_explicit_database_and_json_output() {
         let cli = Cli::try_parse_from([

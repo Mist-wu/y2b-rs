@@ -550,6 +550,15 @@ impl Database {
                 )?;
             }
         }
+        // 补齐曾经直接记录最新版本的数据库，使迁移历史连续。
+        tx.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(22,CURRENT_TIMESTAMP)", [])?;
+        if !tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('channels') WHERE name='source_lang')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )? {
+            tx.execute("ALTER TABLE channels ADD COLUMN source_lang TEXT", [])?;
+        }
         tx.execute(
             "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,CURRENT_TIMESTAMP)",
             [CURRENT_SCHEMA_VERSION],

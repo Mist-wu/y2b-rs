@@ -115,7 +115,7 @@ pub struct WebSubChannel {
     pub last_received_at: Option<DateTime<Utc>>,
 }
 
-const CHANNEL_COLUMNS: &str = "id,youtube_channel_id,name,url,enabled,transfer_mode,priority,last_checked_at,last_error,next_poll_at,consecutive_failures,uploads_playlist_id,next_data_api_poll_at,data_api_etag,websub_lease_expires_at,websub_last_received_at";
+const CHANNEL_COLUMNS: &str = "id,youtube_channel_id,name,url,enabled,transfer_mode,priority,last_checked_at,last_error,next_poll_at,consecutive_failures,uploads_playlist_id,next_data_api_poll_at,data_api_etag,websub_lease_expires_at,websub_last_received_at,source_lang";
 const CANDIDATE_COLUMNS: &str = "video_candidates.video_id,video_candidates.channel_id,video_candidates.url,video_candidates.title,video_candidates.published_at,video_candidates.source,video_candidates.discovered_at,video_candidates.gate_state,video_candidates.gate_attempts,video_candidates.next_gate_at,video_candidates.last_error,video_candidates.source_language,video_candidates.source_language_mismatch";
 const WEBSUB_CHANNEL_COLUMNS: &str = "id,youtube_channel_id,name,enabled,websub_lease_expires_at,websub_secret,websub_callback_path,websub_last_received_at";
 /// jobs 表业务列清单，供所有按 id/video_id/队列查询复用。
@@ -134,7 +134,7 @@ const LEGACY_BILIBILI_UPLOAD_HOLD_OWNER: &str = "bilibili.upload_hold_owner";
 const LEGACY_BILIBILI_UPLOAD_HOLD_PREVIOUS: &str = "bilibili.upload_hold_previous";
 const LEGACY_BILIBILI_UPLOAD_HOLD_UNTIL: &str = "2099-12-31T23:59:59+00:00";
 /// 当前二进制能够完整理解的数据库迁移版本。
-pub const CURRENT_SCHEMA_VERSION: i64 = 22;
+pub const CURRENT_SCHEMA_VERSION: i64 = 23;
 
 mod discovery;
 mod jobs;

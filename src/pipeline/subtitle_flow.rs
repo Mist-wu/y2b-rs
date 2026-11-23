@@ -1,4 +1,4 @@
-//! 字幕流程：下载英文字幕、DeepSeek 分句、DeepSeek 翻译，以及各级缓存/检查点。
+//! 字幕流程：下载源语言字幕、DeepSeek 分句、DeepSeek 翻译，以及各级缓存/检查点。
 use super::ai::{
     AI_MAX_PAYLOAD_BYTES, AI_PROMPT_OVERHEAD_TOKENS, batch_mode_name,
     estimate_segment_argument_bytes, estimate_segment_tokens, estimate_translation_tokens,
@@ -374,13 +374,17 @@ struct SubtitleTrack {
     kind: SubtitleTrackKind,
 }
 
-/// 选出用于分句/翻译的英文字幕文件。
+/// 选出与配置源语言匹配的字幕文件。
 ///
 /// yt-dlp 可能把模板中的语言和自身追加的语言各写一次，生成
 /// `<id>.en.en.vtt`。旧版 `en.*` 还会留下 `<id>.en.en-ar.vtt` 等英文源机器
-/// 翻译轨道；这些不能被误当成英语缓存。这里固定优先级：精确 `en` >
+/// 翻译轨道；这些不能被误当成英语缓存。以英语为例，优先级为精确 `en` >
 /// `en-orig` > 英语地区变体，保证重跑结果可复现。
-pub(super) fn pick_subtitle_file(work: &Path, video_id: &str) -> Result<Option<PathBuf>> {
+pub(super) fn pick_subtitle_file(
+    work: &Path,
+    video_id: &str,
+    source: &str,
+) -> Result<Option<PathBuf>> {
     let mut candidates = fs::read_dir(work)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
@@ -388,11 +392,11 @@ pub(super) fn pick_subtitle_file(work: &Path, video_id: &str) -> Result<Option<P
                 && path.metadata().is_ok_and(|metadata| metadata.len() > 0)
         })
         .map(|path| (subtitle_language_tag(&path, video_id), path))
-        .filter(|(language, _)| is_english_subtitle_language(language))
+        .filter(|(language, _)| matches_track(language, source))
         .collect::<Vec<_>>();
     candidates.sort_by(|(left_lang, left_path), (right_lang, right_path)| {
-        subtitle_language_rank(left_lang)
-            .cmp(&subtitle_language_rank(right_lang))
+        subtitle_language_rank(left_lang, source)
+            .cmp(&subtitle_language_rank(right_lang, source))
             .then_with(|| left_lang.cmp(right_lang))
             .then_with(|| left_path.cmp(right_path))
     });
@@ -416,25 +420,18 @@ fn pick_subtitle_file_for_language(
     Ok(candidates.into_iter().next())
 }
 
-/// 语言标签优先级：精确 `en` > 原始自动字幕 `en-orig` > 英语地区变体。
-pub(super) fn subtitle_language_rank(language: &str) -> u8 {
-    match language {
-        "en" => 0,
-        "en-orig" => 1,
-        _ => 2,
+/// 优先精确标签，其次为原始自动字幕，最后选择同语言变体。
+fn subtitle_language_rank(language: &str, source: &str) -> u8 {
+    if language.eq_ignore_ascii_case(source) {
+        0
+    } else if language.ends_with("-orig") {
+        1
+    } else {
+        2
     }
 }
-
-fn is_english_subtitle_language(language: &str) -> bool {
-    if matches!(language, "en" | "en-orig") {
-        return true;
-    }
-    let Some(variant) = language.strip_prefix("en-") else {
-        return false;
-    };
-    // YouTube 的英文源翻译轨道使用 `en-ar`、`en-de`、`en-zh-Hans` 等全小写
-    // 目标代码；真实英语地区变体通常含大写区域代码（en-US、en-GB…）。
-    variant.chars().any(|ch| ch.is_ascii_uppercase()) && !variant.starts_with("zh-")
+fn matches_track(language: &str, source: &str) -> bool {
+    crate::config::matches_source_lang(source, language)
 }
 
 /// 从 `<video_id>.<language>.vtt` 取出语言标签；yt-dlp 重复追加语言时取最后一段。
@@ -451,7 +448,37 @@ pub(super) fn subtitle_language_tag(path: &Path, video_id: &str) -> String {
         .to_string()
 }
 
-fn best_english_track(
+fn is_translated_caption_url(url: &str) -> bool {
+    let Some((_, query)) = url.split_once('?') else {
+        return false;
+    };
+    let query = query.split('#').next().unwrap_or(query);
+    query.split('&').any(|pair| {
+        pair.split_once('=')
+            .is_some_and(|(key, value)| key == "tlang" && !value.is_empty())
+    })
+}
+
+/// 根据 yt-dlp 返回的轨道 URL 判断是否为自动翻译轨道：
+/// - `Some(true)`：至少一个格式 URL 含 `tlang=`，确认是自动翻译轨；
+/// - `Some(false)`：存在格式 URL 且均不含 `tlang=`，确认是原语轨；
+/// - `None`：元数据未提供 URL，交由标签启发式规则判断。
+fn track_translation_signal(formats: &[Value]) -> Option<bool> {
+    let mut saw_url = false;
+    for format in formats {
+        let Some(url) = format.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        saw_url = true;
+        if is_translated_caption_url(url) {
+            return Some(true);
+        }
+    }
+    saw_url.then_some(false)
+}
+
+fn best_track(
+    source: &str,
     metadata: &Value,
     field: &str,
     kind: SubtitleTrackKind,
@@ -461,16 +488,23 @@ fn best_english_track(
         .as_object()?
         .iter()
         .filter(|(language, formats)| {
-            is_english_subtitle_language(language)
-                && formats
-                    .as_array()
-                    .is_some_and(|formats| !formats.is_empty())
+            let Some(formats) = formats.as_array() else {
+                return false;
+            };
+            if formats.is_empty() {
+                return false;
+            }
+            match track_translation_signal(formats) {
+                Some(true) => false,
+                Some(false) => crate::config::matches_bcp47_source_lang(source, language),
+                None => matches_track(language, source),
+            }
         })
         .map(|(language, _)| language.clone())
         .collect::<Vec<_>>();
     languages.sort_by(|left, right| {
-        subtitle_language_rank(left)
-            .cmp(&subtitle_language_rank(right))
+        subtitle_language_rank(left, source)
+            .cmp(&subtitle_language_rank(right, source))
             .then_with(|| left.cmp(right))
     });
     languages
@@ -479,9 +513,14 @@ fn best_english_track(
         .map(|language| SubtitleTrack { language, kind })
 }
 
-fn select_subtitle_track(metadata: &Value) -> Option<SubtitleTrack> {
-    best_english_track(metadata, "subtitles", SubtitleTrackKind::Manual).or_else(|| {
-        best_english_track(metadata, "automatic_captions", SubtitleTrackKind::Automatic)
+fn select_subtitle_track(metadata: &Value, source: &str) -> Option<SubtitleTrack> {
+    best_track(source, metadata, "subtitles", SubtitleTrackKind::Manual).or_else(|| {
+        best_track(
+            source,
+            metadata,
+            "automatic_captions",
+            SubtitleTrackKind::Automatic,
+        )
     })
 }
 
@@ -529,8 +568,8 @@ impl Pipeline {
         work: &Path,
         redownload_if_missing: bool,
     ) -> Result<Option<PreparedSubtitle>> {
-        let segmented = work.join(format!("{}.en.segmented.json", meta.id));
-        let translated = work.join(format!("{}.en-zh-CN.translated.json", meta.id));
+        let (segmented, translated, _) =
+            super::translation_cache_paths(work, &meta.id, &self.config.translation.source_lang);
 
         let cached = match load_segmented_cache(&segmented) {
             Ok(Some(cues)) => {
@@ -645,7 +684,8 @@ impl Pipeline {
         if let Some(cached) = {
             let work = work.to_owned();
             let id = video_id.to_owned();
-            tokio::task::spawn_blocking(move || pick_subtitle_file(&work, &id)).await??
+            let source = self.config.translation.source_lang.clone();
+            tokio::task::spawn_blocking(move || pick_subtitle_file(&work, &id, &source)).await??
         } {
             let detail = format!("cache:{}", cached.to_string_lossy());
             stage.finish("completed", 0, 0, Some(&detail))?;
@@ -676,12 +716,13 @@ impl Pipeline {
                     .context("字幕轨道查询失败");
             }
         };
-        let Some(track) = select_subtitle_track(&metadata) else {
+        let Some(track) = select_subtitle_track(&metadata, &self.config.translation.source_lang)
+        else {
             stage.finish(
                 "missing",
                 probed.duration_ms,
                 probed.peak_rss_kib,
-                Some("no English subtitle track"),
+                Some("no matching source subtitle track"),
             )?;
             return Ok(None);
         };
@@ -1385,33 +1426,151 @@ mod tests {
         std::fs::write(work.join("vid.raw.mp4"), "x").unwrap();
         std::fs::write(work.join("vid.zz.vtt"), "").unwrap();
         assert_eq!(
-            pick_subtitle_file(work, "vid").unwrap(),
+            pick_subtitle_file(work, "vid", "en").unwrap(),
             Some(work.join("vid.en.en.vtt"))
         );
 
         // 同为精确 en 时按路径稳定排序；移除后优先 en-orig，不选 en-ar。
         std::fs::remove_file(work.join("vid.en.en.vtt")).unwrap();
         assert_eq!(
-            pick_subtitle_file(work, "vid").unwrap(),
+            pick_subtitle_file(work, "vid", "en").unwrap(),
             Some(work.join("vid.en.vtt"))
         );
         std::fs::remove_file(work.join("vid.en.vtt")).unwrap();
-        let first = pick_subtitle_file(work, "vid").unwrap();
+        let first = pick_subtitle_file(work, "vid", "en").unwrap();
         assert_eq!(first, Some(work.join("vid.en-orig.vtt")));
-        assert_eq!(pick_subtitle_file(work, "vid").unwrap(), first);
+        assert_eq!(pick_subtitle_file(work, "vid", "en").unwrap(), first);
 
         std::fs::remove_file(work.join("vid.en-orig.vtt")).unwrap();
         std::fs::remove_file(work.join("vid.en-US.vtt")).unwrap();
         std::fs::remove_file(work.join("vid.en-GB.vtt")).unwrap();
-        assert_eq!(pick_subtitle_file(work, "vid").unwrap(), None);
+        assert_eq!(pick_subtitle_file(work, "vid", "en").unwrap(), None);
 
         std::fs::remove_dir_all(work.join("empty")).ok();
         assert_eq!(
-            pick_subtitle_file(temp.path().join("nope").as_path(), "vid").ok(),
+            pick_subtitle_file(temp.path().join("nope").as_path(), "vid", "en").ok(),
             None
         );
     }
 
+    #[test]
+    fn language_matching_agrees_across_discovery_and_subtitles() {
+        for (source, tag, matches) in [
+            ("fr-ca", "fr-ca", true),
+            ("fr-ca", "fr-CA", true),
+            ("fr-CA", "fr-ca", true),
+            ("fr-CA", "fr-CA", true),
+            ("fr-ch", "fr-ch", true),
+            ("fr-be", "fr-be", true),
+            ("zh-sg", "zh-sg", true),
+            ("ca-es", "ca-es", true),
+            ("ga-ie", "ga-ie", true),
+            ("en-in", "en-in", true),
+            ("pt", "pt-br", true),
+            ("PT-br", "pt-BR", true),
+            ("zh", "zh-Hant-TW", true),
+            ("zh-Hant", "zh-Hant-TW", true),
+            ("en", "en-DE", true),
+            ("ja", "ja-en", false),
+            ("en", "en-zh-Hans", false),
+            ("en", "en-zh", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(format!("vid.{tag}.vtt")), "WEBVTT").unwrap();
+            let metadata = serde_json::json!({"automatic_captions":{(tag):[{}]}});
+            assert_eq!(
+                crate::monitor::source_language_matches(source, tag),
+                matches,
+                "{tag}"
+            );
+            assert_eq!(
+                select_subtitle_track(&metadata, source).is_some(),
+                matches,
+                "{tag}"
+            );
+            assert_eq!(
+                pick_subtitle_file(dir.path(), "vid", source)
+                    .unwrap()
+                    .is_some(),
+                matches,
+                "{tag}"
+            );
+        }
+
+        // 音频语言按纯 BCP-47 大小写无关匹配（en-de / en-DE 均认可），
+        // 无 URL 字幕与本地缓存仍排除易与 YouTube 翻译轨混淆的小写 en-* 标签。
+        for tag in ["en-de", "en-fr", "en-ar"] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(format!("vid.{tag}.vtt")), "WEBVTT").unwrap();
+            let metadata = serde_json::json!({"automatic_captions":{(tag):[{}]}});
+            assert!(
+                crate::monitor::source_language_matches("en", tag),
+                "audio {tag}"
+            );
+            assert!(
+                crate::monitor::source_language_matches("en", &tag.to_ascii_uppercase()),
+                "audio upper {tag}"
+            );
+            assert!(
+                select_subtitle_track(&metadata, "en").is_none(),
+                "online {tag}"
+            );
+            assert!(
+                pick_subtitle_file(dir.path(), "vid", "en")
+                    .unwrap()
+                    .is_none(),
+                "cache {tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn subtitle_track_selection_uses_format_url_to_disambiguate_translations() {
+        let translated_en_de = serde_json::json!({
+            "automatic_captions": {
+                "en-de": [{
+                    "ext": "vtt",
+                    "url": "https://www.youtube.com/api/timedtext?v=abc&lang=en&tlang=de"
+                }]
+            }
+        });
+        assert!(select_subtitle_track(&translated_en_de, "en").is_none());
+
+        let translated_fr_ca = serde_json::json!({
+            "automatic_captions": {
+                "fr-ca": [{
+                    "ext": "vtt",
+                    "url": "https://www.youtube.com/api/timedtext?v=abc&lang=fr&tlang=ca"
+                }]
+            }
+        });
+        assert!(select_subtitle_track(&translated_fr_ca, "fr").is_none());
+
+        let native_en_de = serde_json::json!({
+            "subtitles": {
+                "en-de": [{
+                    "ext": "vtt",
+                    "url": "https://www.youtube.com/api/timedtext?v=abc&lang=en-DE"
+                }]
+            }
+        });
+        assert_eq!(
+            select_subtitle_track(&native_en_de, "en"),
+            Some(SubtitleTrack {
+                language: "en-de".into(),
+                kind: SubtitleTrackKind::Manual,
+            })
+        );
+    }
+    #[test]
+    fn configured_language_selects_its_original_track() {
+        let metadata = serde_json::json!({"subtitles":{"en":[{}],"ja-en":[{}]},"automatic_captions":{"ja-orig":[{}],"ja-JP":[{}]}});
+        assert_eq!(
+            select_subtitle_track(&metadata, "ja").unwrap().language,
+            "ja-orig"
+        );
+        assert!(select_subtitle_track(&metadata, "de").is_none());
+    }
     #[test]
     fn subtitle_track_selection_prefers_one_manual_english_track() {
         let metadata = serde_json::json!({
@@ -1426,7 +1585,7 @@ mod tests {
                 "en-zh-Hans": [{"ext": "vtt"}]
             }
         });
-        let track = select_subtitle_track(&metadata).unwrap();
+        let track = select_subtitle_track(&metadata, "en").unwrap();
         assert_eq!(
             track,
             SubtitleTrack {
@@ -1446,7 +1605,7 @@ mod tests {
             "warning on stdout\n{\"subtitles\":{},\"automatic_captions\":{\"en-ar\":[{}],\"en-zh-Hans\":[{}],\"en-orig\":[{}]}}\n",
         )
         .unwrap();
-        let track = select_subtitle_track(&metadata).unwrap();
+        let track = select_subtitle_track(&metadata, "en").unwrap();
         assert_eq!(
             track,
             SubtitleTrack {
@@ -1465,6 +1624,6 @@ mod tests {
                 "en-zh-Hans": [{}]
             }
         });
-        assert_eq!(select_subtitle_track(&translated_only), None);
+        assert_eq!(select_subtitle_track(&translated_only, "en"), None);
     }
 }
