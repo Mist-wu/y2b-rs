@@ -1,3 +1,10 @@
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
+    use std::process::Output;
+    use y2b_rs::db::CURRENT_SCHEMA_VERSION;
+
     #[test]
     fn deployment_scripts_install_and_preflight_sqlite() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1514,3 +1521,4 @@ esac
             "{y2b_calls}"
         );
     }
+}

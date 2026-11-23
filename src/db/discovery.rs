@@ -571,32 +571,18 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<VideoCandidate>> {
         let c = self.conn();
-        let (sql, params): (String, Vec<rusqlite::types::Value>) = match channel_id {
-            Some(channel_id) => (
-                format!(
-                    "SELECT {CANDIDATE_COLUMNS} FROM video_candidates LEFT JOIN channels ON channels.id=video_candidates.channel_id WHERE video_candidates.channel_id=? AND (gate_state='pending' OR (gate_state='deferred' AND next_gate_at<=?)) ORDER BY CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END DESC,discovered_at LIMIT ?"
-                ),
-                vec![
-                    rusqlite::types::Value::Integer(channel_id),
-                    rusqlite::types::Value::Text(format_timestamp(now)),
-                    rusqlite::types::Value::Integer(limit as i64),
-                ],
-            ),
-            None => (
-                format!(
-                    "SELECT {CANDIDATE_COLUMNS} FROM video_candidates LEFT JOIN channels ON channels.id=video_candidates.channel_id WHERE gate_state='pending' OR (gate_state='deferred' AND next_gate_at<=?) ORDER BY CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END DESC,discovered_at LIMIT ?"
-                ),
-                vec![
-                    rusqlite::types::Value::Text(format_timestamp(now)),
-                    rusqlite::types::Value::Integer(limit as i64),
-                ],
-            ),
-        };
-        let mut q = c.prepare(&sql)?;
-        Ok(
-            q.query_map(rusqlite::params_from_iter(params), candidate_from_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?,
-        )
+        let mut q = c.prepare(&format!(
+            "SELECT {CANDIDATE_COLUMNS} FROM video_candidates
+             LEFT JOIN channels ON channels.id=video_candidates.channel_id
+             WHERE (gate_state='pending' OR (gate_state='deferred' AND next_gate_at<=?1))
+               AND (?2 IS NULL OR video_candidates.channel_id=?2)
+             ORDER BY CASE channels.priority WHEN 'priority' THEN 1 ELSE 0 END DESC,discovered_at LIMIT ?3"
+        ))?;
+        Ok(q.query_map(
+            params![format_timestamp(now), channel_id, limit as i64],
+            candidate_from_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn get_video_candidate(&self, video_id: &str) -> Result<Option<VideoCandidate>> {

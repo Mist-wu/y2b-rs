@@ -8,37 +8,21 @@ pub(super) fn format_timestamp(value: DateTime<Utc>) -> String {
 ///
 /// `ceil_submillis` 用于租约和重试截止时间：亚毫秒余量向上进到下一毫秒，
 /// 避免 `.123456+00:00` 在收成三位小数后被同一毫秒的比较时刻提前判到期。
-pub(super) fn canonical_sql_timestamp(raw: &str, ceil_submillis: bool) -> Result<String, String> {
-    let parsed = parse_legacy_timestamp(raw)?;
-    Ok(format_sql_instant(parsed, ceil_submillis))
+pub(super) fn canonical_sql_timestamp(raw: &str, ceil_submillis: bool) -> Result<String> {
+    let mut value = parse_timestamp(raw)?;
+    let remainder = value.timestamp_subsec_nanos() % 1_000_000;
+    if ceil_submillis && remainder != 0 {
+        value += chrono::Duration::nanoseconds(i64::from(1_000_000 - remainder));
+    }
+    Ok(format_timestamp(value))
 }
 
-fn parse_legacy_timestamp(raw: &str) -> Result<DateTime<Utc>, String> {
-    if let Ok(value) = DateTime::parse_from_rfc3339(raw) {
-        return Ok(value.with_timezone(&Utc));
-    }
-    // 早期迁移和 SQLite `CURRENT_TIMESTAMP` 使用空格分隔的 UTC 时间，可带小数。
-    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f") {
-        return Ok(value.and_utc());
-    }
-    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
-        return Ok(value.and_utc());
-    }
-    Err(format!("无法解析时间戳 {raw:?}"))
-}
-
-fn format_sql_instant(value: DateTime<Utc>, ceil_submillis: bool) -> String {
-    let value = if ceil_submillis {
-        let remainder = value.timestamp_subsec_nanos() % 1_000_000;
-        if remainder == 0 {
-            value
-        } else {
-            value + chrono::Duration::nanoseconds(i64::from(1_000_000 - remainder))
-        }
-    } else {
-        value
-    };
-    format_timestamp(value)
+fn parse_timestamp(raw: &str) -> chrono::ParseResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|value| value.to_utc())
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f").map(|v| v.and_utc())
+        })
 }
 
 pub(super) fn maintenance_hold_from_row(
@@ -166,18 +150,13 @@ pub(super) fn websub_channel_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result
 }
 
 pub(super) fn parse(s: String) -> rusqlite::Result<DateTime<Utc>> {
-    if let Ok(value) = DateTime::parse_from_rfc3339(&s) {
-        return Ok(value.with_timezone(&Utc));
-    }
-    // 早期迁移和 SQLite 的 CURRENT_TIMESTAMP 会生成这一 UTC 格式；它不是损坏值。
-    if let Ok(value) = chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S") {
-        return Ok(value.and_utc());
-    }
-    Err(rusqlite::Error::FromSqlConversionFailure(
-        0,
-        rusqlite::types::Type::Text,
-        anyhow::anyhow!("无效时间戳: {s}").into(),
-    ))
+    parse_timestamp(&s).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            anyhow::anyhow!("无效时间戳: {s}").into(),
+        )
+    })
 }
 pub(super) fn parse_opt(s: Option<String>) -> rusqlite::Result<Option<DateTime<Utc>>> {
     s.map(parse).transpose()

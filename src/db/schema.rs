@@ -616,103 +616,6 @@ impl Database {
     }
 }
 
-struct SqlTimestampColumn {
-    table: &'static str,
-    column: &'static str,
-    id_column: &'static str,
-    /// 截止时间向上取整，排序和发生时间保持截断到毫秒。
-    ceil_submillis: bool,
-}
-
-/// 这些列直接参与租约、恢复、重试或排序的 SQL 文本比较。
-/// 投稿冷却存在 settings 里，读取后会解析成时间，不在此列。
-const SQL_TIMESTAMP_COLUMNS: &[SqlTimestampColumn] = &[
-    SqlTimestampColumn {
-        table: "jobs",
-        column: "claim_expires_at",
-        id_column: "id",
-        ceil_submillis: true,
-    },
-    SqlTimestampColumn {
-        table: "jobs",
-        column: "retry_at",
-        id_column: "id",
-        ceil_submillis: true,
-    },
-    SqlTimestampColumn {
-        table: "jobs",
-        column: "subtitle_retry_at",
-        id_column: "id",
-        ceil_submillis: true,
-    },
-    SqlTimestampColumn {
-        table: "jobs",
-        column: "updated_at",
-        id_column: "id",
-        ceil_submillis: false,
-    },
-    SqlTimestampColumn {
-        table: "jobs",
-        column: "discovered_at",
-        id_column: "id",
-        ceil_submillis: false,
-    },
-    SqlTimestampColumn {
-        table: "maintenance_hold",
-        column: "expires_at",
-        id_column: "singleton",
-        ceil_submillis: true,
-    },
-    SqlTimestampColumn {
-        table: "channels",
-        column: "next_poll_at",
-        id_column: "id",
-        ceil_submillis: true,
-    },
-    SqlTimestampColumn {
-        table: "channels",
-        column: "next_data_api_poll_at",
-        id_column: "id",
-        ceil_submillis: true,
-    },
-    SqlTimestampColumn {
-        table: "channels",
-        column: "websub_lease_expires_at",
-        id_column: "id",
-        ceil_submillis: true,
-    },
-    SqlTimestampColumn {
-        table: "video_candidates",
-        column: "next_gate_at",
-        id_column: "video_id",
-        ceil_submillis: true,
-    },
-    SqlTimestampColumn {
-        table: "video_candidates",
-        column: "discovered_at",
-        id_column: "video_id",
-        ceil_submillis: false,
-    },
-    SqlTimestampColumn {
-        table: "stage_runs",
-        column: "started_at",
-        id_column: "id",
-        ceil_submillis: false,
-    },
-    SqlTimestampColumn {
-        table: "upload_attempts",
-        column: "started_at",
-        id_column: "id",
-        ceil_submillis: false,
-    },
-    SqlTimestampColumn {
-        table: "subtitle_attempts",
-        column: "started_at",
-        id_column: "id",
-        ceil_submillis: false,
-    },
-];
-
 fn normalize_sql_timestamps(connection: &mut Connection) -> Result<()> {
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let version: i64 = tx.query_row(
@@ -723,46 +626,43 @@ fn normalize_sql_timestamps(connection: &mut Connection) -> Result<()> {
     if version >= 24 {
         return Ok(());
     }
-    for column in SQL_TIMESTAMP_COLUMNS {
-        let sql = format!(
-            "SELECT CAST({id} AS TEXT), {name} FROM {table} WHERE {name} IS NOT NULL",
-            id = column.id_column,
-            name = column.column,
-            table = column.table,
-        );
-        let mut query = tx.prepare(&sql)?;
+    // 表、主键、时间列、是否为须向上取整的截止时间。
+    for (table, id, column, deadline) in [
+        ("jobs", "id", "claim_expires_at", true),
+        ("jobs", "id", "retry_at", true),
+        ("jobs", "id", "subtitle_retry_at", true),
+        ("jobs", "id", "updated_at", false),
+        ("jobs", "id", "discovered_at", false),
+        ("maintenance_hold", "singleton", "expires_at", true),
+        ("channels", "id", "next_poll_at", true),
+        ("channels", "id", "next_data_api_poll_at", true),
+        ("channels", "id", "websub_lease_expires_at", true),
+        ("video_candidates", "video_id", "next_gate_at", true),
+        ("video_candidates", "video_id", "discovered_at", false),
+        ("stage_runs", "id", "started_at", false),
+        ("upload_attempts", "id", "started_at", false),
+        ("subtitle_attempts", "id", "started_at", false),
+    ] {
+        let mut query = tx.prepare(&format!(
+            "SELECT CAST({id} AS TEXT), {column} FROM {table} WHERE {column} IS NOT NULL"
+        ))?;
         let rows = query
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(query);
+        let mut update = tx.prepare(&format!("UPDATE {table} SET {column}=? WHERE {id}=?"))?;
         for (row_id, raw) in rows {
-            let canonical =
-                canonical_sql_timestamp(&raw, column.ceil_submillis).map_err(|error| {
-                    anyhow::anyhow!(
-                        "迁移 v24 失败：表 {} 列 {} 行 {row_id} 的时间戳无法规范化: {error}",
-                        column.table,
-                        column.column
-                    )
-                })?;
-            if canonical == raw {
-                continue;
-            }
-            let updated = tx.execute(
-                &format!(
-                    "UPDATE {table} SET {name}=? WHERE {id}=?",
-                    table = column.table,
-                    name = column.column,
-                    id = column.id_column,
-                ),
-                params![canonical, row_id],
-            )?;
-            if updated != 1 {
-                anyhow::bail!(
-                    "迁移 v24 失败：表 {} 列 {} 行 {row_id} 未能写回规范化时间",
-                    column.table,
-                    column.column
+            let canonical = canonical_sql_timestamp(&raw, deadline).with_context(|| {
+                format!(
+                    "迁移 v24 失败：表 {table} 列 {column} 行 {row_id} 的时间戳无法规范化: {raw:?}"
+                )
+            })?;
+            if canonical != raw {
+                anyhow::ensure!(
+                    update.execute(params![canonical, row_id])? == 1,
+                    "迁移 v24 失败：表 {table} 列 {column} 行 {row_id} 未能写回规范化时间"
                 );
             }
         }

@@ -854,7 +854,9 @@ impl Pipeline {
         self.validate_subtitle_caches(&job.id, &meta.id, &work)?;
         let video_fut = self.download_video(&job.id, &job.url, &meta, &work);
         let subtitle_fut = async {
-            let result = self.prepare_translated_subtitle(job, &meta, &work).await;
+            let result = self
+                .prepare_translated_subtitle(job, &meta, &work, true)
+                .await;
             let (_, translated, provenance_path) =
                 translation_cache_paths(&work, &meta.id, &self.config.translation.source_lang);
             if translated.exists() {
@@ -884,13 +886,8 @@ impl Pipeline {
                 )
                 .await;
         };
-        self.publish_metadata(
-            &job.id,
-            TransferMode::Translated,
-            &meta,
-            Some(&subtitle.cues),
-        )
-        .await?;
+        self.publish_metadata(&job.id, TransferMode::Translated, &meta, Some(&subtitle))
+            .await?;
         let prepared = {
             let cover = self.download_cover(&job.id, &meta, &work).await?;
             PreparedUpload::Submission {
@@ -1206,12 +1203,10 @@ impl Pipeline {
         Ok(())
     }
 
-    fn after_upload(&self, job_id: &str, paths: &[&Path]) -> Result<()> {
+    fn after_upload(&self, job_id: &str, raw: Option<&Path>) -> Result<()> {
         if self.config.storage.delete_large_after_upload {
-            for p in paths {
-                if p.exists() {
-                    fs::remove_file(p)?;
-                }
+            if let Some(path) = raw.filter(|p| p.exists()) {
+                fs::remove_file(path)?;
             }
             self.db
                 .event(Some(job_id), "info", "上传成功，已清理大型视频文件")?;

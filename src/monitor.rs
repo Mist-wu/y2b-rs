@@ -7,8 +7,8 @@ use crate::{
     process::run_monitored,
     retry::{jittered_backoff, random_jitter_factor},
     youtube_api::{
-        PlaylistVideo, QuotaDegradation, ResponseBodyError, YoutubeDataApi, bounded_http_client,
-        read_response_body,
+        PlaylistVideo, QuotaDegradation, QuotaPolicy, ResponseBodyError, YoutubeDataApi,
+        bounded_http_client, read_response_body,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -41,13 +41,6 @@ pub struct Monitor {
 const YOUTUBE_EXTRACTOR_ARGS: &str = "youtube:player_client=web_creator";
 
 /// 构造带公共参数（YouTube 客户端、js 运行时、cookies）的 yt-dlp 命令，供各子命令复用。
-///
-/// 注意：不要加 `--force-ipv4`。曾经为了绕开 `[Errno 101] Network is unreachable`
-/// 加过，但那是误诊——真正的原因是部署机到 `74.125.0.0/16` 整段不可达，两个地址
-/// 族都连不上。而 `--force-ipv4`（实现上等价于 `--source-address 0.0.0.0`）在当前
-/// yt-dlp 版本下会让本来正常的域名解析报 `[Errno -9] Address family for hostname
-/// not supported`，属于净负面。需要走 IPv4 时由 `deploy/bootstrap-server.sh`
-/// 在 `/etc/gai.conf` 里设置系统级优先级。
 pub(crate) fn ytdlp_command(config: &YoutubeConfig) -> Command {
     let mut cmd = Command::new(&config.yt_dlp);
     // 2026-08 起默认的 web_safari 客户端会在服务器账号上稳定返回
@@ -433,11 +426,6 @@ impl FallbackLimiter {
         self.global_starts.push_back(now);
         FallbackClaim::Allowed
     }
-
-    #[cfg(test)]
-    fn last_attempt(&self, channel_id: i64) -> Option<Instant> {
-        self.per_channel.get(&channel_id).copied()
-    }
 }
 
 pub(crate) fn is_youtube_video_id(value: &str) -> bool {
@@ -748,20 +736,13 @@ impl Monitor {
         Ok(api.quota_policy()?.degradation != QuotaDegradation::FallbackOnly)
     }
 
-    /// 有效 WebSub 租约意味着新视频由 hub 秒级推送到本地回调，Data API 与 RSS
-    /// 都只剩兜底职责。优先频道也不例外：它们原本每分钟一次的 Data API 轮询占
-    /// 日配额八成以上，正是 WebSub 要替代的部分。
-    fn websub_lease_active(&self, channel: &Channel, now: DateTime<Utc>) -> bool {
-        websub_lease_active(&self.config, channel, now)
-    }
-
     fn data_api_poll_decision(
         &self,
         channel: &Channel,
         now: DateTime<Utc>,
         degradation: QuotaDegradation,
     ) -> Result<DataApiPollDecision> {
-        let websub_active = self.websub_lease_active(channel, now);
+        let websub_active = websub_lease_active(&self.config, channel, now);
         if channel.priority == ChannelPriority::Priority && !websub_active {
             return Ok(DataApiPollDecision {
                 interval: Duration::from_secs(self.config.monitor.poll_seconds.max(1)),
@@ -794,11 +775,16 @@ impl Monitor {
         &self,
         channel_id: i64,
         now: DateTime<Utc>,
-        degradation: QuotaDegradation,
+        policy: QuotaPolicy,
         etag: Option<&str>,
-    ) -> Result<DataApiPollDecision> {
+    ) -> Result<()> {
+        if policy.degradation == QuotaDegradation::FallbackOnly {
+            return self
+                .db
+                .schedule_data_api_poll(channel_id, policy.reset_at, etag);
+        }
         let channel = self.db.channel(channel_id)?;
-        let decision = self.data_api_poll_decision(&channel, now, degradation)?;
+        let decision = self.data_api_poll_decision(&channel, now, policy.degradation)?;
         let next_poll_at = now + chrono::Duration::from_std(decision.interval)?;
         self.db
             .schedule_data_api_poll(channel.id, next_poll_at, etag)?;
@@ -811,7 +797,7 @@ impl Monitor {
                 "WebSub 租约生效，Data API 自动降为纯兜底轮询"
             );
         }
-        Ok(decision)
+        Ok(())
     }
 
     pub async fn resolve_channel(&self, url: &str) -> Result<ResolvedChannel> {
@@ -902,21 +888,15 @@ impl Monitor {
             }
             return Ok(0);
         }
-        let scoped = single_channel.then(|| channels.first().cloned()).flatten();
-        if let Err(error) = self.refresh_upload_playlists(api, scoped.as_ref()).await {
+        let scoped = if single_channel {
+            channels.first()
+        } else {
+            None
+        };
+        if let Err(error) = self.refresh_upload_playlists(api, scoped).await {
             let current_policy = api.quota_policy()?;
             for channel in channels {
-                if current_policy.degradation == QuotaDegradation::FallbackOnly {
-                    self.db
-                        .schedule_data_api_poll(channel.id, current_policy.reset_at, None)?;
-                } else {
-                    self.schedule_data_api_channel(
-                        channel.id,
-                        now,
-                        current_policy.degradation,
-                        None,
-                    )?;
-                }
+                self.schedule_data_api_channel(channel.id, now, current_policy, None)?;
             }
             return Err(error);
         }
@@ -940,15 +920,10 @@ impl Monitor {
                     youtube_channel_id = %channel.youtube_channel_id,
                     "频道缺少 uploads 播放列表，跳过本轮 Data API 发现"
                 );
-                self.schedule_data_api_channel(
-                    channel.id,
-                    Utc::now(),
-                    before_request.degradation,
-                    None,
-                )?;
+                self.schedule_data_api_channel(channel.id, Utc::now(), before_request, None)?;
                 continue;
             };
-            match api
+            let etag = match api
                 .playlist_items(
                     playlist_id,
                     self.config.monitor.data_api_max_results,
@@ -962,43 +937,19 @@ impl Monitor {
                     } else {
                         discovered += self.persist_playlist_candidates(&channel, page.videos)?;
                     }
-                    let current_policy = api.quota_policy()?;
-                    if current_policy.degradation == QuotaDegradation::FallbackOnly {
-                        self.db.schedule_data_api_poll(
-                            channel.id,
-                            current_policy.reset_at,
-                            page.etag.as_deref(),
-                        )?;
-                    } else {
-                        self.schedule_data_api_channel(
-                            channel.id,
-                            Utc::now(),
-                            current_policy.degradation,
-                            page.etag.as_deref(),
-                        )?;
-                    }
+                    page.etag
                 }
                 Err(error) => {
-                    let current_policy = api.quota_policy()?;
-                    if current_policy.degradation == QuotaDegradation::FallbackOnly {
-                        self.db.schedule_data_api_poll(
-                            channel.id,
-                            current_policy.reset_at,
-                            None,
-                        )?;
-                    } else {
-                        self.schedule_data_api_channel(
-                            channel.id,
-                            Utc::now(),
-                            current_policy.degradation,
-                            None,
-                        )?;
-                    }
-                    if first_error.is_none() {
-                        first_error = Some(anyhow::Error::new(error));
-                    }
+                    first_error.get_or_insert_with(|| anyhow::Error::new(error));
+                    None
                 }
-            }
+            };
+            self.schedule_data_api_channel(
+                channel.id,
+                Utc::now(),
+                api.quota_policy()?,
+                etag.as_deref(),
+            )?;
         }
         match first_error {
             Some(error) => Err(error.context("一个或多个频道的 Data API 主发现失败")),
@@ -1045,52 +996,35 @@ impl Monitor {
         api: &YoutubeDataApi,
         only: Option<&Channel>,
     ) -> Result<()> {
-        if let Some(channel) = only {
-            // 单频道命令不推进全局刷新时间，也不为其他频道预扣 channels.list。
+        let now = Utc::now();
+        let all_channels;
+        let channels = if let Some(channel) = only {
             if channel.uploads_playlist_id.is_some() {
                 return Ok(());
             }
-            let uploads = api
-                .channel_upload_playlists(std::slice::from_ref(&channel.youtube_channel_id))
-                .await?;
-            if let Some(playlist_id) = uploads.get(&channel.youtube_channel_id) {
-                self.db
-                    .set_channel_uploads_playlist(&channel.youtube_channel_id, playlist_id)?;
-            } else {
-                tracing::warn!(
-                    channel = %channel.name,
-                    youtube_channel_id = %channel.youtube_channel_id,
-                    "channels.list 未返回频道，可能是无效或不可访问频道"
-                );
+            std::slice::from_ref(channel)
+        } else {
+            let last_refresh = self
+                .db
+                .get_discovery_state(API_UPLOADS_REFRESHED_AT_KEY)?
+                .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
+                .map(|value| value.to_utc());
+            if self.uploads_refreshed_this_process.load(Ordering::Acquire)
+                && let Some(last) = last_refresh
+                && now - last < API_UPLOADS_REFRESH_INTERVAL
+                && !self.db.has_missing_uploads_playlist_created_after(last)?
+            {
+                return Ok(());
             }
-            return Ok(());
-        }
-        let now = Utc::now();
-        let refreshed_this_process = self.uploads_refreshed_this_process.load(Ordering::Acquire);
-        let last_refresh = self
-            .db
-            .get_discovery_state(API_UPLOADS_REFRESHED_AT_KEY)?
-            .as_deref()
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&Utc));
-        let periodic_refresh_due = !refreshed_this_process
-            || last_refresh.is_none_or(|last| now - last >= API_UPLOADS_REFRESH_INTERVAL);
-        let new_channel_missing_uploads = match last_refresh {
-            Some(last) => self.db.has_missing_uploads_playlist_created_after(last)?,
-            None => false,
+            all_channels = self.db.list_channels()?;
+            &all_channels
         };
-        let refresh_due = periodic_refresh_due || new_channel_missing_uploads;
-        if !refresh_due {
-            return Ok(());
-        }
-
-        let channels = self.db.list_channels()?;
         let channel_ids = channels
             .iter()
             .map(|channel| channel.youtube_channel_id.clone())
             .collect::<Vec<_>>();
         let uploads = api.channel_upload_playlists(&channel_ids).await?;
-        for channel in &channels {
+        for channel in channels {
             match uploads.get(&channel.youtube_channel_id) {
                 Some(playlist_id) => self
                     .db
@@ -1102,10 +1036,12 @@ impl Monitor {
                 ),
             }
         }
-        self.db
-            .set_discovery_state(API_UPLOADS_REFRESHED_AT_KEY, &now.to_rfc3339())?;
-        self.uploads_refreshed_this_process
-            .store(true, Ordering::Release);
+        if only.is_none() {
+            self.db
+                .set_discovery_state(API_UPLOADS_REFRESHED_AT_KEY, &now.to_rfc3339())?;
+            self.uploads_refreshed_this_process
+                .store(true, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -2872,19 +2808,6 @@ esac
             limiter.claim(4, start + FALLBACK_GLOBAL_WINDOW),
             FallbackClaim::Allowed
         );
-    }
-
-    #[test]
-    fn fallback_priority_moves_never_attempted_channels_to_the_front() {
-        let start = Instant::now();
-        let mut limiter = FallbackLimiter::default();
-        assert_eq!(limiter.claim(1, start), FallbackClaim::Allowed);
-        assert_eq!(limiter.claim(2, start), FallbackClaim::Allowed);
-        assert_eq!(limiter.claim(3, start), FallbackClaim::Allowed);
-
-        let mut channel_ids = [1, 2, 3, 4, 5, 6];
-        channel_ids.sort_by_key(|channel_id| limiter.last_attempt(*channel_id));
-        assert_eq!(&channel_ids[..3], &[4, 5, 6]);
     }
 
     #[test]

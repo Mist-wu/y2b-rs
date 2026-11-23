@@ -24,23 +24,7 @@
 - 进程与内存限制：外部命令独占 Unix 进程组，超时时清理整棵进程树，不留孤儿进程。systemd 限制 `MemoryMax=1600M`，准备、上传、字幕三个 worker 分开排队。
 - 门禁：push 前本地 hook 跑 Gitleaks、`cargo fmt`、`clippy -D warnings` 和测试；PR 上 CI 再跑 clippy 和测试；依赖漏洞审计在 `Cargo.lock` 变动时和每周跑。详见 `docs/deploy.md`。
 
-## 工作原理
-
-```
-YouTube 频道 ──RSS / Data API / WebSub──> 发现新视频 ──> SQLite 任务队列
-                                                          │
-                ┌─────────────────────────────────────────┘
-                ▼
-   准备 worker：下载原片 ∥ 下载源语言字幕 → DeepSeek 分句 → DeepSeek 翻译 → 生成中文标题、简介、标签
-                │
-                ▼
-   上传 worker：biliup 投稿原片（严格串行，默认间隔 30 分钟）
-                │
-                ▼
-   字幕 worker：等 B 站转码完成 → 提交中文 CC 字幕（失败按指数退避重试）
-```
-
-每个视频有两种搬运模式：
+## 搬运模式
 
 | 模式 | 流程 | 字幕 |
 | --- | --- | --- |
@@ -49,7 +33,7 @@ YouTube 频道 ──RSS / Data API / WebSub──> 发现新视频 ──> SQLi
 
 频道默认使用 `translation.source_lang`。添加频道时可传 `--source-lang ja`，已有频道使用 `y2b channels set-lang <id> ja` 设置。省略语言可查看当前值，传 `--clear` 则恢复全局配置。
 
-`video_id` 全局唯一，同一个视频不会重复入队或重复投稿。优先频道单独按 60 秒轮询，在各个队列里都排在普通频道前面。
+`video_id` 全局唯一，同一个视频不会重复入队或重复投稿。优先频道在队列中优先处理，发现频率和 WebSub 租约的关系见[发现与筛选](docs/workflow.md#发现与筛选)。
 
 ## 快速开始
 
@@ -69,25 +53,7 @@ y2b watch                # 常驻运行
 
 ## 常用命令
 
-```bash
-# 频道
-y2b channels add <URL> --mode direct|translated [--source-lang ja]
-y2b channels list | set-mode <ID> <MODE> | set-priority <ID> normal|priority
-y2b channels set-lang <ID> [LANG] [--clear]
-y2b channels enable <ID> | disable <ID> | sync [ID]
-
-# 任务
-y2b run <URL> [--mode translated]   # 单个视频跑完整流程
-y2b jobs list [N] | show <JOB_ID> | retry <JOB_ID>
-y2b jobs reconcile-upload <JOB_ID> [--not-published]
-
-# 字幕与运维
-y2b subtitle add <BVID>             # 给已投稿视频补中文 CC
-y2b subtitle all                    # 遍历全部已投稿视频，已有中文字幕的跳过
-y2b backup | auth-check | check --write-baseline
-```
-
-TUI 用 `Tab` 切换任务和频道列表，`n` 输入单个 URL，`r` 重试失败任务，`q` 退出。
+`y2b run <URL>` 手动搬运单个视频，`y2b subtitle add <BVID>` 给已有稿件补交中文字幕。用 `y2b --help` 查看所有命令，用 `y2b channels --help`、`y2b jobs --help` 或 `y2b subtitle --help` 查看对应操作。启用 `tui` 特性后，运行 `y2b tui` 可查看队列和当前可用快捷键。
 
 ## 项目结构
 

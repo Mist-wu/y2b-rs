@@ -379,139 +379,102 @@ impl Pipeline {
         {
             bail!("Bilibili 认证失效，暂停上传并保留现有文件")
         }
-        let prepared = self
+        let PreparedUpload::Submission {
+            video_path,
+            cover_path,
+            mode,
+            completion_status,
+        } = self
             .db
             .prepared_upload(&job.id)?
             .with_context(|| format!("待上传任务 {} 缺少持久化上传计划", job.id))?;
-        let subtitle_queued = match prepared {
-            PreparedUpload::Submission {
-                video_path,
-                cover_path,
-                mode,
-                completion_status,
-            } => {
-                if !matches!(
-                    completion_status,
-                    JobStatus::Completed | JobStatus::UploadedOriginalPendingSubtitle
-                ) {
-                    bail!("待上传任务 {} 的完成状态无效: {completion_status}", job.id)
-                }
-                let video = PathBuf::from(video_path);
-                let cover = PathBuf::from(cover_path);
-                ensure_prepared_file(&video, "视频")?;
-                ensure_prepared_file(&cover, "封面")?;
-                let saved = self
-                    .db
-                    .publication_metadata(&job.id)?
-                    .with_context(|| format!("待上传任务 {} 缺少投稿元数据", job.id))?;
-                let Some(publication) = super::publication::accept_saved_publication(&saved)?
-                else {
-                    bail!("待上传任务 {} 的投稿文案无法修复，需要重新准备", job.id)
-                };
-                if publication != saved {
-                    self.db.save_publication_metadata(&job.id, &publication)?;
-                }
-                let meta = self
-                    .db
-                    .source_metadata(&job.id)?
-                    .with_context(|| format!("待上传任务 {} 缺少来源元数据", job.id))?;
-                if !self.wait_for_bilibili_submission(&job.id).await? {
-                    return Ok(());
-                }
-                ensure_prepared_file(&video, "视频")?;
-                ensure_prepared_file(&cover, "封面")?;
-                self.validate_downloaded_video(
-                    &job.id,
-                    &video,
-                    meta.duration,
-                    "upload_boundary_probe",
-                )
-                .await?;
-                let Some(attempt_id) = self.db.begin_prepared_upload(&job.id)? else {
-                    return Ok(());
-                };
-                let execution = self
-                    .run_with_claim_heartbeat(
-                        &job.id,
-                        crate::db::UPLOAD_CLAIM_KIND,
-                        self.upload(&job.id, &video, &publication, &meta, Some(&cover)),
-                    )
-                    .await;
-                let bvid = match execution {
-                    Ok(bvid) => bvid,
-                    Err(error) if error.downcast_ref::<BiliupRejectedError>().is_some() => {
-                        self.db
-                            .fail_upload_attempt(&job.id, &attempt_id, &error.to_string())?;
-                        return Err(error);
-                    }
-                    Err(error) => {
-                        let detail = format!(
-                            "投稿结果不确定（attempt={attempt_id}），请用 jobs reconcile-upload 核对创作中心后再处理: {error:#}"
-                        );
-                        let marked =
-                            self.db
-                                .mark_upload_attempt_uncertain(&job.id, &attempt_id, &detail);
-                        let detail = match marked {
-                            Ok(()) => detail,
-                            Err(mark_error) => {
-                                format!("{detail}；写入不确定状态失败: {mark_error:#}")
-                            }
-                        };
-                        return Err(UploadUncertainError { detail }.into());
-                    }
-                };
-                let next_submit_at = match self
-                    .bilibili_submission_deadline(self.config.bilibili.submit_interval_seconds)
-                {
-                    Ok(next_submit_at) => next_submit_at,
-                    Err(error) => {
-                        let detail = format!(
-                            "Bilibili 已返回成功 {bvid}，但计算本地冷却时间失败（attempt={attempt_id}）: {error:#}"
-                        );
-                        let detail = match self.db.mark_upload_attempt_uncertain(
-                            &job.id,
-                            &attempt_id,
-                            &detail,
-                        ) {
-                            Ok(()) => detail,
-                            Err(mark_error) => {
-                                format!("{detail}；写入不确定状态失败: {mark_error:#}")
-                            }
-                        };
-                        return Err(UploadUncertainError { detail }.into());
-                    }
-                };
-                match self.db.finish_upload_attempt(
-                    &job.id,
-                    &attempt_id,
-                    &bvid,
-                    completion_status,
-                    mode,
-                    UploadCompletionTiming {
-                        subtitle_delay_seconds: CC_INITIAL_DELAY_SECONDS,
-                        next_submit_at,
-                    },
-                ) {
-                    Ok(subtitle_queued) => subtitle_queued,
-                    Err(error) => {
-                        let detail = format!(
-                            "Bilibili 已返回成功 {bvid}，但本地确认失败（attempt={attempt_id}）: {error:#}"
-                        );
-                        let detail = match self.db.mark_upload_attempt_uncertain(
-                            &job.id,
-                            &attempt_id,
-                            &detail,
-                        ) {
-                            Ok(()) => detail,
-                            Err(mark_error) => {
-                                format!("{detail}；写入不确定状态失败: {mark_error:#}")
-                            }
-                        };
-                        return Err(UploadUncertainError { detail }.into());
-                    }
-                }
+        if !matches!(
+            completion_status,
+            JobStatus::Completed | JobStatus::UploadedOriginalPendingSubtitle
+        ) {
+            bail!("待上传任务 {} 的完成状态无效: {completion_status}", job.id)
+        }
+        let video = PathBuf::from(video_path);
+        let cover = PathBuf::from(cover_path);
+        ensure_prepared_file(&video, "视频")?;
+        ensure_prepared_file(&cover, "封面")?;
+        let saved = self
+            .db
+            .publication_metadata(&job.id)?
+            .with_context(|| format!("待上传任务 {} 缺少投稿元数据", job.id))?;
+        let Some(publication) = super::publication::accept_saved_publication(&saved)? else {
+            bail!("待上传任务 {} 的投稿文案无法修复，需要重新准备", job.id)
+        };
+        if publication != saved {
+            self.db.save_publication_metadata(&job.id, &publication)?;
+        }
+        let meta = self
+            .db
+            .source_metadata(&job.id)?
+            .with_context(|| format!("待上传任务 {} 缺少来源元数据", job.id))?;
+        if !self.wait_for_bilibili_submission(&job.id).await? {
+            return Ok(());
+        }
+        ensure_prepared_file(&video, "视频")?;
+        ensure_prepared_file(&cover, "封面")?;
+        self.validate_downloaded_video(&job.id, &video, meta.duration, "upload_boundary_probe")
+            .await?;
+        let Some(attempt_id) = self.db.begin_prepared_upload(&job.id)? else {
+            return Ok(());
+        };
+        let execution = self
+            .run_with_claim_heartbeat(
+                &job.id,
+                crate::db::UPLOAD_CLAIM_KIND,
+                self.upload(&job.id, &video, &publication, &meta, &cover),
+            )
+            .await;
+        let uncertain = |detail: String| {
+            let detail = match self
+                .db
+                .mark_upload_attempt_uncertain(&job.id, &attempt_id, &detail)
+            {
+                Ok(()) => detail,
+                Err(error) => format!("{detail}；写入不确定状态失败: {error:#}"),
+            };
+            UploadUncertainError { detail }
+        };
+        let bvid = match execution {
+            Ok(bvid) => bvid,
+            Err(error) if error.downcast_ref::<BiliupRejectedError>().is_some() => {
+                self.db
+                    .fail_upload_attempt(&job.id, &attempt_id, &error.to_string())?;
+                return Err(error);
+            }
+            Err(error) => {
+                return Err(uncertain(format!(
+                    "投稿结果不确定（attempt={attempt_id}），请用 jobs reconcile-upload 核对创作中心后再处理: {error:#}"
+                )).into());
             }
         };
+        let next_submit_at = self
+            .bilibili_submission_deadline(self.config.bilibili.submit_interval_seconds)
+            .map_err(|error| uncertain(format!(
+                "Bilibili 已返回成功 {bvid}，但计算本地冷却时间失败（attempt={attempt_id}）: {error:#}"
+            )))?;
+        let subtitle_queued = self
+            .db
+            .finish_upload_attempt(
+                &job.id,
+                &attempt_id,
+                &bvid,
+                completion_status,
+                mode,
+                UploadCompletionTiming {
+                    subtitle_delay_seconds: CC_INITIAL_DELAY_SECONDS,
+                    next_submit_at,
+                },
+            )
+            .map_err(|error| {
+                uncertain(format!(
+                    "Bilibili 已返回成功 {bvid}，但本地确认失败（attempt={attempt_id}）: {error:#}"
+                ))
+            })?;
         // 投稿 attempt、任务终态和全局冷却已经由 finish_upload_attempt 同事务持久化。
         // CC 字幕状态和首次到期时间也在同一事务写入，不占用上传 worker。
         if subtitle_queued {
@@ -519,13 +482,7 @@ impl Pipeline {
                 .event(Some(&job.id), "info", "已投稿，等待自动补交中文 CC 字幕")?;
         }
         let (raw, _, _) = self.db.job_paths(&job.id)?;
-        let paths = [raw]
-            .into_iter()
-            .flatten()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
-        let path_refs = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
-        if let Err(error) = self.after_upload(&job.id, &path_refs) {
+        if let Err(error) = self.after_upload(&job.id, raw.as_deref().map(Path::new)) {
             tracing::warn!(job_id = %job.id, error = %error, "上传成功后的文件清理失败");
             self.db.event(
                 Some(&job.id),
@@ -536,13 +493,13 @@ impl Pipeline {
         Ok(())
     }
 
-    pub(super) async fn upload(
+    async fn upload(
         &self,
         job_id: &str,
         video: &Path,
         publication: &PublicationMetadata,
         meta: &VideoMetadata,
-        cover: Option<&Path>,
+        cover: &Path,
     ) -> Result<String> {
         let mut stage = StageGuard::start(&self.db, job_id, "upload", None, None, None)?;
         let mut cmd = Command::new(&self.config.bilibili.biliup);
@@ -550,10 +507,9 @@ impl Pipeline {
             .arg(&self.config.bilibili.cookies)
             .arg("upload")
             .arg(video)
-            .args(build_upload_args(publication, meta));
-        if let Some(c) = cover {
-            cmd.arg("--cover").arg(c);
-        }
+            .args(build_upload_args(publication, meta))
+            .arg("--cover")
+            .arg(cover);
         match run_monitored(cmd, Duration::from_secs(14400)).await {
             Ok(output) => {
                 let merged = output.stdout.clone() + "\n" + &output.stderr;

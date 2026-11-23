@@ -389,13 +389,13 @@ impl Pipeline {
         let work = self.config.runtime.download_dir.join(&meta.id);
         let Some(subtitle) = self
             .for_channel(job.channel_id)?
-            .prepare_translated_subtitle_with_download(job, meta, &work, redownload_if_missing)
+            .prepare_translated_subtitle(job, meta, &work, redownload_if_missing)
             .await?
         else {
             let bvid = job.bvid.as_deref().unwrap_or_default();
             bail!("{MISSING_SUBTITLE_MATERIAL_PREFIX}（可手动执行 y2b subtitle add {bvid}）")
         };
-        let cc_cues = cc_cues_from(&subtitle.cues, Some(duration));
+        let cc_cues = cc_cues_from(&subtitle, Some(duration));
         if cc_cues.is_empty() {
             bail!("{EMPTY_TRANSLATION_PREFIX}，没有可提交的中文字幕")
         }
@@ -684,11 +684,11 @@ mod tests {
         assert_eq!(ready[1].content, "第二句");
         // 主准备入口也应复用同一份完整结果，不再次翻译。
         let prepared = pipeline
-            .prepare_translated_subtitle(&job, &meta, &work)
+            .prepare_translated_subtitle(&job, &meta, &work, true)
             .await
             .unwrap()
             .unwrap();
-        assert!(prepared.cues.iter().all(|cue| cue.translation.is_some()));
+        assert!(prepared.iter().all(|cue| cue.translation.is_some()));
         let calls = fs::read_to_string(directory.path().join("calls")).unwrap();
         let inputs = calls
             .lines()
