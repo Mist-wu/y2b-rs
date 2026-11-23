@@ -122,13 +122,13 @@ enum MaintenanceCmd {
 enum ChannelCmd {
     SetLang {
         id: i64,
-        #[arg(conflicts_with = "clear")]
+        #[arg(conflicts_with = "clear",value_parser=y2b_rs::config::normalize_source_lang)]
         source_lang: Option<String>,
         #[arg(long)]
         clear: bool,
     },
     Add {
-        #[arg(long)]
+        #[arg(long,value_parser=y2b_rs::config::normalize_source_lang)]
         source_lang: Option<String>,
         url: String,
         #[arg(long, value_enum)]
@@ -445,13 +445,14 @@ async fn main() -> Result<()> {
             ChannelCmd::List => {
                 for c in db.list_channels()? {
                     println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         c.id,
                         if c.enabled { "on" } else { "off" },
                         c.transfer_mode,
                         c.priority,
                         c.name,
-                        c.youtube_channel_id
+                        c.youtube_channel_id,
+                        c.source_lang.as_deref().unwrap_or("-")
                     )
                 }
             }

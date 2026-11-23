@@ -695,11 +695,11 @@ impl Pipeline {
             bail!("任务 {} 没有当前进程持有的准备领取权", job.id)
         }
         let result = self
-            .run_with_claim_heartbeat(
-                &job.id,
-                PREPARE_CLAIM_KIND,
-                self.for_channel(job.channel_id)?.prepare_job_inner(&job),
-            )
+            .run_with_claim_heartbeat(&job.id, PREPARE_CLAIM_KIND, async {
+                self.for_channel(job.channel_id)?
+                    .prepare_job_inner(&job)
+                    .await
+            })
             .await;
         if let Err(e) = &result {
             // 租约已经被其他执行者接管时，旧 worker 只能退出，不能覆盖新状态。
@@ -1543,6 +1543,32 @@ mod tests {
         );
         std::fs::remove_file(&provenance_path).unwrap();
         assert!(validate_translation_cache(&config, "vid", temp.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_channel_records_prepare_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("state.db")).unwrap();
+        let id = db
+            .create_job(NewJob {
+                channel_id: None,
+                video_id: "stage-guard",
+                url: "https://youtu.be/stage-guard",
+                title: None,
+                published: None,
+                updated: None,
+                transfer_mode: TransferMode::Direct,
+            })
+            .unwrap()
+            .unwrap();
+
+        let mut job = db.claim_prepare_job(&id).unwrap().unwrap();
+        job.channel_id = Some(i64::MAX);
+        let pipeline = Pipeline::new(Config::default(), db.clone());
+        assert!(pipeline.prepare_job(job).await.is_err());
+        let stored = db.get_job(&id).unwrap().unwrap();
+        assert_eq!(stored.status, JobStatus::RetryWait);
+        assert_eq!(stored.attempt, 1);
     }
 
     #[test]

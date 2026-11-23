@@ -373,14 +373,12 @@ fn is_unknown_language(actual: &str) -> bool {
             .any(|tag| primary.eq_ignore_ascii_case(tag))
 }
 
-fn source_language_matches(expected: &str, actual: &str) -> bool {
+pub(crate) fn source_language_matches(expected: &str, actual: &str) -> bool {
     // 无法判定语言时一律放行，不算不符。
     if is_unknown_language(actual) {
         return true;
     }
-    let expected = expected.split(['-', '_']).next().unwrap_or(expected).trim();
-    let actual = actual.split(['-', '_']).next().unwrap_or(actual).trim();
-    !expected.is_empty() && expected.eq_ignore_ascii_case(actual)
+    crate::config::matches_source_lang(expected, actual)
 }
 
 impl FeedFetchError {

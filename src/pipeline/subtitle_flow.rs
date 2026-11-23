@@ -431,29 +431,7 @@ fn subtitle_language_rank(language: &str, source: &str) -> u8 {
     }
 }
 fn matches_track(language: &str, source: &str) -> bool {
-    let language = language.strip_suffix("-orig").unwrap_or(language);
-    if language.eq_ignore_ascii_case(source) {
-        return true;
-    }
-    let base = source.split('-').next().unwrap_or(source);
-    let mut parts = language.split('-');
-    if !parts
-        .next()
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(base))
-    {
-        return false;
-    }
-    match parts.next() {
-        None => true,
-        Some(region) => {
-            parts.next().is_none()
-                && ((region.len() == 2 && region.bytes().all(|b| b.is_ascii_uppercase()))
-                    || (region.len() == 3 && region.bytes().all(|b| b.is_ascii_digit()))
-                    || (region.len() == 4
-                        && region.as_bytes()[0].is_ascii_uppercase()
-                        && region.as_bytes()[1..].iter().all(u8::is_ascii_lowercase)))
-        }
-    }
+    crate::config::matches_source_lang(source, language)
 }
 
 /// 从 `<video_id>.<language>.vtt` 取出语言标签；yt-dlp 重复追加语言时取最后一段。
@@ -1439,6 +1417,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn language_matching_agrees_across_discovery_and_subtitles() {
+        for (source, tag, matches) in [
+            ("pt", "pt-br", true),
+            ("PT-br", "pt-BR", true),
+            ("zh", "zh-Hant-TW", true),
+            ("zh-Hant", "zh-Hant-TW", true),
+            ("ja", "ja-en", false),
+            ("en", "en-ar", false),
+            ("en", "en-zh-Hans", false),
+            ("en", "en-zh", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(format!("vid.{tag}.vtt")), "WEBVTT").unwrap();
+            let metadata = serde_json::json!({"automatic_captions":{(tag):[{}]}});
+            assert_eq!(
+                crate::monitor::source_language_matches(source, tag),
+                matches,
+                "{tag}"
+            );
+            assert_eq!(
+                select_subtitle_track(&metadata, source).is_some(),
+                matches,
+                "{tag}"
+            );
+            assert_eq!(
+                pick_subtitle_file(dir.path(), "vid", source)
+                    .unwrap()
+                    .is_some(),
+                matches,
+                "{tag}"
+            );
+        }
+    }
     #[test]
     fn configured_language_selects_its_original_track() {
         let metadata = serde_json::json!({"subtitles":{"en":[{}],"ja-en":[{}]},"automatic_captions":{"ja-orig":[{}],"ja-JP":[{}]}});

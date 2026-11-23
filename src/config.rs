@@ -286,17 +286,55 @@ impl Default for WebSubConfig {
         }
     }
 }
-pub fn validate_source_lang(lang: &str) -> anyhow::Result<()> {
-    let mut parts = lang.split('-');
-    let primary = parts.next().unwrap_or_default();
+pub fn normalize_source_lang(lang: &str) -> Result<String> {
+    use language_tags::LanguageTag;
+    let tag = LanguageTag::parse(lang).with_context(|| format!("source_lang 无效: {lang}"))?;
+    tag.validate()
+        .with_context(|| format!("source_lang 无效: {lang}"))?;
     anyhow::ensure!(
-        (2..=8).contains(&primary.len())
-            && primary.bytes().all(|b| b.is_ascii_alphabetic())
-            && parts.all(|part| (1..=8).contains(&part.len())
-                && part.bytes().all(|b| b.is_ascii_alphanumeric())),
+        tag.primary_language().len() >= 2,
         "source_lang 无效: {lang}"
     );
-    Ok(())
+    // A lowercase suffix can be both a country and a translation language.
+    // Resolve ambiguous pairs using the region's likely language (CLDR).
+    // Explicit uppercase regions always retain their BCP-47 meaning.
+    if let Some(region) = tag.region()
+        && let Some(raw) = lang.split('-').nth(1)
+        && raw == region.to_ascii_lowercase()
+        && LanguageTag::parse(raw).is_ok_and(|language| language.validate().is_ok())
+    {
+        let mut locale: icu_locale::LanguageIdentifier = format!("und-{region}").parse()?;
+        icu_locale::LocaleExpander::new_common().maximize(&mut locale);
+        anyhow::ensure!(
+            locale.language.as_str() == tag.primary_language(),
+            "source_lang 无效: {lang}"
+        );
+    }
+    Ok(tag.to_string())
+}
+
+pub fn validate_source_lang(lang: &str) -> Result<()> {
+    normalize_source_lang(lang).map(drop)
+}
+
+pub(crate) fn matches_source_lang(source: &str, language: &str) -> bool {
+    let language = language
+        .strip_suffix("-orig")
+        .unwrap_or(language)
+        .replace('_', "-");
+    let (Ok(actual), Ok(expected)) = (
+        normalize_source_lang(&language),
+        normalize_source_lang(source),
+    ) else {
+        return false;
+    };
+    actual == expected
+        || actual
+            .strip_prefix(&expected)
+            .is_some_and(|rest| rest.starts_with('-'))
+        || expected
+            .strip_prefix(&actual)
+            .is_some_and(|rest| rest.starts_with('-'))
 }
 impl Config {
     /// 严格读取配置，文件不存在也返回错误。
@@ -310,7 +348,7 @@ impl Config {
     }
 
     fn load_inner(path: &Path, allow_missing: bool) -> Result<Self> {
-        let config = match fs::read_to_string(path) {
+        let mut config = match fs::read_to_string(path) {
             Ok(raw) => toml::from_str(&raw)
                 .map_err(|error| anyhow::anyhow!("配置格式无效: {}: {error}", path.display()))?,
             Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
@@ -320,6 +358,7 @@ impl Config {
                 return Err(error).with_context(|| format!("读取配置失败: {}", path.display()));
             }
         };
+        config.translation.source_lang = normalize_source_lang(&config.translation.source_lang)?;
         config.validate()?;
         Ok(config)
     }
@@ -521,6 +560,23 @@ impl Config {
 mod tests {
     use super::*;
 
+    #[test]
+    fn load_normalizes_configured_language_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (input, expected) in [
+            ("PT-br", "pt-BR"),
+            ("ZH-hant-tw", "zh-Hant-TW"),
+            ("es-419", "es-419"),
+        ] {
+            fs::write(&path, format!("[translation]\nsource_lang = '{input}'\n")).unwrap();
+            assert_eq!(
+                Config::load(&path).unwrap().translation.source_lang,
+                expected
+            );
+        }
+        assert!(validate_source_lang("en-zh").is_err());
+    }
     #[test]
     fn parses_batch_modes_and_256k_defaults() {
         let adaptive: AiConfig = toml::from_str("batch_mode = \"adaptive\"").unwrap();

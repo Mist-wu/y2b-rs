@@ -25,6 +25,8 @@ fs2 = "0.4"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
+icu_locale = "=2.2.0"
+language-tags = "0.3"
 libc = "0.2"
 ratatui = { version = "0.30", optional = true }
 regex = "1"

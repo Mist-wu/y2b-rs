@@ -2828,7 +2828,17 @@ fn channel_language_migrates_and_falls_back_after_clear() {
     drop(db);
     let db = Database::open(&path).unwrap();
     assert_eq!(db.effective_source_lang(Some(id), "ja").unwrap(), "ja");
-    db.set_channel_language(id, Some("pt-BR")).unwrap();
+    db.set_channel_language(id, Some("PT-br")).unwrap();
+    let stored: String = db
+        .conn()
+        .query_row("SELECT source_lang FROM channels WHERE id=?", [id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored, "pt-BR");
+    db.conn()
+        .execute("UPDATE channels SET source_lang='PT-br' WHERE id=?", [id])
+        .unwrap();
     assert_eq!(db.effective_source_lang(Some(id), "ja").unwrap(), "pt-BR");
     db.set_channel_language(id, None).unwrap();
     assert_eq!(db.effective_source_lang(Some(id), "de").unwrap(), "de");
