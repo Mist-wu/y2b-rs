@@ -896,14 +896,12 @@ impl Pipeline {
                         last_error.as_ref().expect("分句重试前必有错误")
                     ),
                 )?;
-                sleep(
-                    crate::retry::jittered_backoff(
-                        Duration::from_secs(1),
-                        (attempt - 1) as u32,
-                        crate::retry::random_jitter_factor(),
-                    )
-                    .min(Duration::from_secs(30)),
-                )
+                sleep(crate::retry::jittered_backoff(
+                    Duration::from_secs(1),
+                    (attempt - 1) as u32,
+                    crate::retry::random_jitter_factor(),
+                    Duration::from_secs(30),
+                ))
                 .await;
             }
         }
@@ -1099,14 +1097,12 @@ impl Pipeline {
             )?;
             if attempt < attempts {
                 // 指数退避：1s, 2s, 4s… 对偶发故障收敛，同时限制上游 API 压力。
-                sleep(
-                    crate::retry::jittered_backoff(
-                        Duration::from_secs(1),
-                        (attempt - 1) as u32,
-                        crate::retry::random_jitter_factor(),
-                    )
-                    .min(Duration::from_secs(30)),
-                )
+                sleep(crate::retry::jittered_backoff(
+                    Duration::from_secs(1),
+                    (attempt - 1) as u32,
+                    crate::retry::random_jitter_factor(),
+                    Duration::from_secs(30),
+                ))
                 .await;
             }
         }

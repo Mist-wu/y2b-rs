@@ -528,9 +528,10 @@ pub fn parse_iso8601_duration(value: &str) -> Option<f64> {
 
 pub fn next_pacific_midnight(now: DateTime<Utc>) -> Result<DateTime<Utc>, YoutubeApiError> {
     let local = now.with_timezone(&Los_Angeles);
-    let next_date = local
-        .date_naive()
-        .succ_opt()
+    let next_date = now
+        .naive_utc()
+        .checked_add_offset(chrono::Offset::fix(local.offset()))
+        .and_then(|time| time.date().succ_opt())
         .ok_or_else(|| YoutubeApiError::State(anyhow::anyhow!("chrono 支持范围内应有下一天")))?;
     let midnight = next_date
         .and_hms_opt(0, 0, 0)
@@ -827,6 +828,12 @@ mod tests {
         assert_eq!(parse_iso8601_duration("1:23"), None);
     }
 
+    #[test]
+    fn quota_midnight_handles_extremes() {
+        for now in [DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC] {
+            assert!(next_pacific_midnight(now).is_err());
+        }
+    }
     #[test]
     fn quota_resets_at_next_pacific_midnight() {
         let winter = DateTime::parse_from_rfc3339("2026-01-15T12:00:00Z")

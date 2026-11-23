@@ -1,4 +1,3 @@
-use crate::retry::{jittered_backoff, random_jitter_factor};
 use crate::{
     config::{Config, YoutubeConfig},
     db::{Database, NewJob, NewVideoCandidate},
@@ -6,6 +5,7 @@ use crate::{
         CandidateSource, Channel, ChannelPriority, Job, TransferMode, VideoCandidate, VideoMetadata,
     },
     process::run_monitored,
+    retry::{jittered_backoff, random_jitter_factor},
     youtube_api::{
         PlaylistVideo, QuotaDegradation, ResponseBodyError, YoutubeDataApi, bounded_http_client,
         read_response_body,
@@ -1381,6 +1381,7 @@ impl Monitor {
                         RSS_RETRY_BASE,
                         u32::try_from(retry).unwrap_or(u32::MAX),
                         random_jitter_factor(),
+                        Duration::MAX,
                     );
                     tracing::debug!(attempt = retry + 1, ?delay, url, error = %error, "RSS 暂时失败，退避后重试");
                     tokio::time::sleep(delay).await;
@@ -1424,8 +1425,12 @@ impl Monitor {
             retry_at
         } else if failed {
             let base = Duration::from_secs(self.config.monitor.poll_seconds.max(1));
-            let delay = jittered_backoff(base, failures, random_jitter_factor())
-                .min(CHANNEL_FAILURE_BACKOFF_CAP);
+            let delay = jittered_backoff(
+                base,
+                failures,
+                random_jitter_factor(),
+                CHANNEL_FAILURE_BACKOFF_CAP,
+            );
             now + chrono::Duration::from_std(delay)?
         } else {
             let channel = self.db.channel(id)?;
@@ -2530,9 +2535,18 @@ esac
     #[test]
     fn channel_backoff_has_jitter_and_is_persisted() {
         let base = Duration::from_secs(60);
-        assert_eq!(jittered_backoff(base, 0, 0.5), Duration::from_secs(30));
-        assert_eq!(jittered_backoff(base, 0, 1.5), Duration::from_secs(90));
-        assert_eq!(jittered_backoff(base, 2, 1.0), Duration::from_secs(240));
+        assert_eq!(
+            jittered_backoff(base, 0, 0.5, Duration::MAX),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            jittered_backoff(base, 0, 1.5, Duration::MAX),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            jittered_backoff(base, 2, 1.0, Duration::MAX),
+            Duration::from_secs(240)
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("poll-state.db");

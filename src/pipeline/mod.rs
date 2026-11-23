@@ -498,9 +498,10 @@ fn retry_delay_seconds(attempt: i64) -> i64 {
         Duration::from_secs(RETRY_BASE_SECONDS as u64),
         attempt.clamp(0, 16) as u32,
         crate::retry::random_jitter_factor(),
+        Duration::from_secs(RETRY_CAP_SECONDS as u64),
     )
     .as_secs()
-    .min(RETRY_CAP_SECONDS as u64) as i64
+    .max(600) as i64
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1573,13 +1574,13 @@ mod tests {
     }
 
     #[test]
-    fn retry_backoff_keeps_the_first_retry_at_ten_minutes_then_grows() {
-        // 第一次重试和迁移前的固定 10 分钟一致，之后翻倍并封顶 1 小时。
-        assert!((300..=900).contains(&retry_delay_seconds(1)));
+    fn retry_backoff_respects_ten_minute_floor_and_jitters_at_cap() {
+        // 首次至少等待 10 分钟，达到上限后仍可向下抖动。
+        assert!((600..=900).contains(&retry_delay_seconds(1)));
         assert!((600..=1800).contains(&retry_delay_seconds(2)));
         assert!((1200..=3600).contains(&retry_delay_seconds(3)));
-        assert!((2400..=3600).contains(&retry_delay_seconds(4)));
-        assert_eq!(retry_delay_seconds(64), 3600);
+        assert!((1800..=3600).contains(&retry_delay_seconds(4)));
+        assert!((1800..=3600).contains(&retry_delay_seconds(64)));
     }
 
     #[test]
