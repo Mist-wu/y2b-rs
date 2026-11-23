@@ -483,20 +483,29 @@ fn quarantine_invalid_vtt_caches(work: &Path, video_id: &str) -> Result<Vec<Path
     Ok(quarantined)
 }
 
-/// 任务重试退避基数与上限：第 n 次失败后等待 `min(5min × 2^n, 1h)`。
-///
-/// n=1 恰好是迁移前的固定 10 分钟，所以首次重试的时机没变；之后逐步拉长，
-/// 避免持续故障（YouTube 限流、网络抖动）时在 max_attempts 内密集重试——
-/// 每次重试都要重新走一遍下载。
+/// 首次失败在 10–15 分钟后重试，保留旧的 10 分钟下限。
+/// 后续重试的基准时间逐次翻倍，至多 1 小时；到达上限后仍向下抖动。
 const RETRY_BASE_SECONDS: i64 = 300;
 const RETRY_CAP_SECONDS: i64 = 3600;
 /// 已入队的直播/预约每 30 分钟复查一次，直到完整回放可用。
 const LIVE_RETRY_SECONDS: i64 = 30 * 60;
 
 fn retry_delay_seconds(attempt: i64) -> i64 {
-    RETRY_BASE_SECONDS
-        .saturating_mul(1i64 << attempt.clamp(0, 16))
-        .min(RETRY_CAP_SECONDS)
+    let jitter = crate::retry::random_jitter_factor();
+    // 将首次重试的 [0.5, 1.5] 线性映射到 [1.0, 1.5]。
+    let jitter = if attempt == 1 {
+        0.75 + jitter / 2.0
+    } else {
+        jitter
+    };
+    crate::retry::jittered_backoff(
+        Duration::from_secs(RETRY_BASE_SECONDS as u64),
+        attempt.clamp(0, 16) as u32,
+        jitter,
+        Duration::from_secs(RETRY_CAP_SECONDS as u64),
+    )
+    .as_secs()
+    .max(600) as i64
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -824,7 +833,7 @@ impl Pipeline {
         )?;
         self.db.save_source_metadata(&job.id, &meta)?;
         let work = self.config.runtime.download_dir.join(&meta.id);
-        fs::create_dir_all(&work)?;
+        tokio::fs::create_dir_all(&work).await?;
         self.db.update_claimed_job_status(
             &job.id,
             PREPARE_CLAIM_KIND,
@@ -972,7 +981,7 @@ impl Pipeline {
             if bytes.is_empty() {
                 bail!("YouTube 封面为空")
             }
-            fs::write(&source, bytes)?;
+            tokio::fs::write(&source, bytes).await?;
             let mut cmd = Command::new(&self.config.render.ffmpeg);
             cmd.arg("-y")
                 .arg("-i")
@@ -986,7 +995,11 @@ impl Pipeline {
             Ok::<u64, anyhow::Error>(output.peak_rss_kib)
         }
         .await;
-        let _ = fs::remove_file(&source);
+        if let Err(error) = tokio::fs::remove_file(&source).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "清理临时封面失败");
+        }
         let duration_ms = stage.elapsed_ms();
         match result {
             Ok(peak_rss_kib) => {
@@ -1565,13 +1578,13 @@ mod tests {
     }
 
     #[test]
-    fn retry_backoff_keeps_the_first_retry_at_ten_minutes_then_grows() {
-        // 第一次重试和迁移前的固定 10 分钟一致，之后翻倍并封顶 1 小时。
-        assert_eq!(retry_delay_seconds(1), 600);
-        assert_eq!(retry_delay_seconds(2), 1200);
-        assert_eq!(retry_delay_seconds(3), 2400);
-        assert_eq!(retry_delay_seconds(4), 3600);
-        assert_eq!(retry_delay_seconds(64), 3600);
+    fn retry_backoff_respects_ten_minute_floor_and_jitters_at_cap() {
+        // 首次至少等待 10 分钟，达到上限后仍可向下抖动。
+        assert!((600..=900).contains(&retry_delay_seconds(1)));
+        assert!((600..=1800).contains(&retry_delay_seconds(2)));
+        assert!((1200..=3600).contains(&retry_delay_seconds(3)));
+        assert!((1800..=3600).contains(&retry_delay_seconds(4)));
+        assert!((1800..=3600).contains(&retry_delay_seconds(64)));
     }
 
     #[test]

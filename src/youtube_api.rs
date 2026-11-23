@@ -232,7 +232,7 @@ impl YoutubeDataApi {
     pub fn quota_status(&self) -> Result<DiscoveryQuota, YoutubeApiError> {
         let now = Utc::now();
         self.db
-            .consume_discovery_quota(0, YOUTUBE_DAILY_QUOTA, now, next_pacific_midnight(now))
+            .consume_discovery_quota(0, YOUTUBE_DAILY_QUOTA, now, next_pacific_midnight(now)?)
             .map_err(YoutubeApiError::State)
     }
 
@@ -411,7 +411,7 @@ impl YoutubeDataApi {
                 let now = Utc::now();
                 let exhausted = self
                     .db
-                    .exhaust_discovery_quota(YOUTUBE_DAILY_QUOTA, now, next_pacific_midnight(now))
+                    .exhaust_discovery_quota(YOUTUBE_DAILY_QUOTA, now, next_pacific_midnight(now)?)
                     .map_err(YoutubeApiError::State)?;
                 self.record_degradation_warnings(exhausted)?;
             }
@@ -432,7 +432,7 @@ impl YoutubeDataApi {
         let now = Utc::now();
         let quota = self
             .db
-            .consume_discovery_quota(1, YOUTUBE_DAILY_QUOTA, now, next_pacific_midnight(now))
+            .consume_discovery_quota(1, YOUTUBE_DAILY_QUOTA, now, next_pacific_midnight(now)?)
             .map_err(YoutubeApiError::State)?;
         if !quota.allowed {
             return Err(YoutubeApiError::LocalQuota {
@@ -526,18 +526,21 @@ pub fn parse_iso8601_duration(value: &str) -> Option<f64> {
     Some(number(1) * 86_400.0 + number(2) * 3_600.0 + number(3) * 60.0 + number(4))
 }
 
-pub fn next_pacific_midnight(now: DateTime<Utc>) -> DateTime<Utc> {
+pub fn next_pacific_midnight(now: DateTime<Utc>) -> Result<DateTime<Utc>, YoutubeApiError> {
     let local = now.with_timezone(&Los_Angeles);
-    let next_date = local
-        .date_naive()
-        .succ_opt()
-        .expect("chrono 支持范围内应有下一天");
-    let midnight = next_date.and_hms_opt(0, 0, 0).expect("午夜时间必须有效");
-    Los_Angeles
+    let next_date = now
+        .naive_utc()
+        .checked_add_offset(chrono::Offset::fix(local.offset()))
+        .and_then(|time| time.date().succ_opt())
+        .ok_or_else(|| YoutubeApiError::State(anyhow::anyhow!("chrono 支持范围内应有下一天")))?;
+    let midnight = next_date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| YoutubeApiError::State(anyhow::anyhow!("午夜时间必须有效")))?;
+    Ok(Los_Angeles
         .from_local_datetime(&midnight)
         .earliest()
-        .expect("洛杉矶午夜必须存在")
-        .with_timezone(&Utc)
+        .ok_or_else(|| YoutubeApiError::State(anyhow::anyhow!("洛杉矶午夜必须存在")))?
+        .with_timezone(&Utc))
 }
 
 #[derive(Deserialize)]
@@ -826,12 +829,18 @@ mod tests {
     }
 
     #[test]
+    fn quota_midnight_handles_extremes() {
+        for now in [DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC] {
+            assert!(next_pacific_midnight(now).is_err());
+        }
+    }
+    #[test]
     fn quota_resets_at_next_pacific_midnight() {
         let winter = DateTime::parse_from_rfc3339("2026-01-15T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(
-            next_pacific_midnight(winter),
+            next_pacific_midnight(winter).unwrap(),
             DateTime::parse_from_rfc3339("2026-01-16T08:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc)
@@ -840,7 +849,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(
-            next_pacific_midnight(summer),
+            next_pacific_midnight(summer).unwrap(),
             DateTime::parse_from_rfc3339("2026-08-16T07:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc)

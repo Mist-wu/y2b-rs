@@ -7,6 +7,7 @@ pub mod model;
 pub mod monitor;
 pub mod pipeline;
 pub mod process;
+mod retry;
 pub mod subtitle;
 #[cfg(feature = "tui")]
 pub mod tui;

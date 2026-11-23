@@ -343,7 +343,10 @@ fn normalize_inline_ends(cues: &mut [Cue]) {
 }
 
 fn inline_atom_metrics(cues: &[Cue]) -> (f64, usize, usize) {
-    let duration = cues.last().unwrap().end - cues[0].start;
+    let duration = cues
+        .first()
+        .zip(cues.last())
+        .map_or(0.0, |(first, last)| last.end - first.start);
     let chars = cues
         .iter()
         .map(|cue| cue.source.chars().count())
@@ -365,46 +368,46 @@ fn ends_inline_atom(source: &str) -> bool {
         .ends_with(['.', '!', '?', ',', ';', ':'])
 }
 
-fn merge_atom(cues: &[Cue]) -> Cue {
-    Cue {
-        start: cues[0].start,
-        end: cues.last().unwrap().end,
+fn merge_atom(cues: &[Cue]) -> Option<Cue> {
+    Some(Cue {
+        start: cues.first()?.start,
+        end: cues.last()?.end,
         source: cues
             .iter()
             .map(|cue| cue.source.as_str())
             .collect::<Vec<_>>()
             .join(" "),
         translation: None,
-    }
+    })
 }
 
 fn group_inline_atoms(cues: Vec<Cue>) -> Vec<Cue> {
     let mut output = Vec::new();
     let mut current: Vec<Cue> = Vec::new();
     for cue in cues {
-        if !current.is_empty() {
+        if let Some(last) = current.last() {
             let mut candidate = current.clone();
             candidate.push(cue.clone());
             let (duration, chars, words) = inline_atom_metrics(&candidate);
-            let gap = cue.start - current.last().unwrap().end;
+            let gap = cue.start - last.end;
             if gap >= 0.8
                 || duration > INLINE_ATOM_MAX_DURATION_SECONDS
                 || chars > INLINE_ATOM_MAX_CHARS
                 || words > INLINE_ATOM_MAX_WORDS
             {
-                output.push(merge_atom(&current));
+                output.extend(merge_atom(&current));
                 current.clear();
             }
         }
         let boundary = ends_inline_atom(&cue.source);
         current.push(cue);
         if boundary {
-            output.push(merge_atom(&current));
+            output.extend(merge_atom(&current));
             current.clear();
         }
     }
     if !current.is_empty() {
-        output.push(merge_atom(&current));
+        output.extend(merge_atom(&current));
     }
     output
 }

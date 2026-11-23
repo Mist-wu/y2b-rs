@@ -807,9 +807,8 @@ async fn schedule_loop(
                     let fresh = reload_config(config_path, config);
                     let worker_db = db.clone();
                     subtitle_worker = Some(tokio::spawn(async move {
-                        let _ = Pipeline::new(fresh, worker_db)
-                            .submit_pending_subtitle(job)
-                            .await;
+                        let job_id = job.id.clone();
+                        if let Err(error) = Pipeline::new(fresh, worker_db).submit_pending_subtitle(job).await { tracing::error!(job_id, %error, "CC 字幕补交失败"); }
                     }));
                 }
             }
