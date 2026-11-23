@@ -494,9 +494,13 @@ const RETRY_CAP_SECONDS: i64 = 3600;
 const LIVE_RETRY_SECONDS: i64 = 30 * 60;
 
 fn retry_delay_seconds(attempt: i64) -> i64 {
-    RETRY_BASE_SECONDS
-        .saturating_mul(1i64 << attempt.clamp(0, 16))
-        .min(RETRY_CAP_SECONDS)
+    crate::retry::jittered_backoff(
+        Duration::from_secs(RETRY_BASE_SECONDS as u64),
+        attempt.clamp(0, 16) as u32,
+        crate::retry::random_jitter_factor(),
+    )
+    .as_secs()
+    .min(RETRY_CAP_SECONDS as u64) as i64
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -824,7 +828,7 @@ impl Pipeline {
         )?;
         self.db.save_source_metadata(&job.id, &meta)?;
         let work = self.config.runtime.download_dir.join(&meta.id);
-        fs::create_dir_all(&work)?;
+        tokio::fs::create_dir_all(&work).await?;
         self.db.update_claimed_job_status(
             &job.id,
             PREPARE_CLAIM_KIND,
@@ -972,7 +976,7 @@ impl Pipeline {
             if bytes.is_empty() {
                 bail!("YouTube 封面为空")
             }
-            fs::write(&source, bytes)?;
+            tokio::fs::write(&source, bytes).await?;
             let mut cmd = Command::new(&self.config.render.ffmpeg);
             cmd.arg("-y")
                 .arg("-i")
@@ -986,7 +990,11 @@ impl Pipeline {
             Ok::<u64, anyhow::Error>(output.peak_rss_kib)
         }
         .await;
-        let _ = fs::remove_file(&source);
+        if let Err(error) = tokio::fs::remove_file(&source).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "清理临时封面失败");
+        }
         let duration_ms = stage.elapsed_ms();
         match result {
             Ok(peak_rss_kib) => {
@@ -1567,10 +1575,10 @@ mod tests {
     #[test]
     fn retry_backoff_keeps_the_first_retry_at_ten_minutes_then_grows() {
         // 第一次重试和迁移前的固定 10 分钟一致，之后翻倍并封顶 1 小时。
-        assert_eq!(retry_delay_seconds(1), 600);
-        assert_eq!(retry_delay_seconds(2), 1200);
-        assert_eq!(retry_delay_seconds(3), 2400);
-        assert_eq!(retry_delay_seconds(4), 3600);
+        assert!((300..=900).contains(&retry_delay_seconds(1)));
+        assert!((600..=1800).contains(&retry_delay_seconds(2)));
+        assert!((1200..=3600).contains(&retry_delay_seconds(3)));
+        assert!((2400..=3600).contains(&retry_delay_seconds(4)));
         assert_eq!(retry_delay_seconds(64), 3600);
     }
 

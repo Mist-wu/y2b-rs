@@ -590,7 +590,7 @@ impl Pipeline {
         let mut cues = match cues {
             Some(cues) => cues,
             None => {
-                fs::create_dir_all(work)?;
+                tokio::fs::create_dir_all(work).await?;
                 let Some(fresh) = self.segment_uncached(job, meta, work, &segmented).await? else {
                     return Ok(None);
                 };
@@ -642,7 +642,11 @@ impl Pipeline {
         work: &Path,
     ) -> Result<Option<PathBuf>> {
         let mut stage = StageGuard::start(&self.db, job_id, "subtitle_download", None, None, None)?;
-        if let Some(cached) = pick_subtitle_file(work, video_id)? {
+        if let Some(cached) = {
+            let work = work.to_owned();
+            let id = video_id.to_owned();
+            tokio::task::spawn_blocking(move || pick_subtitle_file(&work, &id)).await??
+        } {
             let detail = format!("cache:{}", cached.to_string_lossy());
             stage.finish("completed", 0, 0, Some(&detail))?;
             return Ok(Some(cached));
@@ -691,7 +695,15 @@ impl Pipeline {
         let result = run_monitored(download, Duration::from_secs(180)).await;
         match result {
             Ok(out) => {
-                let found = pick_subtitle_file_for_language(work, video_id, &track.language)?;
+                let found = {
+                    let work = work.to_owned();
+                    let id = video_id.to_owned();
+                    let lang = track.language.clone();
+                    tokio::task::spawn_blocking(move || {
+                        pick_subtitle_file_for_language(&work, &id, &lang)
+                    })
+                    .await??
+                };
                 let status = if found.is_some() {
                     "completed"
                 } else {
@@ -884,7 +896,15 @@ impl Pipeline {
                         last_error.as_ref().expect("分句重试前必有错误")
                     ),
                 )?;
-                sleep(Duration::from_secs((1u64 << (attempt - 1)).min(30))).await;
+                sleep(
+                    crate::retry::jittered_backoff(
+                        Duration::from_secs(1),
+                        (attempt - 1) as u32,
+                        crate::retry::random_jitter_factor(),
+                    )
+                    .min(Duration::from_secs(30)),
+                )
+                .await;
             }
         }
         let (r, local) = result.ok_or_else(|| {
@@ -1079,7 +1099,15 @@ impl Pipeline {
             )?;
             if attempt < attempts {
                 // 指数退避：1s, 2s, 4s… 对偶发故障收敛，同时限制上游 API 压力。
-                sleep(Duration::from_secs((1u64 << (attempt - 1)).min(30))).await;
+                sleep(
+                    crate::retry::jittered_backoff(
+                        Duration::from_secs(1),
+                        (attempt - 1) as u32,
+                        crate::retry::random_jitter_factor(),
+                    )
+                    .min(Duration::from_secs(30)),
+                )
+                .await;
             }
         }
 

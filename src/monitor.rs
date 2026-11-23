@@ -1,3 +1,4 @@
+use crate::retry::{jittered_backoff, random_jitter_factor};
 use crate::{
     config::{Config, YoutubeConfig},
     db::{Database, NewJob, NewVideoCandidate},
@@ -24,7 +25,6 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::process::Command;
-use uuid::Uuid;
 
 pub struct Monitor {
     config: Config,
@@ -539,18 +539,6 @@ fn normalize_channel_url(value: &str) -> Result<String> {
         format!("{path}/videos")
     };
     Ok(format!("https://www.youtube.com{path}"))
-}
-
-fn random_jitter_factor() -> f64 {
-    let bytes = Uuid::new_v4().into_bytes();
-    let sample = f64::from(u16::from_be_bytes([bytes[0], bytes[1]])) / f64::from(u16::MAX);
-    0.5 + sample
-}
-
-fn jittered_backoff(base: Duration, exponent: u32, jitter: f64) -> Duration {
-    let multiplier = 2_u64.saturating_pow(exponent.min(20));
-    base.saturating_mul(multiplier as u32)
-        .mul_f64(jitter.clamp(0.5, 1.5))
 }
 
 fn parse_retry_after(
